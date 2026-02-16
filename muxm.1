@@ -1,0 +1,66 @@
+.TH MUXM 1 "2025-08-13" "MuxMaster v1.3" "User Commands"
+.SH NAME
+muxm \- Universal DV/HLG/HDR10/SDR → MP4 encoder/muxer for Apple TV direct play
+.SH SYNOPSIS
+.B muxm
+[\fIoptions\fR] \fIsource\fR [\fItarget.mp4\fR]
+.SH DESCRIPTION
+MuxMaster converts and muxes video to MP4 suitable for Apple TV direct play.
+It handles Dolby Vision (extract/convert/inject), HDR/HLG/SDR color handling,
+audio selection/transcoding, and subtitle selection with optional PGS→SRT OCR.
+.PP
+Configuration layers (lowest to highest precedence):
+.PP
+Defaults → /etc/.muxmrc → ~/.muxmrc → ./.muxmrc → CLI flags
+.SH COMMON OPTIONS
+.TP
+.BR --dry-run
+Plan steps without encoding/muxing (creates placeholders only).
+.TP
+.BR --output-ext " " EXT
+Output container: mp4|m4v|mov. Default: mp4.
+.TP
+.BR --crf " " N
+x265 quality CRF (lower = higher quality). Typical: 18–22.
+.TP
+.BR -p ", " --preset " " NAME
+x265 preset ultrafast..placebo. Default: slower.
+.TP
+.BR -l ", " --level " " N
+x265 level-idc (e.g., 5.1).
+.TP
+.BR --x265-params " " STR
+Advanced x265 parameter string.
+.TP
+.BR --audio-track " " N
+Select specific audio stream index (0-based).
+.TP
+.BR --audio-lang-pref " " LIST
+Preferred audio languages (comma-separated, e.g., eng,spa).
+.TP
+.BR --stereo-fallback " , " --no-stereo-fallback
+Enable/disable automatic AAC stereo track when primary >2ch.
+.TP
+.BR --sub-lang-pref " " LIST
+Preferred subtitle languages (comma-separated).
+.TP
+.BR --no-ocr
+Disable PGS→SRT OCR (PGS will be skipped unless directly mapped).
+.TP
+.BR --skip-video " , " --skip-audio " , " --skip-subs
+Disable respective pipelines (useful for quick tests).
+.SH FULL OPTIONS
+See \fB--help-all\fR for the comprehensive list, defaults, and notes.
+.SH EXAMPLES
+.nf
+muxm Movie.mkv out.mp4
+muxm --crf 20 -p slow Movie.mkv out.mp4
+muxm --audio-lang-pref eng,spa --sub-lang-pref eng --no-ocr Movie.mkv out.mp4
+muxm --dry-run --skip-video Movie.mkv out.mp4
+.fi
+.SH FILES
+\fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
+.PP
+CLI flags always override config files.
+.SH AUTHOR
+Jamey Wicklund (theBluWiz).
