@@ -9,12 +9,11 @@
 # =============================================================================
 #
 # Requires:
-#   - ffmpeg, ffprobe, jq
-#   - Bash 4.0+ (macOS users: install via Homebrew — `brew install bash`)
+#   - ffmpeg, ffprobe
+#   - dovi_tool (optional for Dolby Vision RPU extraction/injection; script will fallback)
 #
-# Optional:
-#   - dovi_tool  — for Dolby Vision RPU extraction/injection (auto-disabled if absent)
-#   - sub2srt    — or another OCR tool you set via --ocr-tool (for PGS subtitle OCR)
+# Optional (for PGS subtitle OCR):
+#   - sub2srt (or another OCR tool you set via --ocr-tool)
 #
 # Notes:
 #   - MP4 cannot carry PGS bitmap subtitles. If OCR can't produce SRT, subtitles are omitted.
@@ -22,15 +21,7 @@
 #     is often missing).
 # =============================================================================
 
-# ===== Section 1: Strict mode, Bash version guard & debug =====================================
-# [FIX #8] Guard against macOS default Bash 3.2 — we require 4.0+ for declare -i,
-# associative arrays, [[ =~ ]], (( )) arithmetic, and inherit_errexit (4.4+).
-if (( BASH_VERSINFO[0] < 4 )); then
-  printf "Error: %s requires Bash 4.0+ (found %s).\n" "MuxMaster" "$BASH_VERSION" >&2
-  printf "  macOS users: brew install bash\n" >&2
-  exit 1
-fi
-
+# ===== Section 1: Strict mode & debug =========================================================
 set -eEuo pipefail
 if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 [[ "${DEBUG:-0}" == "1" ]] && set -x
@@ -38,7 +29,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.0.0"
+readonly VERSION="0.9.1"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -49,19 +40,17 @@ FAILED=0
 FAIL_MSG=""
 EXIT_CODE=1
 PRINT_EFFCONF=0
-# [FIX #12] Removed dead globals: CONFIG_WRITE_ROTATE, CONFIG_WRITE_PATH
+CONFIG_WRITE_ROTATE=0
+CONFIG_WRITE_PATH=""
 
-# Metadata cache — populated once by cache_stream_metadata(), queried throughout.
+# Metadata cache for performance optimization
 METADATA_CACHE=""
 
 # ===== Section 4: Opinionated defaults ========================================================
-
 # ---- Video encode (x265)
 declare -i CRF_VALUE=18
 PRESET_VALUE="slower"
-# [FIX #9] Removed hdr-opt from base params — it's added conditionally in build_x265_params()
-# only for HDR10 content, avoiding the previous duplication.
-X265_PARAMS_BASE='profile=main10:repeat-headers=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
 LEVEL_VALUE=""                 # e.g., 5.1 (blank = encoder decides)
 declare -i CONSERVATIVE_VBV=1
 LEVEL_VBV_4_1_MAXRATE=10000k; LEVEL_VBV_4_1_BUFSIZE=20000k
@@ -83,22 +72,14 @@ declare -i ALLOW_DV_FALLBACK=1
 declare -i DV_CONVERT_TO_P81_IF_FAIL=1
 
 # ---- Audio selection (preferences & weights)
-# Scoring weights used by _score_audio_stream() to rank candidate tracks.
-# Channel count × multiplier is the dominant factor; surround bonus rewards ≥6ch;
-# language bonus rewards tracks matching AUDIO_LANG_PREF; codec rank inverted from
-# 120 ensures preferred codecs score higher. Bitrate is a minor tie-breaker.
 AUDIO_LANG_PREF="eng"                 # comma-separated list
 AUDIO_CODEC_PREFERENCE="eac3,ac3,aac,alac,other"
 declare -i AUDIO_SCORE_CHANNEL_MULTIPLIER=20
 declare -i AUDIO_SCORE_SURROUND_BONUS=30
-# [FIX #3] Renamed from AUDIO_SCORE_LANG_BONUS_ENG — now applies to any
-# language matching AUDIO_LANG_PREF, not just English.
-declare -i AUDIO_SCORE_LANG_BONUS=25
+declare -i AUDIO_SCORE_LANG_BONUS_ENG=25
 
 # ---- Audio transcode policy
-# [FIX #5] Stereo fallback now encodes to AAC (was AC3) per the atv-directplay-hq
-# preset spec and for maximum universal compatibility.
-STEREO_BITRATE="256k"
+STEREO_BITRATE="192k"
 declare -i MAX_AUDIO_CHANNELS=8
 declare -i ADD_STEREO_IF_MULTICH=1
 EAC3_BITRATE_5_1="640k"
@@ -165,14 +146,6 @@ on_error(){
 }
 
 mark_done(){ COMPLETED_STEPS+=("$1"); }
-
-# Print the completed-steps summary. Used by on_exit for both success and failure.
-_print_completed_steps(){
-  if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
-    echo "---- Completed steps ----" >&2
-    for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s" >&2; done
-  fi
-}
 
 need(){
   command -v "$1" >/dev/null 2>&1 || die 10 "Missing required tool: $1"
@@ -242,20 +215,7 @@ ffmpeg_has_muxer(){
   ffmpeg -hide_banner -muxers 2>/dev/null | awk '{print $1}' | grep -qx "$mux"
 }
 
-# [FIX #7] Validate that a string is a valid integer within an inclusive range.
-# Usage: validate_int_range <value> <min> <max> <label>
-validate_int_range(){
-  local val="$1" min="$2" max="$3" label="$4"
-  if ! [[ "$val" =~ ^[0-9]+$ ]]; then
-    die 11 "Invalid ${label}: '${val}' (must be a number ${min}–${max})"
-  fi
-  if (( val < min || val > max )); then
-    die 11 "Invalid ${label}: ${val} (must be ${min}–${max})"
-  fi
-}
-
 # ===== Section 6: Config chain: Defaults → /etc → ~ → project =================================
-# Trusted config locations (/etc, $HOME) — sourced unconditionally if readable.
 _muxm_try_source(){
   local f="$1"
   [[ -r "$f" ]] || return 0
@@ -263,34 +223,9 @@ _muxm_try_source(){
   . "$f"
   MUXM_CONFIG_LOADED+=("$f")
 }
-
-# [FIX #13] CWD config sourcing with ownership check.
-# Sourcing ./.muxmrc from the current directory is a convenience feature, but it
-# executes arbitrary code. To mitigate attacks from untrusted directories (e.g.,
-# downloaded archives, shared mounts, cloned repos), we require the file to be
-# owned by the current user before sourcing it.
-_muxm_try_source_cwd(){
-  local f="$1"
-  [[ -r "$f" ]] || return 0
-  local file_owner
-  # Portable file-owner check across macOS (BSD stat) and Linux (GNU stat)
-  if stat -f '%u' /dev/null >/dev/null 2>&1; then
-    file_owner="$(stat -f '%u' "$f")"
-  else
-    file_owner="$(stat -c '%u' "$f" 2>/dev/null || echo -1)"
-  fi
-  if [[ "$file_owner" != "$(id -u)" ]]; then
-    warn "Skipping $f — owned by UID $file_owner, not current user (UID $(id -u)). Security risk."
-    return 0
-  fi
-  # shellcheck disable=SC1090
-  . "$f"
-  MUXM_CONFIG_LOADED+=("$f")
-}
-
 _muxm_try_source /etc/.muxmrc
 _muxm_try_source "$HOME/.muxmrc"
-_muxm_try_source_cwd "./.muxmrc"
+_muxm_try_source "./.muxmrc"
 
 # ===== Section 7: CLI ==========================================================================
 USAGE_SHORT="Usage: ${CLI_NAME} [options] <source> [target.${OUTPUT_EXT}]"
@@ -307,10 +242,9 @@ Core options:
   -k, --keep-temp             Keep workdir on failure (default behavior keeps on failure anyway)
   --dry-run                   Print actions and create stub artifacts (no real encode)
   --checksum                  Write sha256 checksum for final output
-  --parallelize               Encode audio in parallel (experimental)
 
 Video:
-  --crf N                     Set CRF 0–51 (default: ${CRF_VALUE})
+  --crf N                     Set CRF (default: ${CRF_VALUE})
   -p, --preset NAME           x265 preset (default: ${PRESET_VALUE})
   --x265-params "..."         Extra/override x265 params
   -l, --level N               HEVC level (e.g., 4.1, 5.1)
@@ -322,7 +256,7 @@ Video:
 Audio:
   --audio-track N             Force select audio track (0-based, relative to audio streams)
   --audio-lang-pref "eng,..." Language preference order (default: ${AUDIO_LANG_PREF})
-  --stereo-bitrate 256k       Stereo AAC fallback bitrate (default: ${STEREO_BITRATE})
+  --stereo-bitrate 192k       Stereo AC3 bitrate (default: ${STEREO_BITRATE})
   --no-stereo-fallback        Do not add stereo track when primary is multichannel
 
 Subtitles:
@@ -366,8 +300,6 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
-    # [FIX #4] Wire up --parallelize to the existing PARALLEL_AUDIO variable.
-    --parallelize) PARALLEL_AUDIO=1; shift ;;
 
     --ffmpeg-loglevel) FFMPEG_LOGLEVEL="${2:-}"; shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
@@ -375,7 +307,6 @@ while [[ $# -gt 0 ]]; do
     --ffprobe-loglevel) FFPROBE_LOGLEVEL="${2:-}"; shift 2 ;;
     --threads) THREADS="${2:-}"; shift 2 ;;
 
-    # [FIX #7] CRF is validated after CLI parsing with validate_int_range.
     --crf) CRF_VALUE="${2:-}"; shift 2 ;;
     -p|--preset)
       PRESET_VALUE="${2:-}"
@@ -416,10 +347,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# [FIX #7] Validate CRF range after CLI parsing (declare -i silently coerces
-# non-numeric strings to 0, which would produce a lossless encode with no warning).
-validate_int_range "$CRF_VALUE" 0 51 "--crf"
-
 if (( PRINT_EFFCONF )); then
   cat <<EOF
 Effective config (post config-files + CLI):
@@ -438,7 +365,6 @@ Effective config (post config-files + CLI):
   AUDIO_TRACK_OVERRIDE=${AUDIO_TRACK_OVERRIDE:-}
   ADD_STEREO_IF_MULTICH=$ADD_STEREO_IF_MULTICH
   STEREO_BITRATE=$STEREO_BITRATE
-  PARALLEL_AUDIO=$PARALLEL_AUDIO
   SUB_LANG_PREF=$SUB_LANG_PREF
   SUB_INCLUDE_FORCED=$SUB_INCLUDE_FORCED
   SUB_INCLUDE_FULL=$SUB_INCLUDE_FULL
@@ -458,17 +384,7 @@ fi
 # ===== Section 8: Required tools ===============================================================
 need ffmpeg
 need ffprobe
-# [FIX #1] jq is used throughout for metadata cache queries — hard require it.
-need jq
-
-# [FIX #2] dovi_tool is optional — soft-check with graceful disable.
-# If absent, Dolby Vision features are disabled but the script continues normally.
-if ! command -v dovi_tool >/dev/null 2>&1; then
-  if (( DISABLE_DV == 0 )); then
-    note "dovi_tool not found in PATH — Dolby Vision extraction/injection disabled."
-    DISABLE_DV=1
-  fi
-fi
+need dovi_tool
 
 if (( SUB_ENABLE_OCR )); then
   if ! command -v "$SUB_OCR_TOOL" >/dev/null 2>&1; then
@@ -526,11 +442,10 @@ if [[ "$SRC_ABS" -ef "$OUT_ABS" ]]; then
   die 11 "Source and output are the same file - aborting to prevent data loss"
 fi
 
-# [FIX #14] Mitigate TOCTOU race: mktemp creates an empty file; we atomically
-# rename it with the desired extension instead of deleting and recreating.
-TMP_OUT_BASE="$(mktemp "$OUT_DIR/.muxm.output.XXXXXXXX")" || die 11 "Cannot create temp output file"
-TMP_OUT="${TMP_OUT_BASE}.${OUTPUT_EXT}"
-mv -f "$TMP_OUT_BASE" "$TMP_OUT"
+# Security: Use unpredictable temp file name
+TMP_OUT="$(mktemp "$OUT_DIR/.muxm.output.XXXXXXXX")" || die 11 "Cannot create temp output file"
+rm -f "$TMP_OUT"  # Remove the file, we just wanted the name
+TMP_OUT="${TMP_OUT}.${OUTPUT_EXT}"
 
 # Determine mux format
 MUX_FORMAT="mp4"
@@ -560,10 +475,6 @@ WORKDIR="$(
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
 # ===== Section 12: Begin logging to file =======================================================
-# [FIX #15] Known limitation: process substitution creates a background `tee` that
-# may not have flushed on abnormal exit. The final lines of output can be lost from
-# the log file. This is a Bash/OS limitation with no clean fix short of restructuring
-# the entrypoint. In practice the in-terminal output is always complete.
 if [[ "${DEBUG:-0}" != "1" ]]; then
   : > "$LOGFILE" 2>/dev/null || true
   exec > >(tee -a "$LOGFILE") 2>&1
@@ -595,7 +506,10 @@ on_exit() {
       note "Build SUCCEEDED."
     fi
 
-    _print_completed_steps
+    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
+      echo "---- Completed steps ----"
+      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
+    fi
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
       rm -rf "$WORKDIR"
@@ -605,16 +519,19 @@ on_exit() {
     exit 0
   else
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
-    printf "❌ Build FAILED. %s\n" "$FAIL_MSG" >&2
+    printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
     
-    _print_completed_steps
-    echo "See log: $LOGFILE" >&2
+    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
+      echo "---- Completed steps ----"
+      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
+    fi
+    echo "See log: $LOGFILE"
 
     # Clean up temp output file on failure
     [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP -eq 0 && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
-      rm -rf "$WORKDIR"
+      note "Keeping failure artifacts at: $WORKDIR (use -k to suppress this, or -K to always keep)"
     else
       note "Keeping failure artifacts at: $WORKDIR"
     fi
@@ -635,10 +552,7 @@ disk_free_warn() {
 disk_free_warn
 
 # ===== Section 15: Metadata caching & ffprobe helpers ==========================================
-# Cache all stream metadata in one call for performance.
-# METADATA_CACHE is a JSON blob from `ffprobe -show_streams -of json`.
-# All audio, video, and subtitle field queries read from this cache
-# rather than spawning additional ffprobe processes.
+# Cache all stream metadata in one call for performance
 cache_stream_metadata() {
   note "→ Caching stream metadata..."
   METADATA_CACHE="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -of json "$SRC_ABS" 2>/dev/null)" || {
@@ -646,27 +560,21 @@ cache_stream_metadata() {
   }
 }
 
-# [FIX #10] Removed dead code: _probe_stream_from_cache() was never called and
-# contained an overly complex jq query that would fail for most inputs.
-
-# [FIX #6] Rewritten to query METADATA_CACHE instead of spawning a new ffprobe.
-# Queries the first video stream's field from the cached metadata.
-# Args: field_name
-# Globals: METADATA_CACHE (must be populated by cache_stream_metadata)
-_probe_field(){
-  local field="$1"
-  printf '%s\n' "$METADATA_CACHE" \
-    | jq -r "[.streams[] | select(.codec_type==\"video\")] | .[0].${field} // empty" 2>/dev/null \
-    | head -n1 || true
+# Generic probe helper - reduces code duplication
+_probe_stream_from_cache() {
+  local stream_type="$1" idx="$2" field="$3"
+  local jq_query=".streams[] | select(.codec_type==\"${stream_type}\") | select(.index==(${idx} + ([.streams[] | select(.codec_type==\"${stream_type}\")] | to_entries[${idx}].value.index // ${idx}))) | .${field} // empty"
+  
+  printf '%s\n' "$METADATA_CACHE" | jq -r "$jq_query" 2>/dev/null | head -n1 || true
 }
 
-# [FIX #11] Corrected signature: takes one argument (stream type), not two.
-# The previous version accepted a phantom $1 (file path) that was silently ignored.
-# Args: stream_type (e.g., "audio", "video", "subtitle")
-# Globals: METADATA_CACHE
+_probe_field(){
+  ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$1" \
+          -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true
+}
+
 _has_stream(){
-  local stream_type="$1"
-  printf '%s\n' "$METADATA_CACHE" | jq -e "[.streams[] | select(.codec_type==\"$stream_type\")] | length > 0" >/dev/null 2>&1
+  printf '%s\n' "$METADATA_CACHE" | jq -e "[.streams[] | select(.codec_type==\"$2\")] | length > 0" >/dev/null 2>&1
 }
 
 # ===== Section 16: Color space & pixel format decision =========================================
@@ -675,15 +583,12 @@ PROFILE_DESC="SDR"
 TARGET_PIXFMT="yuv420p"
 COLOR_ARGS=()
 
-# Analyze source video color properties and decide output pixel format + color args.
-# Sets globals: PROFILE_DESC, TARGET_PIXFMT, COLOR_ARGS
 decide_color_and_pixfmt() {
-  # [FIX #6] All _probe_field calls now read from METADATA_CACHE (no extra ffprobe).
-  local pix prim trc cspace
-  pix="$(_probe_field pix_fmt)"
-  prim="$(_probe_field color_primaries)"
-  trc="$(_probe_field color_transfer)"
-  cspace="$(_probe_field color_space)"
+  local src="$1" pix prim trc cspace
+  pix="$(_probe_field pix_fmt "$src")"
+  prim="$(_probe_field color_primaries "$src")"
+  trc="$(_probe_field color_transfer "$src")"
+  cspace="$(_probe_field color_space "$src")"
 
   prim="$(printf %s "$prim"    | tr '[:upper:]' '[:lower:]')"
   trc="$(printf %s "$trc"      | tr '[:upper:]' '[:lower:]')"
@@ -733,23 +638,22 @@ decide_color_and_pixfmt() {
 }
 
 # ===== Section 17: x265 params & Level/VBV guardrails =========================================
-
-# Build the x265-params string based on the detected color profile.
-# [FIX #9] hdr-opt is no longer in X265_PARAMS_BASE. It is added here only when
-# the profile is HDR10, eliminating the previous duplication where both hdr-opt=1
-# (from base) and hdr10-opt=1 (from the HDR10 append) were present.
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
-  # Add HDR10-specific params (hdr-opt, hdr10, color metadata, range)
+  # Remove hdr-opt if not HDR10
+  if [[ "$PROFILE_DESC" != "HDR10" ]]; then
+    X265_PARAMS="${X265_PARAMS/:hdr-opt=1/}"
+  fi
+
+  # Add HDR10-specific params if HDR10
   if [[ "$PROFILE_DESC" == "HDR10" ]]; then
-    X265_PARAMS="${X265_PARAMS}:hdr-opt=1:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
+    X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
   fi
 }
 
-# Apply level-based VBV constraints.
-# VBV (Video Buffering Verifier) ensures bitrate stays within device capabilities.
-# Only applied when CONSERVATIVE_VBV=1 and a recognized HEVC level is specified.
+# Apply level-based VBV constraints
+# VBV (Video Buffering Verifier) ensures bitrate stays within device capabilities
 apply_level_vbv() {
   local lvl="$1" maxrate="" bufsize=""
   if (( CONSERVATIVE_VBV )); then
@@ -800,8 +704,7 @@ V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
 
 A_PRIMARY=""
-# [FIX #5] Renamed from AAC_STEREO to STEREO_FALLBACK to match actual usage.
-STEREO_FALLBACK=""
+AAC_STEREO=""
 declare -i HAS_AUDIO=0
 
 # ===== Section 20: Video pipeline ==============================================================
@@ -812,12 +715,11 @@ run_video_pipeline() {
     : > "$V_SRC_ES" 2>/dev/null || true
     mark_done "Demux raw ES → video_src.es (dry-run)"
   else
-    # Extract HEVC elementary stream for DV RPU extraction.
-    # Use -c copy; if it fails we still proceed (DV path will fallback).
+    # Extract HEVC elementary stream for DV RPU extraction
+    # Use -c copy; if it fails we still proceed (DV path will fallback)
     if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err"; then
       local codec
-      # [FIX #6] _probe_field now reads from cache (no extra ffprobe)
-      codec="$(_probe_field codec_name)"
+      codec="$(_probe_field codec_name "$SRC_ABS")"
       warn "Could not demux raw ES - source codec: ${codec:-unknown}. DV extraction may be skipped."
       warn "See: $WORKDIR/demux.err for details"
       : > "$V_SRC_ES" 2>/dev/null || true
@@ -926,28 +828,22 @@ run_video_pipeline() {
 }
 
 # ===== Section 21: Audio selection & pipeline ==================================================
-
-# --- Audio metadata helpers ---
-# These functions query METADATA_CACHE via jq. Each spawns a jq process per call.
-# Acceptable for typical files (2–4 audio tracks); batch optimization deferred.
-
-# Count audio streams in source file.
+# Count audio streams in source file
 # Returns: Integer count (0 if none)
 # Globals: METADATA_CACHE
 _audio_stream_count(){
   printf '%s\n' "$METADATA_CACHE" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null || echo 0
 }
 
-# Get audio field from cached metadata.
-# Args: relative_audio_index field_name
+# Get audio field from cached metadata
+# Args: stream_index field_name
 _audio_field(){
   local idx="$1" field="$2" stream_idx
   stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].index" 2>/dev/null)
   printf '%s\n' "$METADATA_CACHE" | jq -r ".streams[] | select(.index==$stream_idx) | .$field // empty" 2>/dev/null | head -n1 || true
 }
 
-# Get audio tag from cached metadata.
-# Args: relative_audio_index tag_name
+# Get audio tag from cached metadata
 _audio_tag(){
   local idx="$1" tag="$2" stream_idx
   stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].index" 2>/dev/null)
@@ -986,9 +882,7 @@ _audio_title(){
   _audio_tag "$1" title
 }
 
-# Calculate codec preference rank (lower rank = better codec).
-# Ranks against AUDIO_CODEC_PREFERENCE comma-separated list.
-# Returns: integer rank (0-based), or 99 if codec not in preference list.
+# Calculate codec preference rank (lower is better)
 _audio_codec_rank(){
   local codec="$1" list="$AUDIO_CODEC_PREFERENCE" item i=0
   IFS=',' read -r -a arr <<<"$list"
@@ -996,18 +890,12 @@ _audio_codec_rank(){
     item="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     [[ -z "$item" ]] && continue
     if [[ "$item" == "$codec" ]]; then echo "$i"; return 0; fi
-    ((i++))
+    (( i++, 1 ))
   done
   echo "99"
 }
 
-# Score an audio stream for automatic track selection.
-# Scoring factors (highest to lowest impact):
-#   1. Channel count × AUDIO_SCORE_CHANNEL_MULTIPLIER (dominant factor)
-#   2. Surround bonus for ≥6 channels
-#   3. Language bonus if track matches any language in AUDIO_LANG_PREF
-#   4. Codec preference rank (inverted: lower rank = higher score)
-#   5. Bitrate (minor tie-breaker, scaled down by /50000)
+# Score audio stream for selection
 # Returns: score|idx|codec|channels|lang|title
 _score_audio_stream(){
   local idx="$1"
@@ -1024,17 +912,16 @@ _score_audio_stream(){
   score=$(( score + ch * AUDIO_SCORE_CHANNEL_MULTIPLIER ))
   # Surround bonus (>=6ch)
   (( ch >= 6 )) && score=$(( score + AUDIO_SCORE_SURROUND_BONUS ))
-  # [FIX #3] Language bonus now checks against AUDIO_LANG_PREF (comma-separated)
-  # instead of being hardcoded to "eng". Supports multi-language preference lists.
-  if [[ ",$AUDIO_LANG_PREF," == *",$lang,"* ]]; then
-    score=$(( score + AUDIO_SCORE_LANG_BONUS ))
+  # Language bonus for preferred language
+  if [[ "$lang" == "eng" ]]; then
+    score=$(( score + AUDIO_SCORE_LANG_BONUS_ENG ))
   fi
-  # Codec preference: better rank -> higher score (inverted so rank 0 = +120, rank 99 = +21)
+  # Codec preference: better rank -> higher score
   local inv=$(( 120 - rank ))
   (( inv < 0 )) && inv=0
   score=$(( score + inv ))
 
-  # Bitrate small tie-breaker (scaled down so it doesn't dominate)
+  # Bitrate small tie-breaker (scaled)
   if [[ "$br" =~ ^[0-9]+$ ]] && (( br > 0 )); then
     score=$(( score + (br / 50000) ))
   fi
@@ -1042,8 +929,7 @@ _score_audio_stream(){
   printf "%s|%s|%s|%s|%s|%s\n" "$score" "$idx" "$codec" "$ch" "$lang" "${title:-}"
 }
 
-# Select best audio track based on scoring algorithm.
-# Returns: 0-based audio stream index, or empty string if no audio found.
+# Select best audio track based on scoring algorithm
 select_best_audio(){
   local n i best_line best_score=-999999
   n="$(_audio_stream_count)"
@@ -1073,7 +959,7 @@ select_best_audio(){
   echo "${best_line#*|}" | cut -d'|' -f1
 }
 
-# Check if audio codec can be direct-play copied to MP4 without re-encoding.
+# Check if audio codec can be direct-play copied to MP4
 audio_is_direct_play_copyable(){
   local codec="$1"
   case "$codec" in
@@ -1082,8 +968,7 @@ audio_is_direct_play_copyable(){
   esac
 }
 
-# Determine target codec for audio transcode based on channel count.
-# ≥6ch → E-AC-3 (surround), <6ch → AAC (stereo/mono)
+# Determine target codec for audio transcode based on channel count
 audio_target_codec_for_transcode(){
   local ch="$1"
   if (( ch >= 6 )); then
@@ -1093,7 +978,7 @@ audio_target_codec_for_transcode(){
   fi
 }
 
-# Determine target bitrate for audio transcode based on channel count.
+# Determine target bitrate based on channel count
 audio_target_bitrate(){
   local ch="$1"
   if (( ch >= 8 )); then echo "$EAC3_BITRATE_7_1"; return 0; fi
@@ -1139,8 +1024,7 @@ run_audio_pipeline(){
   note "[Audio Select] Using track #$idx: $codec ${ch}ch [$lang]${title:+ — $title}${br:+, $((br/1000))kbps}"
 
   A_PRIMARY="$WORKDIR/audio_primary.${codec}"
-  # [FIX #5] Stereo fallback uses AAC (.aac) instead of AC3 (.ac3)
-  STEREO_FALLBACK="$WORKDIR/audio_stereo.aac"
+  AAC_STEREO="$WORKDIR/audio_stereo.ac3"
   HAS_AUDIO=1
 
   note "→ Preparing primary audio → $A_PRIMARY"
@@ -1149,7 +1033,7 @@ run_audio_pipeline(){
     : > "$A_PRIMARY" 2>/dev/null || true
     mark_done "Primary audio prepared (dry-run)"
     if (( ADD_STEREO_IF_MULTICH )) && (( ch > 2 )); then
-      : > "$STEREO_FALLBACK" 2>/dev/null || true
+      : > "$AAC_STEREO" 2>/dev/null || true
       mark_done "Stereo fallback prepared (dry-run)"
     fi
     return 0
@@ -1189,16 +1073,15 @@ run_audio_pipeline(){
 
   mark_done "Primary audio prepared"
 
-  # [FIX #5] Stereo fallback now encodes to AAC stereo (was AC3).
-  # AAC is universally supported and matches the atv-directplay-hq preset spec.
+  # Add stereo fallback if needed
   if (( ADD_STEREO_IF_MULTICH )) && (( ch > 2 )); then
-    note "→ Preparing AAC stereo fallback → $STEREO_FALLBACK"
+    note "→ Preparing stereo fallback → $AAC_STEREO"
     if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" \
-      -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$STEREO_FALLBACK" 2>"$WORKDIR/audio_stereo.err"; then
+      -c:a ac3 -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" 2>"$WORKDIR/audio_stereo.err"; then
       warn "Stereo fallback creation failed - continuing without it. See: $WORKDIR/audio_stereo.err"
-      STEREO_FALLBACK=""
+      AAC_STEREO=""
     else
-      mark_done "Stereo fallback prepared (AAC ${STEREO_BITRATE} 2ch)"
+      mark_done "Stereo fallback prepared"
     fi
   else
     note "Primary audio is stereo (or fallback disabled); no extra stereo needed."
@@ -1211,7 +1094,7 @@ _sub_count() {
   printf '%s\n' "$METADATA_CACHE" | jq '[.streams[] | select(.codec_type=="subtitle")] | length' 2>/dev/null || echo 0
 }
 
-# List all subtitle stream indices (0-based, relative to subtitle streams)
+# List all subtitle stream indices
 list_sub_indices(){
   local n i
   n="$(_sub_count)"
@@ -1219,7 +1102,6 @@ list_sub_indices(){
 }
 
 # Get subtitle field from cached metadata
-# Args: relative_subtitle_index field_name
 _sp_sub_field() {
   local idx="$1" field="$2" stream_idx
   stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].index" 2>/dev/null)
@@ -1227,7 +1109,6 @@ _sp_sub_field() {
 }
 
 # Get subtitle tag from cached metadata
-# Args: relative_subtitle_index tag_name
 _sp_sub_tag() {
   local idx="$1" tag="$2" stream_idx
   stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].index" 2>/dev/null)
@@ -1260,7 +1141,7 @@ _is_sdh_title(){
   [[ "$t" =~ (^|[^a-z])(sdh|hi)([^a-z]|$)|hearing|impaired|cc|caption ]]
 }
 
-# Describe subtitle stream for user-facing output
+# Describe subtitle stream for user
 describe_sub_stream(){
   local i="$1" codec lang title forced flags=""
   codec="$(_sp_sub_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
@@ -1289,9 +1170,7 @@ _pick_direct_text_sub_relidx(){
   local i lang codec
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
-    # [FIX #16] Also match "und" (undefined) language tags so untagged subtitles
-    # aren't silently dropped. Common in older rips.
-    [[ ",$SUB_LANG_PREF,und," == *",$lang,"* ]] || continue
+    [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
     codec="$(_sp_sub_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
     if _is_text_sub_codec "$codec"; then
       echo "$i"
@@ -1301,9 +1180,9 @@ _pick_direct_text_sub_relidx(){
   echo ""
 }
 
-# Prepare subtitle to SRT format (with OCR if needed).
+# Prepare subtitle to SRT format (with OCR if needed)
 # Args: subtitle_stream_index
-# Returns: path to SRT file (stdout), or empty string if preparation failed.
+# Returns: path to SRT file or empty string if failed
 _prepare_sub_to_srt(){
   local idx="$1" codec srt sup vob_base
   codec="$(_sp_sub_field "$idx" codec_name | tr '[:upper:]' '[:lower:]')"
@@ -1403,10 +1282,7 @@ SRT_SDH=""
 declare -i SRT_DIRECT_MAP=0
 DIRECT_SUB_RELIDX=""
 
-# Build subtitle processing plan.
-# Scans subtitle streams, categorizes them (forced / full / SDH), and prepares
-# up to SUB_MAX_TRACKS SRT files. If no SRTs can be prepared, falls back to
-# direct-mapping a compatible text subtitle from the source.
+# Build subtitle processing plan
 build_subtitle_plan(){
   if (( SKIP_SUBS )); then
     SRT_FORCED=""; SRT_FULL=""; SRT_SDH=""
@@ -1414,8 +1290,7 @@ build_subtitle_plan(){
     return 0
   fi
 
-  # [FIX #11] _has_stream now takes one argument (stream type)
-  if ! _has_stream subtitle; then
+  if ! _has_stream "$SRC_ABS" subtitle; then
     note "[Subs] No subtitle streams detected."
     SRT_DIRECT_MAP=0
     return 0
@@ -1430,15 +1305,10 @@ build_subtitle_plan(){
   local forced_idx="" full_idx="" sdh_idx=""
   local lang title forced is_sdh
 
-  # Find best subtitle candidates in each category.
-  # Categorization precedence: forced > SDH > full.
-  # A track matching multiple categories (e.g., forced + SDH) is assigned to the
-  # first matching category only. The `continue` after each match prevents
-  # double-counting.
+  # Find best subtitle candidates
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
-    # [FIX #16] Also match "und" (undefined) language so untagged subs aren't dropped.
-    [[ ",$SUB_LANG_PREF,und," == *",$lang,"* ]] || continue
+    [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
 
     title="$(_sp_sub_tag "$i" title)"
     forced="$(_sp_sub_dispo_forced "$i")"
@@ -1465,15 +1335,15 @@ build_subtitle_plan(){
   local p pick_count=0
   if [[ -n "$forced_idx" ]]; then
     p="$(_prepare_sub_to_srt "$forced_idx")"
-    [[ -n "$p" ]] && SRT_FORCED="$p" && ((pick_count++)) && note "[Subs] Prepared Forced → $SRT_FORCED"
+    [[ -n "$p" ]] && SRT_FORCED="$p" && (( pick_count++, 1 )) && note "[Subs] Prepared Forced → $SRT_FORCED"
   fi
   if [[ -n "$full_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
     p="$(_prepare_sub_to_srt "$full_idx")"
-    [[ -n "$p" ]] && SRT_FULL="$p" && ((pick_count++)) && note "[Subs] Prepared Full → $SRT_FULL"
+    [[ -n "$p" ]] && SRT_FULL="$p" && (( pick_count++, 1 )) && note "[Subs] Prepared Full → $SRT_FULL"
   fi
   if [[ -n "$sdh_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
     p="$(_prepare_sub_to_srt "$sdh_idx")"
-    [[ -n "$p" ]] && SRT_SDH="$p" && ((pick_count++)) && note "[Subs] Prepared SDH → $SRT_SDH"
+    [[ -n "$p" ]] && SRT_SDH="$p" && (( pick_count++, 1 )) && note "[Subs] Prepared SDH → $SRT_SDH"
   fi
 
   # Fallback: try direct-mapping a text subtitle if no SRTs prepared
@@ -1523,7 +1393,7 @@ mux_final() {
     fi
     ff_in+=( -i "$V_MIXED" )
     vid_idx=$next_idx
-    ((next_idx++))
+    (( next_idx++, 1 ))
   else
     die 42 "No encoded video stream found."
   fi
@@ -1532,14 +1402,13 @@ mux_final() {
   if (( ! SKIP_AUDIO )) && (( HAS_AUDIO )) && [[ -n "${A_PRIMARY:-}" && -s "$A_PRIMARY" ]]; then
     ff_in+=( -i "$A_PRIMARY" )
     a_primary_idx=$next_idx
-    ((next_idx++))
+    (( next_idx++, 1 ))
   fi
   
-  # [FIX #5] Renamed from AAC_STEREO to STEREO_FALLBACK
-  if (( ! SKIP_AUDIO )) && [[ -n "${STEREO_FALLBACK:-}" && -s "$STEREO_FALLBACK" ]]; then
-    ff_in+=( -i "$STEREO_FALLBACK" )
+  if (( ! SKIP_AUDIO )) && [[ -n "${AAC_STEREO:-}" && -s "$AAC_STEREO" ]]; then
+    ff_in+=( -i "$AAC_STEREO" )
     a_stereo_idx=$next_idx
-    ((next_idx++))
+    (( next_idx++, 1 ))
   fi
 
   # Add subtitle streams
@@ -1547,21 +1416,21 @@ mux_final() {
     if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
       ff_in+=( -i "$SRT_FORCED" )
       s_forced_idx=$next_idx
-      ((next_idx++))
+      (( next_idx++, 1 ))
       forced_present=1
     fi
     
     if [[ -n "${SRT_FULL:-}" && -s "$SRT_FULL" ]]; then
       ff_in+=( -i "$SRT_FULL" )
       s_full_idx=$next_idx
-      ((next_idx++))
+      (( next_idx++, 1 ))
       full_present=1
     fi
     
     if [[ -n "${SRT_SDH:-}" && -s "$SRT_SDH" ]]; then
       ff_in+=( -i "$SRT_SDH" )
       s_sdh_idx=$next_idx
-      ((next_idx++))
+      (( next_idx++, 1 ))
       sdh_present=1
     fi
   fi
@@ -1570,7 +1439,7 @@ mux_final() {
   if (( ! SKIP_SUBS )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
     ff_in+=( -i "$SRC_ABS" )
     src_sub_idx=$next_idx
-    ((next_idx++))
+    (( next_idx++, 1 ))
   fi
 
   # Build stream mapping
@@ -1587,14 +1456,14 @@ mux_final() {
     ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
   fi
 
-  # Codec settings: copy everything, convert subs to mov_text for MP4 compatibility
+  # Codec settings: copy everything, convert subs to mov_text
   ff_codec+=( -c copy )
 
   if (( forced_present || full_present || sdh_present )) || [[ -n "$src_sub_idx" ]]; then
     ff_codec+=( -c:s mov_text )
   fi
 
-  # MP4 optimization: move moov atom to start for progressive playback
+  # MP4 optimization
   ff_codec+=( -movflags +faststart )
 
   # Execute final mux
@@ -1642,7 +1511,7 @@ main() {
   (( DISABLE_DV )) && note "DV handling explicitly disabled via --no-dv."
 
   # Decide color space and build x265 params
-  decide_color_and_pixfmt
+  decide_color_and_pixfmt "$SRC_ABS"
   build_x265_params
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
@@ -1657,7 +1526,7 @@ main() {
     note "[Quick Test] --skip-audio: skipping audio selection/transcode"
     HAS_AUDIO=0
     A_PRIMARY=""
-    STEREO_FALLBACK=""
+    AAC_STEREO=""
   else
     run_audio_pipeline
   fi
