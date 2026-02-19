@@ -258,8 +258,22 @@ _muxm_try_source "./.muxmrc"
 
 # ===== Section 6b: Profile pre-scan & application ==============================================
 # Two-pass CLI: first extract --profile, apply it, then let full CLI parse override.
+#
+# Precedence for PROFILE_NAME:
+#   1. /etc/.muxmrc, ~/.muxmrc, ./.muxmrc  — may set PROFILE_NAME (lowest)
+#   2. CLI --profile <n>                    — overrides config-file value (highest)
+#
+# Users can set a default profile in any .muxmrc file:
+#   PROFILE_NAME="atv-directplay-hq"
+# CLI --profile always overrides a config-file PROFILE_NAME.
 
-# Pre-scan: walk args looking only for --profile <name>
+# Track where the profile originated (for diagnostics / conflict warnings)
+_PROFILE_SOURCE=""
+if [[ -n "${PROFILE_NAME:-}" ]]; then
+  _PROFILE_SOURCE="config-file"
+fi
+
+# Pre-scan: walk args looking only for --profile <n>
 _prescan_args=("$@")
 _filtered_args=()
 _i=0
@@ -267,6 +281,7 @@ while (( _i < ${#_prescan_args[@]} )); do
   if [[ "${_prescan_args[$_i]}" == "--profile" ]]; then
     if (( _i + 1 < ${#_prescan_args[@]} )); then
       PROFILE_NAME="${_prescan_args[$((_i+1))]}"
+      _PROFILE_SOURCE="cli"
       _i=$((_i + 2))
     else
       _i=$((_i + 1))
@@ -418,7 +433,7 @@ apply_profile() {
       exit 11
       ;;
   esac
-  note "Applied profile: $PROFILE_NAME"
+  note "Applied profile: $PROFILE_NAME (source: ${_PROFILE_SOURCE:-unknown})"
 }
 
 # Apply profile now (after config files, before CLI flags)
@@ -584,12 +599,145 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ===== Section 7b: Profile + flag conflict warnings ============================================
+# These are warnings, not errors — the user's explicit CLI flags always win.
+# Conflicts are only checked when a profile is active.
+
+_warn_conflict() {
+  local profile="$1" flag="$2" reason="$3"
+  warn "Profile '$profile' + $flag: $reason"
+}
+
+if [[ -n "${PROFILE_NAME:-}" ]]; then
+  case "$PROFILE_NAME" in
+
+    dv-archival)
+      # DV archival without DV is pointless
+      (( DISABLE_DV )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-dv" \
+          "DV archival without Dolby Vision is pointless. Output will be a plain remux."
+
+      # dv-archival is copy-only; setting CRF implies the user wants to re-encode
+      if [[ "$_PROFILE_SOURCE" == "cli" ]] && [[ "$CRF_VALUE" -ne 18 ]]; then
+        _warn_conflict "$PROFILE_NAME" "--crf $CRF_VALUE" \
+          "dv-archival is designed for copy-only (no re-encode). CRF is ignored when VIDEO_COPY_IF_COMPLIANT succeeds."
+      fi
+
+      # Stripping metadata defeats archival purpose
+      (( STRIP_METADATA )) && \
+        _warn_conflict "$PROFILE_NAME" "--strip-metadata" \
+          "Stripping metadata conflicts with archival goals. Metadata will be stripped as requested."
+
+      # Stripping chapters defeats archival purpose
+      (( ! KEEP_CHAPTERS )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-keep-chapters" \
+          "Stripping chapters conflicts with archival goals. Chapters will be stripped as requested."
+
+      # Burning subs defeats archival purpose (irreversible)
+      (( SUB_BURN_FORCED )) && \
+        _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
+          "Burning subtitles is irreversible and conflicts with archival goals."
+      ;;
+
+    hdr10-hq)
+      # hdr10-hq sets DISABLE_DV=1 by default; if someone re-enabled it, warn
+      (( ! DISABLE_DV )) && \
+        _warn_conflict "$PROFILE_NAME" "(DV enabled)" \
+          "hdr10-hq expects DV to be stripped. DV layers may cause unexpected behavior."
+
+      # Tone-mapping makes no sense for HDR output
+      (( TONEMAP_HDR_TO_SDR )) && \
+        _warn_conflict "$PROFILE_NAME" "--tonemap" \
+          "Tone-mapping HDR to SDR conflicts with HDR10 output. Output will be SDR."
+
+      # H.264 codec is wrong for HDR10
+      [[ "$VIDEO_CODEC" == "libx264" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
+          "H.264 cannot carry HDR10 metadata. Use libx265 for HDR10 output."
+      ;;
+
+    atv-directplay-hq)
+      # MKV won’t Direct Play on Apple TV
+      [[ "$OUTPUT_EXT" == "mkv" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
+          "MKV does not Direct Play on Apple TV. Use mp4 for ATV compatibility."
+
+      # MOV is unusual but works
+      [[ "$OUTPUT_EXT" == "mov" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
+          "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
+
+      # Tone-mapping defeats HDR purpose
+      (( TONEMAP_HDR_TO_SDR )) && \
+        _warn_conflict "$PROFILE_NAME" "--tonemap" \
+          "Tone-mapping to SDR removes HDR. Apple TV supports HDR natively."
+
+      # H.264 loses HDR + DV
+      [[ "$VIDEO_CODEC" == "libx264" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
+          "H.264 cannot carry HDR10/DV. Apple TV supports HEVC; use libx265."
+
+      # Lossless audio won’t Direct Play on ATV
+      (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
+        _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
+          "TrueHD/DTS-HD MA won’t Direct Play on Apple TV. E-AC-3 is recommended."
+      ;;
+
+    universal)
+      # MKV is unusual for max-compat
+      [[ "$OUTPUT_EXT" == "mkv" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
+          "MKV is unusual for max compatibility. MP4 recommended for widest device support."
+
+      # MOV is unusual for max-compat
+      [[ "$OUTPUT_EXT" == "mov" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
+          "MOV is unusual for max compatibility. MP4 recommended for widest device support."
+
+      # Lossless passthrough defeats compatibility
+      (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
+        _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
+          "Lossless audio (TrueHD/DTS-HD MA) is not widely supported. AAC is recommended."
+
+      # HEVC may not play everywhere
+      [[ "$VIDEO_CODEC" == "libx265" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--video-codec libx265" \
+          "HEVC is less widely supported than H.264 for universal playback."
+
+      # Keeping DV enabled makes no sense for SDR universal output
+      (( ! DISABLE_DV )) && \
+        _warn_conflict "$PROFILE_NAME" "(DV enabled)" \
+          "Dolby Vision in an SDR/H.264 universal output is contradictory. DV will be stripped."
+      ;;
+
+  esac
+
+  # Cross-profile: warn on any flag combination that is inherently contradictory
+  if (( TONEMAP_HDR_TO_SDR )) && [[ "$VIDEO_CODEC" == "libx265" ]]; then
+    warn "Tone-mapping to SDR with HEVC output: SDR content in HEVC is valid but unusual. Consider libx264 for max compatibility."
+  fi
+
+  if (( VIDEO_COPY_IF_COMPLIANT )) && (( TONEMAP_HDR_TO_SDR )); then
+    warn "VIDEO_COPY_IF_COMPLIANT + TONEMAP_HDR_TO_SDR: copy will be skipped when tone-mapping is needed."
+  fi
+
+  if (( SUB_BURN_FORCED )) && (( ! SUB_INCLUDE_FORCED )); then
+    warn "SUB_BURN_FORCED=1 but SUB_INCLUDE_FORCED=0: no forced subtitles to burn."
+  fi
+
+  if (( SUB_EXPORT_EXTERNAL )) && [[ "$OUTPUT_EXT" == "mkv" ]]; then
+    warn "SUB_EXPORT_EXTERNAL with MKV: MKV natively supports multiple subtitle tracks. External SRT export is unnecessary but will proceed as requested."
+  fi
+fi
+
+
 if (( PRINT_EFFCONF )); then
   cat <<EOF
 Effective config (post config-files + profile + CLI):
 
   [Profile]
   PROFILE_NAME              = ${PROFILE_NAME:-<none>}
+  PROFILE_SOURCE            = ${_PROFILE_SOURCE:-<none>}
 
   [Video — Encode]
   VIDEO_CODEC               = $VIDEO_CODEC
@@ -654,21 +802,6 @@ Effective config (post config-files + profile + CLI):
   KEEP_TEMP_ALWAYS          = $KEEP_TEMP_ALWAYS
 EOF
   exit 0
-fi
-
-# ===== Section 7b: Profile + flag conflict warnings ============================================
-if [[ -n "${PROFILE_NAME:-}" ]]; then
-  case "$PROFILE_NAME" in
-    dv-archival)
-      (( DISABLE_DV )) && warn "Profile 'dv-archival' with --no-dv: DV archival without DV is pointless."
-      ;;
-    hdr10-hq)
-      (( ! DISABLE_DV )) && warn "Profile 'hdr10-hq' expects DV to be stripped; ensure --no-dv or profile default is active."
-      ;;
-    universal)
-      [[ "$OUTPUT_EXT" == "mkv" ]] && warn "Profile 'universal' with mkv: unusual combination (mp4 recommended for max compat)."
-      ;;
-  esac
 fi
 
 # ===== Section 8: Required tools ===============================================================
