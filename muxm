@@ -40,6 +40,7 @@ FAILED=0
 FAIL_MSG=""
 EXIT_CODE=1
 PRINT_EFFCONF=0
+# TODO(future): Config file rotation — write-back of resolved config to disk
 CONFIG_WRITE_ROTATE=0
 CONFIG_WRITE_PATH=""
 PROFILE_NAME=""
@@ -88,6 +89,7 @@ declare -i MAX_AUDIO_CHANNELS=8
 declare -i ADD_STEREO_IF_MULTICH=1
 EAC3_BITRATE_5_1="640k"
 EAC3_BITRATE_7_1="768k"
+# TODO(future): Parallel audio transcode when multiple outputs needed
 declare -i PARALLEL_AUDIO=0
 
 # ---- Subtitles
@@ -103,8 +105,10 @@ SUB_OCR_LANG="eng"
 
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
+# TODO(future): MP4 interleave duration for streaming optimization
 declare -i MP4_INTERLEAVE_MS=500
 TAG_LANGUAGE_DEFAULT="und"
+# TODO(future): Include descriptive titles in audio stream metadata tags
 declare -i INCLUDE_AUDIO_TITLES=1
 
 # ---- Operational defaults
@@ -154,9 +158,19 @@ declare -i SKIP_IF_IDEAL=0
 declare -i REPORT_JSON=0
 
 # ===== Section 5: Basic helpers ===============================================================
+# ---- Logging helpers ----
+# All output goes to stderr to keep stdout clean for piping.
+# say()  — plain informational message (no prefix)
+# note() — informational with ℹ️  prefix
+# warn() — warning with ⚠️  prefix
+# die()  — fatal error with ❌ prefix; exits with code (default 1)
+#           Usage: die "message" or die <code> "message"
 say()  { printf "%s\n" "$@" >&2; }
 note() { printf "ℹ️  %s\n" "$@" >&2; }
 warn() { printf "⚠️  %s\n" "$@" >&2; }
+
+# Lowercase a string (avoids repeated inline tr calls)
+_lower(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 die()  {
   local code=1
@@ -944,6 +958,12 @@ trap 'on_error $LINENO "$BASH_COMMAND" "$?"' ERR
 trap 'FAILED=1; EXIT_CODE=130; FAIL_MSG="Interrupted by user (SIGINT)"; exit 130' INT
 trap 'FAILED=1; EXIT_CODE=143; FAIL_MSG="Terminated (SIGTERM)"; exit 143' TERM
 
+_print_completed_steps(){
+  [[ ${#COMPLETED_STEPS[@]} -gt 0 ]] || return 0
+  echo "---- Completed steps ----"
+  for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
+}
+
 on_exit() {
   local have_result=0
   
@@ -964,10 +984,7 @@ on_exit() {
       note "Build SUCCEEDED."
     fi
 
-    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
-      echo "---- Completed steps ----"
-      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
-    fi
+    _print_completed_steps
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
       rm -rf "$WORKDIR"
@@ -979,10 +996,7 @@ on_exit() {
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
     
-    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
-      echo "---- Completed steps ----"
-      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
-    fi
+    _print_completed_steps
     echo "See log: $LOGFILE"
 
     # Clean up temp output file on failure
@@ -1062,10 +1076,10 @@ check_skip_if_ideal() {
 
   local src_codec src_pix src_ext ideal=1
 
-  src_codec="$(_probe_field codec_name "$SRC_ABS" | tr '[:upper:]' '[:lower:]')"
-  src_pix="$(_probe_field pix_fmt "$SRC_ABS" | tr '[:upper:]' '[:lower:]')"
+  src_codec="$(_lower "$(_probe_field codec_name)")"
+  src_pix="$(_lower "$(_probe_field pix_fmt)")"
   src_ext="${SRC_ABS##*.}"
-  src_ext="$(printf '%s' "$src_ext" | tr '[:upper:]' '[:lower:]')"
+  src_ext="$(_lower "$src_ext")"
 
   local reason=""
 
@@ -1138,17 +1152,21 @@ check_skip_if_ideal() {
   fi
 }
 
-# Generic probe helper - reduces code duplication
-_probe_stream_from_cache() {
-  local stream_type="$1" idx="$2" field="$3"
-  local jq_query=".streams[] | select(.codec_type==\"${stream_type}\") | select(.index==(${idx} + ([.streams[] | select(.codec_type==\"${stream_type}\")] | to_entries[${idx}].value.index // ${idx}))) | .${field} // empty"
-  
-  printf '%s\n' "$METADATA_CACHE" | jq -r "$jq_query" 2>/dev/null | head -n1 || true
-}
-
+# Query a field from the first video stream in the metadata cache.
+# Falls back to ffprobe if cache is empty (called before cache_stream_metadata).
+# Args: $1 — field name (e.g., codec_name, pix_fmt, color_primaries)
+#        $2 — (optional) source file path, only used in pre-cache fallback
+# Globals: METADATA_CACHE (read), FFPROBE_FLAGS (read)
 _probe_field(){
-  ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$1" \
-          -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true
+  local field="$1"
+  if [[ -n "${METADATA_CACHE:-}" ]]; then
+    printf '%s\n' "$METADATA_CACHE" | jq -r \
+      "[.streams[] | select(.codec_type==\"video\")] | .[0].$field // empty" 2>/dev/null | head -n1 || true
+  else
+    # Pre-cache fallback (should only occur if called before cache_stream_metadata)
+    ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$field" \
+            -of default=nk=1:nw=1 "${2:-}" 2>/dev/null | head -n1 || true
+  fi
 }
 
 # Check if METADATA_CACHE contains at least one stream of the given type.
@@ -1165,16 +1183,16 @@ TARGET_PIXFMT="yuv420p"
 COLOR_ARGS=()
 
 decide_color_and_pixfmt() {
-  local src="$1" pix prim trc cspace
-  pix="$(_probe_field pix_fmt "$src")"
-  prim="$(_probe_field color_primaries "$src")"
-  trc="$(_probe_field color_transfer "$src")"
-  cspace="$(_probe_field color_space "$src")"
+  local pix prim trc cspace
+  pix="$(_probe_field pix_fmt)"
+  prim="$(_probe_field color_primaries)"
+  trc="$(_probe_field color_transfer)"
+  cspace="$(_probe_field color_space)"
 
-  prim="$(printf %s "$prim"    | tr '[:upper:]' '[:lower:]')"
-  trc="$(printf %s "$trc"      | tr '[:upper:]' '[:lower:]')"
-  cspace="$(printf %s "$cspace"| tr '[:upper:]' '[:lower:]')"
-  pix="$(printf %s "$pix"      | tr '[:upper:]' '[:lower:]')"
+  prim="$(_lower "$prim")"
+  trc="$(_lower "$trc")"
+  cspace="$(_lower "$cspace")"
+  pix="$(_lower "$pix")"
 
   local is_10bit=0 chroma="420"
   [[ "$pix" =~ p10 ]] && is_10bit=1
@@ -1301,8 +1319,8 @@ declare -i HAS_AUDIO=0
 # Check if source video is compliant for copy (no re-encode needed)
 _video_is_copy_compliant() {
   local src_codec src_pix
-  src_codec="$(_probe_field codec_name "$SRC_ABS" | tr '[:upper:]' '[:lower:]')"
-  src_pix="$(_probe_field pix_fmt "$SRC_ABS" | tr '[:upper:]' '[:lower:]')"
+  src_codec="$(_lower "$(_probe_field codec_name)")"
+  src_pix="$(_lower "$(_probe_field pix_fmt)")"
 
   # Check codec match
   if [[ "$VIDEO_CODEC" == "libx265" && "$src_codec" != "hevc" ]]; then
@@ -1368,7 +1386,7 @@ run_video_pipeline() {
     # Extract HEVC elementary stream for DV RPU extraction
     if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err"; then
       local codec
-      codec="$(_probe_field codec_name "$SRC_ABS")"
+      codec="$(_probe_field codec_name)"
       warn "Could not demux raw ES - source codec: ${codec:-unknown}. DV extraction may be skipped."
       warn "See: $WORKDIR/demux.err for details"
       : > "$V_SRC_ES" 2>/dev/null || true
@@ -1530,24 +1548,28 @@ _audio_stream_count(){
   printf '%s\n' "$METADATA_CACHE" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null || echo 0
 }
 
-# Get audio field from cached metadata
-# Args: stream_index field_name
+# Get audio field from cached metadata (single jq call)
+# Args: $1 — audio stream index (0-based, relative to audio streams)
+#        $2 — field name (jq path, e.g., codec_name, channels)
+# Globals: METADATA_CACHE (read)
 _audio_field(){
-  local idx="$1" field="$2" stream_idx
-  stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].index" 2>/dev/null)
-  printf '%s\n' "$METADATA_CACHE" | jq -r ".streams[] | select(.index==$stream_idx) | .$field // empty" 2>/dev/null | head -n1 || true
+  local idx="$1" field="$2"
+  printf '%s\n' "$METADATA_CACHE" | jq -r \
+    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].$field // empty" 2>/dev/null | head -n1 || true
 }
 
-# Get audio tag from cached metadata
+# Get audio tag from cached metadata (single jq call)
+# Args: $1 — audio stream index, $2 — tag name (e.g., language, title)
+# Globals: METADATA_CACHE (read)
 _audio_tag(){
-  local idx="$1" tag="$2" stream_idx
-  stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].index" 2>/dev/null)
-  printf '%s\n' "$METADATA_CACHE" | jq -r ".streams[] | select(.index==$stream_idx) | .tags.$tag // empty" 2>/dev/null | head -n1 || true
+  local idx="$1" tag="$2"
+  printf '%s\n' "$METADATA_CACHE" | jq -r \
+    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].tags.$tag // empty" 2>/dev/null | head -n1 || true
 }
 
 _audio_lang(){
   local lang
-  lang="$(_audio_tag "$1" language | tr '[:upper:]' '[:lower:]')"
+  lang="$(_lower "$(_audio_tag "$1" language)")"
   [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
   echo "$lang"
 }
@@ -1568,7 +1590,7 @@ _audio_bitrate(){
 
 _audio_codec(){
   local c
-  c="$(_audio_field "$1" codec_name | tr '[:upper:]' '[:lower:]')"
+  c="$(_lower "$(_audio_field "$1" codec_name)")"
   [[ -z "$c" ]] && c="unknown"
   echo "$c"
 }
@@ -1582,7 +1604,8 @@ _audio_codec_rank(){
   local codec="$1" list="$AUDIO_CODEC_PREFERENCE" item i=0
   IFS=',' read -r -a arr <<<"$list"
   for item in "${arr[@]}"; do
-    item="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    item="$(_lower "$item")"
+    item="${item// /}"   # strip spaces
     [[ -z "$item" ]] && continue
     if [[ "$item" == "$codec" ]]; then echo "$i"; return 0; fi
     ((i++))
@@ -1877,50 +1900,58 @@ list_sub_indices(){
   for (( i=0; i<n; i++ )); do echo "$i"; done
 }
 
-# Get subtitle field from cached metadata
+# Get subtitle field from cached metadata (single jq call)
+# Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
+#        $2 — field name (jq path, e.g., codec_name)
+# Globals: METADATA_CACHE (read)
 _sp_sub_field() {
-  local idx="$1" field="$2" stream_idx
-  stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].index" 2>/dev/null)
-  printf '%s\n' "$METADATA_CACHE" | jq -r ".streams[] | select(.index==$stream_idx) | .$field // empty" 2>/dev/null | head -n1 || true
+  local idx="$1" field="$2"
+  printf '%s\n' "$METADATA_CACHE" | jq -r \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].$field // empty" 2>/dev/null | head -n1 || true
 }
 
-# Get subtitle tag from cached metadata
+# Get subtitle tag from cached metadata (single jq call)
+# Args: $1 — subtitle stream index, $2 — tag name (e.g., language, title)
+# Globals: METADATA_CACHE (read)
 _sp_sub_tag() {
-  local idx="$1" tag="$2" stream_idx
-  stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].index" 2>/dev/null)
-  printf '%s\n' "$METADATA_CACHE" | jq -r ".streams[] | select(.index==$stream_idx) | .tags.$tag // empty" 2>/dev/null | head -n1 || true
+  local idx="$1" tag="$2"
+  printf '%s\n' "$METADATA_CACHE" | jq -r \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].tags.$tag // empty" 2>/dev/null | head -n1 || true
 }
 
-# Check if subtitle stream has forced disposition
+# Check if subtitle stream has forced disposition (single jq call)
+# Args: $1 — subtitle stream index
+# Returns: 1 if forced, 0 otherwise
+# Globals: METADATA_CACHE (read)
 _sp_sub_dispo_forced(){
-  local idx="$1" stream_idx
-  stream_idx=$(printf '%s\n' "$METADATA_CACHE" | jq "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].index" 2>/dev/null)
-  printf '%s\n' "$METADATA_CACHE" | jq ".streams[] | select(.index==$stream_idx) | .disposition.forced // 0" 2>/dev/null | head -n1 || echo 0
+  local idx="$1"
+  printf '%s\n' "$METADATA_CACHE" | jq \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].disposition.forced // 0" 2>/dev/null | head -n1 || echo 0
 }
 
 _sp_sub_lang(){
   local lang
-  lang="$(_sp_sub_tag "$1" language | tr '[:upper:]' '[:lower:]')"
+  lang="$(_lower "$(_sp_sub_tag "$1" language)")"
   [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
   echo "$lang"
 }
 
 _is_forced_title(){
   local t
-  t="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
+  t="$(_lower "$1")"
   [[ "$t" =~ forced|signs|foreign ]]
 }
 
 _is_sdh_title(){
   local t
-  t="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
+  t="$(_lower "$1")"
   [[ "$t" =~ (^|[^a-z])(sdh|hi)([^a-z]|$)|hearing|impaired|cc|caption ]]
 }
 
 # Describe subtitle stream for user
 describe_sub_stream(){
   local i="$1" codec lang title forced flags=""
-  codec="$(_sp_sub_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
+  codec="$(_lower "$(_sp_sub_field "$i" codec_name)")"
   lang="$(_sp_sub_lang "$i")"
   title="$(_sp_sub_tag "$i" title)"
   forced="$(_sp_sub_dispo_forced "$i")"
@@ -1947,7 +1978,7 @@ _pick_direct_text_sub_relidx(){
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
     [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
-    codec="$(_sp_sub_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
+    codec="$(_lower "$(_sp_sub_field "$i" codec_name)")"
     if _is_text_sub_codec "$codec"; then
       echo "$i"
       return 0
@@ -1961,7 +1992,7 @@ _pick_direct_text_sub_relidx(){
 # Returns: path to SRT file or empty string if failed
 _prepare_sub_to_srt(){
   local idx="$1" codec srt sup vob_base
-  codec="$(_sp_sub_field "$idx" codec_name | tr '[:upper:]' '[:lower:]')"
+  codec="$(_lower "$(_sp_sub_field "$idx" codec_name)")"
   srt="$WORKDIR/sub.${idx}.srt"
 
   if (( DRY_RUN )); then
@@ -2353,10 +2384,12 @@ main() {
     if check_skip_if_ideal; then
       # Source is ideal — write report and exit clean
       write_json_report
-      # Copy source to output (or symlink) since it's already ideal
+      # Hardlink source to output (instant on same filesystem); fall back to copy
       if (( ! DRY_RUN )); then
-        cp -f "$SRC_ABS" "$TMP_OUT"
-        note "Copied source to output (already ideal)."
+        if ! ln -f "$SRC_ABS" "$TMP_OUT" 2>/dev/null; then
+          cp -f "$SRC_ABS" "$TMP_OUT"
+        fi
+        note "Linked/copied source to output (already ideal)."
       fi
       mark_done "Skip-if-ideal (source compliant)"
       FAILED=0
@@ -2377,7 +2410,7 @@ main() {
   (( DISABLE_DV )) && note "DV handling explicitly disabled via --no-dv."
 
   # Decide color space and build x265 params
-  decide_color_and_pixfmt "$SRC_ABS"
+  decide_color_and_pixfmt
   build_x265_params
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
