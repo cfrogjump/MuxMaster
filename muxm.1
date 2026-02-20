@@ -62,5 +62,10 @@ muxm --dry-run --skip-video Movie.mkv out.mp4
 \fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
 .PP
 CLI flags always override config files.
+.SH DEPENDENCIES
+Required: \fBffmpeg\fR, \fBffprobe\fR, \fBjq\fR.
+.PP
+Optional: \fBdovi_tool\fR (Dolby Vision; auto-disabled if missing),
+\fBsub2srt\fR or equivalent OCR tool (PGS subtitle conversion).
 .SH AUTHOR
 Jamey Wicklund (theBluWiz).

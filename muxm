@@ -29,7 +29,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="0.10.0"
+readonly VERSION="0.10.1"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -251,6 +251,15 @@ write_checksum(){
   fi
   note "Writing checksum → ${p}.sha256"
   "${cmd[@]}" "$p" > "${p}.sha256"
+}
+
+# Validate that a media file exists, is non-empty, and is parseable by ffprobe.
+# Args: $1 — file path, $2 — context label for error message
+# Dies on failure.
+_validate_media_file(){
+  local file="$1" label="${2:-output}"
+  [[ -s "$file" ]] || die 41 "$label produced empty file"
+  ffprobe -v error "$file" >/dev/null 2>&1 || die 41 "$label produced corrupt file"
 }
 
 ffmpeg_has_muxer(){
@@ -764,7 +773,9 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 fi
 
 
-if (( PRINT_EFFCONF )); then
+# Display the resolved configuration from all sources (config files + profile + CLI).
+# Called when --print-effective-config is passed. Exits after printing.
+print_effective_config(){
   cat <<EOF
 Effective config (post config-files + profile + CLI):
 
@@ -835,7 +846,9 @@ Effective config (post config-files + profile + CLI):
   KEEP_TEMP_ALWAYS          = $KEEP_TEMP_ALWAYS
 EOF
   exit 0
-fi
+}
+
+(( PRINT_EFFCONF )) && print_effective_config
 
 # ===== Section 8: Required tools ===============================================================
 need ffmpeg
@@ -942,7 +955,7 @@ FFPROBE_FLAGS+=("${PROBE_OPTS[@]}")
 
 # ===== Section 11: Workdir =====================================================================
 WORKDIR="$(
-  TMPDIR="$OUT_DIR" mktemp -d ".muxm.tmp.XXXXXXXX"
+  mktemp -d "${OUT_DIR}/.muxm.tmp.XXXXXXXX"
 )" || die 11 "Cannot create working directory under: $OUT_DIR"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
@@ -1029,6 +1042,10 @@ cache_stream_metadata() {
   note "→ Caching stream metadata..."
   METADATA_CACHE="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -of json "$SRC_ABS" 2>/dev/null)" || {
     die 12 "Failed to probe source file metadata - file may be corrupt"
+  }
+  # Validate JSON integrity before downstream helpers rely on it
+  printf '%s\n' "$METADATA_CACHE" | jq empty 2>/dev/null || {
+    die 12 "ffprobe returned invalid JSON - file may be corrupt or ffprobe version incompatible"
   }
 }
 
@@ -1205,10 +1222,10 @@ decide_color_and_pixfmt() {
   fi
 
   # Color Space Decision Tree:
-  # ┌─ TONEMAP_HDR_TO_SDR=1 → Force SDR output (tone-map in video pipeline)
-  # ├─ HLG (arib-std-b67) → HDR profile, bt2020
-  # ├─ HDR10 (bt2020/smpte2084) → HDR10 profile, bt2020
-  # └─ SDR (other) → SDR profile, 10-bit if source is 10-bit
+  # ┌─ TONEMAP_HDR_TO_SDR=1 + HDR source → SDR-TONEMAP (force bt709)
+  # ├─ HLG (arib-std-b67)                → HLG profile, bt2020
+  # ├─ HDR10 (bt2020/smpte2084)          → HDR10 profile, bt2020
+  # └─ SDR (everything else)             → SDR, 10-bit if source is 10-bit
   
   local tgt_pix="yuv420p" profile="SDR"
 
@@ -1340,6 +1357,19 @@ _video_is_copy_compliant() {
     return 1
   fi
 
+  # Check DV profile compatibility when DV handling is active.
+  # For atv-directplay-hq, only Profile 8 is acceptable for copy; other
+  # profiles (e.g., P7) require RPU conversion and cannot be stream-copied.
+  if (( IS_DV && ! DISABLE_DV )); then
+    if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
+      local dv_check
+      dv_check="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)"
+      if ! printf '%s\n' "$dv_check" | grep -qiE 'dv_profile.*8'; then
+        return 1  # Not copy-compliant; needs DV conversion
+      fi
+    fi
+  fi
+
   return 0
 }
 
@@ -1362,6 +1392,7 @@ run_video_pipeline() {
         warn "Video copy failed — falling back to re-encode. See: $WORKDIR/copy.err"
         # Fall through to encode path
       else
+        _validate_media_file "$V_MIXED" "Video stream copy"
         mark_done "Video stream copy (compliant)"
         # Still attempt DV handling on the copied stream
         if (( IS_DV && ! DISABLE_DV )); then
@@ -1414,9 +1445,20 @@ run_video_pipeline() {
   if (( SUB_BURN_FORCED )) && [[ -n "${SRT_FORCED_BURN_PATH:-}" && -s "${SRT_FORCED_BURN_PATH:-}" ]]; then
     local safe_srt="$WORKDIR/burn_forced.srt"
     cp -f "$SRT_FORCED_BURN_PATH" "$safe_srt"
-    vf_filters+=("subtitles='${safe_srt}'")
+    # Escape characters special to ffmpeg's filter graph syntax
+    local escaped_srt="$safe_srt"
+    local _sq="'"
+    escaped_srt="${escaped_srt//\\/\\\\}"        # backslash
+    escaped_srt="${escaped_srt//:/\\:}"          # colon
+    escaped_srt="${escaped_srt//$_sq/\\$_sq}"    # single quote
+    escaped_srt="${escaped_srt//\[/\\[}"         # opening bracket
+    escaped_srt="${escaped_srt//\]/\\]}"         # closing bracket
+    vf_filters+=("subtitles='${escaped_srt}'")
     note "→ Burning forced subtitles into video stream"
     report_add "sub_burn_forced" "true"
+  elif (( SUB_BURN_FORCED )); then
+    warn "SUB_BURN_FORCED requested but no forced subtitle was prepared — encoding without burn-in."
+    report_add "sub_burn_forced" "skipped (no forced subtitle available)"
   fi
 
   # Build -vf string
@@ -1463,13 +1505,7 @@ run_video_pipeline() {
     fi
 
     # Validate encoded output
-    if [[ ! -s "$V_BASE" ]]; then
-      die 40 "Base video encode produced empty file"
-    fi
-    
-    if ! ffprobe -v error "$V_BASE" >/dev/null 2>&1; then
-      die 40 "Base video encode produced corrupt file"
-    fi
+    _validate_media_file "$V_BASE" "Base video encode"
 
     mark_done "Encode base video"
   fi
@@ -1507,7 +1543,10 @@ run_video_pipeline() {
     die 40 "Dolby Vision RPU extraction failed and fallback is disabled"
   fi
 
-  # Optional: convert DV profile if requested
+  # Convert DV RPU from Profile 7 to Profile 8.1 if requested.
+  # Profile 7 uses a separate enhancement layer incompatible with single-track MP4.
+  # Profile 8.1 embeds DV metadata in the base layer, enabling playback on
+  # Apple TV 4K while maintaining HDR10 fallback for non-DV devices.
   if (( DV_CONVERT_TO_P81_IF_FAIL )); then
     if dovi_tool convert --rpu-in "$RPU_P7" --rpu-out "$RPU_P81" >/dev/null 2>&1; then
       note "DV profile converted (P7 → P8.1)"
@@ -1613,7 +1652,20 @@ _audio_codec_rank(){
   echo "99"
 }
 
-# Score audio stream for selection
+# Audio stream scoring algorithm for automatic track selection.
+#
+# Factors (highest weight first):
+#   1. Channel count        — ch × AUDIO_SCORE_CHANNEL_MULTIPLIER (20)
+#      More channels = higher fidelity; 7.1 scores higher than 5.1.
+#   2. Surround bonus       — +AUDIO_SCORE_SURROUND_BONUS (30) if ≥ 6ch
+#      Discrete jump to prefer surround over stereo.
+#   3. Language preference   — +AUDIO_SCORE_LANG_BONUS_ENG (25) if English
+#      Ensures preferred language wins over higher-channel foreign tracks.
+#   4. Codec preference      — (120 − rank) from AUDIO_CODEC_PREFERENCE list
+#      eac3 > ac3 > aac > alac > other by default.
+#   5. Bitrate (tie-break)   — br / 50000
+#      Small bonus for higher-bitrate tracks when all else is equal.
+#
 # Returns: score|idx|codec|channels|lang|title
 _score_audio_stream(){
   local idx="$1"
@@ -1713,22 +1765,19 @@ audio_lossless_muxable(){
   return 1
 }
 
-# Determine target codec for audio transcode based on channel count
-audio_target_codec_for_transcode(){
+# Determine target codec and bitrate for audio transcode based on channel count.
+# Outputs: "codec bitrate" (space-separated, suitable for `read`)
+# Channel thresholds are centralized here to avoid divergence.
+# Args: $1 — channel count
+audio_transcode_target(){
   local ch="$1"
-  if (( ch >= 6 )); then
-    echo "eac3"
+  if (( ch >= 8 )); then
+    echo "eac3 $EAC3_BITRATE_7_1"
+  elif (( ch >= 6 )); then
+    echo "eac3 $EAC3_BITRATE_5_1"
   else
-    echo "aac"
+    echo "aac 192k"
   fi
-}
-
-# Determine target bitrate based on channel count
-audio_target_bitrate(){
-  local ch="$1"
-  if (( ch >= 8 )); then echo "$EAC3_BITRATE_7_1"; return 0; fi
-  if (( ch >= 6 )); then echo "$EAC3_BITRATE_5_1"; return 0; fi
-  echo "192k"
 }
 
 run_audio_pipeline(){
@@ -1770,7 +1819,7 @@ run_audio_pipeline(){
   report_add "audio_source" "track #$idx: $codec ${ch}ch [$lang]"
 
   A_PRIMARY="$WORKDIR/audio_primary.${codec}"
-  AAC_STEREO="$WORKDIR/audio_stereo.ac3"
+  AAC_STEREO="$WORKDIR/audio_stereo.aac"
   HAS_AUDIO=1
 
   # Enforce MAX_AUDIO_CHANNELS
@@ -1808,7 +1857,7 @@ run_audio_pipeline(){
       note "Audio already matches forced codec ($tgt_codec). Copying."
       report_add "audio_action" "copy (already $tgt_codec)"
     else
-      tgt_br="$(audio_target_bitrate "$effective_ch")"
+      read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       if [[ "$tgt_codec" == "aac" ]]; then
         tgt_br="256k"
       fi
@@ -1822,8 +1871,7 @@ run_audio_pipeline(){
       report_add "audio_action" "lossless passthrough ($codec)"
     else
       # Lossless but can't mux into target container — transcode to best compatible
-      tgt_codec="$(audio_target_codec_for_transcode "$effective_ch")"
-      tgt_br="$(audio_target_bitrate "$effective_ch")"
+      read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       note "Lossless $codec can't mux into $MUX_FORMAT — transcoding to $tgt_codec."
       report_add "audio_action" "transcode (lossless $codec incompatible with $MUX_FORMAT)"
     fi
@@ -1832,8 +1880,7 @@ run_audio_pipeline(){
     note "Direct Play audio codec detected ($codec). Copying without conversion."
     report_add "audio_action" "copy ($codec direct-play compatible)"
   else
-    tgt_codec="$(audio_target_codec_for_transcode "$effective_ch")"
-    tgt_br="$(audio_target_bitrate "$effective_ch")"
+    read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
     note "Transcoding audio: $codec → $tgt_codec (channels=${effective_ch}ch, bitrate=$tgt_br)"
     report_add "audio_action" "transcode $codec → $tgt_codec"
   fi
@@ -1876,7 +1923,7 @@ run_audio_pipeline(){
   if (( ADD_STEREO_IF_MULTICH )) && (( effective_ch > 2 )); then
     note "→ Preparing stereo fallback → $AAC_STEREO"
     if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" \
-      -c:a ac3 -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" 2>"$WORKDIR/audio_stereo.err"; then
+      -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" 2>"$WORKDIR/audio_stereo.err"; then
       warn "Stereo fallback creation failed - continuing without it. See: $WORKDIR/audio_stereo.err"
       AAC_STEREO=""
     else
@@ -2091,6 +2138,27 @@ declare -a EXTERNAL_SRT_PATHS=()  # Paths of external SRT files exported alongsi
 declare -i SRT_DIRECT_MAP=0
 DIRECT_SUB_RELIDX=""
 
+# Process a prepared subtitle: either export as external SRT or embed.
+# Sets _SUB_EMBED_PATH to the SRT path if embedded, empty if exported externally.
+# Args: $1 — SRT file path, $2 — label (full|sdh)
+# Globals: SUB_EXPORT_EXTERNAL, OUT, OUTPUT_EXT, DRY_RUN, EXTERNAL_SRT_PATHS (modified)
+_SUB_EMBED_PATH=""
+_export_or_embed_sub(){
+  local srt_path="$1" label="$2"
+  _SUB_EMBED_PATH=""
+  if (( SUB_EXPORT_EXTERNAL )); then
+    local ext_srt="${OUT%.${OUTPUT_EXT}}.${label}.srt"
+    (( ! DRY_RUN )) && cp -f "$srt_path" "$ext_srt" 2>/dev/null || true
+    EXTERNAL_SRT_PATHS+=("$ext_srt")
+    note "[Subs] Exported $label → external $ext_srt"
+    report_add "sub_${label}" "external srt"
+  else
+    _SUB_EMBED_PATH="$srt_path"
+    note "[Subs] Prepared $label → $srt_path"
+    report_add "sub_${label}" "embedded"
+  fi
+}
+
 # Build subtitle processing plan
 build_subtitle_plan(){
   if (( SKIP_SUBS )); then
@@ -2161,39 +2229,20 @@ build_subtitle_plan(){
   if [[ -n "$full_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
     p="$(_prepare_sub_to_srt "$full_idx")"
     if [[ -n "$p" ]]; then
-      if (( SUB_EXPORT_EXTERNAL )); then
-        # Export as external SRT alongside output
-        local ext_srt="${OUT%.${OUTPUT_EXT}}.full.srt"
-        if (( ! DRY_RUN )); then
-          cp -f "$p" "$ext_srt" 2>/dev/null || true
-        fi
-        EXTERNAL_SRT_PATHS+=("$ext_srt")
-        note "[Subs] Exported Full → external $ext_srt"
-        report_add "sub_full" "external srt"
-      else
-        SRT_FULL="$p"
+      _export_or_embed_sub "$p" "full"
+      if [[ -n "$_SUB_EMBED_PATH" ]]; then
+        SRT_FULL="$_SUB_EMBED_PATH"
         ((pick_count++))
-        note "[Subs] Prepared Full → $SRT_FULL"
-        report_add "sub_full" "embedded"
       fi
     fi
   fi
   if [[ -n "$sdh_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
     p="$(_prepare_sub_to_srt "$sdh_idx")"
     if [[ -n "$p" ]]; then
-      if (( SUB_EXPORT_EXTERNAL )); then
-        local ext_srt="${OUT%.${OUTPUT_EXT}}.sdh.srt"
-        if (( ! DRY_RUN )); then
-          cp -f "$p" "$ext_srt" 2>/dev/null || true
-        fi
-        EXTERNAL_SRT_PATHS+=("$ext_srt")
-        note "[Subs] Exported SDH → external $ext_srt"
-        report_add "sub_sdh" "external srt"
-      else
-        SRT_SDH="$p"
+      _export_or_embed_sub "$p" "sdh"
+      if [[ -n "$_SUB_EMBED_PATH" ]]; then
+        SRT_SDH="$_SUB_EMBED_PATH"
         ((pick_count++))
-        note "[Subs] Prepared SDH → $SRT_SDH"
-        report_add "sub_sdh" "embedded"
       fi
     fi
   fi
@@ -2212,6 +2261,9 @@ build_subtitle_plan(){
 }
 
 # ===== Section 23: Final mux ===================================================================
+# Assemble all prepared streams (video, primary audio, stereo fallback, subtitles)
+# into the target container format. Handles stream mapping, codec assignment,
+# chapter/metadata policy, and validates the muxed output.
 mux_final() {
   say "→ Muxing final ${OUTPUT_EXT^^} with ffmpeg → $TMP_OUT"
 
@@ -2350,13 +2402,7 @@ mux_final() {
   fi
 
   # Validate muxed output
-  if [[ ! -s "$TMP_OUT" ]]; then
-    die 41 "Final mux produced empty file"
-  fi
-  
-  if ! ffprobe -v error "$TMP_OUT" >/dev/null 2>&1; then
-    die 41 "Final mux produced corrupt file"
-  fi
+  _validate_media_file "$TMP_OUT" "Final mux"
 
   mark_done "Mux final ${OUTPUT_EXT}"
 }
@@ -2378,6 +2424,9 @@ main() {
 
   # Cache metadata once for all operations
   cache_stream_metadata
+
+  # Validate source contains at least one video stream
+  _has_stream video || die 12 "Source file contains no video streams"
 
   # Skip-if-ideal: check early and exit if source is already compliant
   if (( SKIP_IF_IDEAL )); then

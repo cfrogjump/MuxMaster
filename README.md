@@ -117,6 +117,7 @@ sudo mv muxm /usr/local/bin/muxm
 ### Dependencies
 
 - **ffmpeg** and **ffprobe** (required)
+- **jq** (required — JSON parsing for stream metadata)
 - **dovi_tool** (required for Dolby Vision handling; auto-disabled if missing)
 - **sub2srt** or equivalent OCR tool (optional, for PGS subtitle conversion)
 
@@ -193,6 +194,8 @@ Hardcoded defaults
         → --profile <name> (format profile)
           → CLI flags      (highest — always wins)
 ```
+
+> ⚠️ **Security note:** `muxm` sources `./.muxmrc` from the current working directory. Do not run `muxm` inside untrusted directories (e.g., downloaded archives or shared network mounts) as a malicious `.muxmrc` could execute arbitrary code. System and user config files (`/etc/.muxmrc`, `~/.muxmrc`) are not affected by this concern.
 
 ### Setting a Default Profile
 
