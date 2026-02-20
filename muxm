@@ -29,7 +29,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="0.9.1"
+readonly VERSION="0.10.0"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -225,18 +225,18 @@ filesize_pretty(){
   fi
 }
 
-checksum_cmd(){
-  command -v sha256sum >/dev/null 2>/dev/null && { echo "sha256sum"; return; }
-  command -v shasum >/dev/null 2>/dev/null && { echo "shasum -a 256"; return; }
-  echo ""
-}
-
 write_checksum(){
-  local p="$1" c
-  c="$(checksum_cmd)"
-  [[ -z "$c" ]] && { warn "Checksum tool not found"; return 0; }
+  local p="$1"
+  local -a cmd=()
+  if command -v sha256sum >/dev/null 2>&1; then
+    cmd=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    cmd=(shasum -a 256)
+  else
+    warn "Checksum tool not found"; return 0
+  fi
   note "Writing checksum → ${p}.sha256"
-  $c "$p" > "${p}.sha256"
+  "${cmd[@]}" "$p" > "${p}.sha256"
 }
 
 ffmpeg_has_muxer(){
@@ -284,7 +284,7 @@ while (( _i < ${#_prescan_args[@]} )); do
       _PROFILE_SOURCE="cli"
       _i=$((_i + 2))
     else
-      _i=$((_i + 1))
+      die 11 "--profile requires a profile name (dv-archival, hdr10-hq, atv-directplay-hq, universal)"
     fi
   else
     _filtered_args+=("${_prescan_args[$_i]}")
@@ -450,7 +450,19 @@ $USAGE_SHORT
 Profile (format presets):
   --profile NAME              Apply a named format profile. Overrides config-file
                               defaults; CLI flags still override the profile.
-                              Valid: dv-archival, hdr10-hq, atv-directplay-hq, universal
+
+  Available profiles:
+    dv-archival               Preserve DV + HDR10 + lossless audio. Copy video
+                              (no re-encode). Skip if already ideal. JSON report.
+    hdr10-hq                  Strip DV, keep HDR10. HEVC CRF 17. Lossless audio
+                              + stereo fallback. MKV container.
+    atv-directplay-hq         Apple TV Direct Play. MP4, HEVC Main10, DV P8.1,
+                              E-AC-3 audio, AAC stereo fallback, burn forced subs.
+    universal                 Play anywhere. H.264 SDR (tone-map HDR), AAC stereo,
+                              burn forced subs, strip chapters/metadata. MP4.
+
+  Profiles can also be set in .muxmrc files:
+    PROFILE_NAME="atv-directplay-hq"
 
 Core options:
   -h, --help                  Show help
@@ -550,7 +562,14 @@ while [[ $# -gt 0 ]]; do
     --no-allow-dv-fallback) ALLOW_DV_FALLBACK=0; shift ;;
     --dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=1; shift ;;
     --no-dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=0; shift ;;
-    --video-codec) VIDEO_CODEC="${2:-}"; shift 2 ;;
+    --video-codec)
+      VIDEO_CODEC="${2:-}"
+      case "$VIDEO_CODEC" in
+        libx265|libx264) ;;
+        *) die 11 "Invalid --video-codec: must be libx265 or libx264 (got: $VIDEO_CODEC)" ;;
+      esac
+      shift 2
+      ;;
     --video-copy-if-compliant) VIDEO_COPY_IF_COMPLIANT=1; shift ;;
     --no-video-copy-if-compliant) VIDEO_COPY_IF_COMPLIANT=0; shift ;;
     --tonemap) TONEMAP_HDR_TO_SDR=1; shift ;;
@@ -807,6 +826,7 @@ fi
 # ===== Section 8: Required tools ===============================================================
 need ffmpeg
 need ffprobe
+need jq
 if (( ! DISABLE_DV )); then
   if ! command -v dovi_tool >/dev/null 2>&1; then
     warn "dovi_tool not found — Dolby Vision handling will be disabled."
@@ -818,7 +838,13 @@ else
 fi
 
 if (( SUB_ENABLE_OCR )); then
-  if ! command -v "$SUB_OCR_TOOL" >/dev/null 2>&1; then
+  # Security: reject OCR tool names containing shell metacharacters to prevent
+  # injection via --ocr-tool or a malicious .muxmrc. Allows alphanumerics,
+  # dots, hyphens, underscores, and forward slashes (for paths).
+  if [[ "$SUB_OCR_TOOL" =~ [^a-zA-Z0-9_./-] ]]; then
+    warn "SUB_OCR_TOOL '${SUB_OCR_TOOL}' contains disallowed characters — OCR disabled for safety."
+    SUB_ENABLE_OCR=0
+  elif ! command -v "$SUB_OCR_TOOL" >/dev/null 2>&1; then
     warn "SUB_ENABLE_OCR=1 but '${SUB_OCR_TOOL}' not found in PATH — PGS OCR will be skipped."
     SUB_ENABLE_OCR=0
   fi
@@ -994,9 +1020,11 @@ cache_stream_metadata() {
 
 # ===== Section 15b: Report helpers & skip-if-ideal =============================================
 
-# Add an entry to the JSON report accumulator
+# Add an entry to the JSON report accumulator.
+# Escapes backslash and double-quote to produce valid JSON.
 report_add() {
-  local key="$1" val="$2"
+  local key="${1//\\/\\\\}"; key="${key//\"/\\\"}"
+  local val="${2//\\/\\\\}"; val="${val//\"/\\\"}"
   REPORT_ENTRIES+=("\"${key}\": \"${val}\"")
 }
 
@@ -1010,15 +1038,19 @@ write_json_report() {
     printf '  "profile": "%s",\n' "${PROFILE_NAME:-<none>}"
     printf '  "source": "%s",\n' "$SRC_ABS"
     printf '  "output": "%s",\n' "$OUT"
-    printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    local i last=$(( ${#REPORT_ENTRIES[@]} - 1 ))
-    for (( i=0; i<${#REPORT_ENTRIES[@]}; i++ )); do
-      if (( i < last )); then
-        printf '  %s,\n' "${REPORT_ENTRIES[$i]}"
-      else
-        printf '  %s\n' "${REPORT_ENTRIES[$i]}"
-      fi
-    done
+    if (( ${#REPORT_ENTRIES[@]} > 0 )); then
+      printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      local i last=$(( ${#REPORT_ENTRIES[@]} - 1 ))
+      for (( i=0; i<${#REPORT_ENTRIES[@]}; i++ )); do
+        if (( i < last )); then
+          printf '  %s,\n' "${REPORT_ENTRIES[$i]}"
+        else
+          printf '  %s\n' "${REPORT_ENTRIES[$i]}"
+        fi
+      done
+    else
+      printf '  "timestamp": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
     printf '}\n'
   } > "$report_path" 2>/dev/null || warn "Failed to write JSON report to $report_path"
   note "JSON report written → $report_path"
@@ -1060,11 +1092,10 @@ check_skip_if_ideal() {
     esac
   fi
 
-  # Check pixel format for HDR profiles
+  # Check pixel format for HDR profiles (source must be 10-bit when target expects it)
   if (( ideal )) && [[ "$VIDEO_CODEC" == "libx265" ]]; then
     if [[ "$src_pix" != *"p10"* && "$HDR_TARGET_PIXFMT" == "yuv420p10le" ]]; then
-      # Only flag this if source should be 10-bit but isn't
-      :
+      ideal=0; reason="pixel format is $src_pix (need 10-bit for $HDR_TARGET_PIXFMT)"
     fi
   fi
 
@@ -1120,8 +1151,11 @@ _probe_field(){
           -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true
 }
 
+# Check if METADATA_CACHE contains at least one stream of the given type.
+# Args: $1 — stream type (e.g., "audio", "video", "subtitle")
+# Globals: METADATA_CACHE (read)
 _has_stream(){
-  printf '%s\n' "$METADATA_CACHE" | jq -e "[.streams[] | select(.codec_type==\"$2\")] | length > 0" >/dev/null 2>&1
+  printf '%s\n' "$METADATA_CACHE" | jq -e "[.streams[] | select(.codec_type==\"$1\")] | length > 0" >/dev/null 2>&1
 }
 
 # ===== Section 16: Color space & pixel format decision =========================================
@@ -1356,12 +1390,13 @@ run_video_pipeline() {
   fi
 
   # Forced subtitle burn-in filter (added here if SUB_BURN_FORCED and we have a forced SRT)
-  # Note: SRT_FORCED_BURN_PATH is set by subtitle plan if burn is requested
+  # Note: SRT_FORCED_BURN_PATH is set by subtitle plan if burn is requested.
+  # Instead of escaping special characters for the ffmpeg filter graph (fragile),
+  # copy the SRT to a safe temp path in the workdir where the name is controlled.
   if (( SUB_BURN_FORCED )) && [[ -n "${SRT_FORCED_BURN_PATH:-}" && -s "${SRT_FORCED_BURN_PATH:-}" ]]; then
-    # Escape special characters in the path for the subtitles filter
-    local escaped_path
-    escaped_path="$(printf '%s' "$SRT_FORCED_BURN_PATH" | sed "s/'/\\\\'/g; s/:/\\\\:/g; s/\[/\\\\[/g; s/\]/\\\\]/g")"
-    vf_filters+=("subtitles='${escaped_path}'")
+    local safe_srt="$WORKDIR/burn_forced.srt"
+    cp -f "$SRT_FORCED_BURN_PATH" "$safe_srt"
+    vf_filters+=("subtitles='${safe_srt}'")
     note "→ Burning forced subtitles into video stream"
     report_add "sub_burn_forced" "true"
   fi
@@ -2033,7 +2068,7 @@ build_subtitle_plan(){
     return 0
   fi
 
-  if ! _has_stream "$SRC_ABS" subtitle; then
+  if ! _has_stream subtitle; then
     note "[Subs] No subtitle streams detected."
     SRT_DIRECT_MAP=0
     return 0
