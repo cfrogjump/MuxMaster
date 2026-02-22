@@ -53,6 +53,12 @@ METADATA_CACHE=""
 # Tracks whether DV actually made it into the output (not just detected in source)
 declare -i OUTPUT_HAS_DV=0
 
+# DV source metadata (populated by detect_dv_info after DV detection)
+DV_SRC_PROFILE=""        # DV profile number (5, 7, 8, etc.)
+DV_SRC_COMPAT_ID=""      # BL signal compatibility ID (1=PQ/HDR10, 2=SDR, 4=HLG)
+DV_SRC_BL_PRESENT=""     # Base layer present flag
+DV_SRC_EL_PRESENT=""     # Enhancement layer present flag
+
 # JSON report accumulator (for dv-archival reporting)
 declare -a REPORT_ENTRIES=()
 
@@ -1156,11 +1162,9 @@ check_skip_if_ideal() {
   # Check DV compliance for atv-directplay-hq
   if (( ideal )) && [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
     if detect_dv; then
-      # DV present — check if it's Profile 8.1 (acceptable) or something else
-      local dv_info
-      dv_info="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)"
-      if ! printf '%s\n' "$dv_info" | grep -qiE 'dv_profile.*8'; then
-        ideal=0; reason="DV present but not Profile 8 (needs conversion)"
+      # DV present — check if it's Profile 8 (acceptable) or something else
+      if [[ "${DV_SRC_PROFILE:-}" != "8" ]]; then
+        ideal=0; reason="DV present but not Profile 8 (P${DV_SRC_PROFILE:-?}, needs conversion)"
       fi
     fi
   fi
@@ -1329,10 +1333,212 @@ detect_dv() {
   return 1
 }
 
+# Populate DV source metadata from ffprobe side data and container records.
+# Sets: DV_SRC_PROFILE, DV_SRC_COMPAT_ID, DV_SRC_BL_PRESENT, DV_SRC_EL_PRESENT
+# Must be called after detect_dv returns true and METADATA_CACHE is populated.
+# Globals: METADATA_CACHE (read), DV_SRC_* (write), FFPROBE_FLAGS (read), SRC_ABS (read)
+detect_dv_info() {
+  # Try JSON metadata cache first (structured side_data_list)
+  if [[ -n "${METADATA_CACHE:-}" ]]; then
+    local side_data
+    side_data="$(printf '%s\n' "$METADATA_CACHE" | jq -r '
+      [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]? |
+      select(.side_data_type == "DOVI configuration record")' 2>/dev/null)" || true
+
+    if [[ -n "$side_data" ]]; then
+      DV_SRC_PROFILE="$(printf '%s\n' "$side_data" | jq -r '.dv_profile // empty' 2>/dev/null)" || true
+      DV_SRC_COMPAT_ID="$(printf '%s\n' "$side_data" | jq -r '.dv_bl_signal_compatibility_id // empty' 2>/dev/null)" || true
+      DV_SRC_BL_PRESENT="$(printf '%s\n' "$side_data" | jq -r '.bl_present_flag // empty' 2>/dev/null)" || true
+      DV_SRC_EL_PRESENT="$(printf '%s\n' "$side_data" | jq -r '.el_present_flag // empty' 2>/dev/null)" || true
+    fi
+  fi
+
+  # Fallback: parse text ffprobe output if JSON didn't produce results
+  if [[ -z "${DV_SRC_PROFILE:-}" ]]; then
+    local probe_out
+    probe_out="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || return 1
+
+    DV_SRC_PROFILE="$(printf '%s\n' "$probe_out" | grep -oiE 'profile: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_COMPAT_ID="$(printf '%s\n' "$probe_out" | grep -oiE 'compatibility id: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_BL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'bl.flag: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_EL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'el.flag: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+  fi
+
+  note "DV source info: profile=${DV_SRC_PROFILE:-?}, compat_id=${DV_SRC_COMPAT_ID:-?}, bl=${DV_SRC_BL_PRESENT:-?}, el=${DV_SRC_EL_PRESENT:-?}"
+  report_add "dv_src_profile" "${DV_SRC_PROFILE:-unknown}"
+  report_add "dv_src_compat_id" "${DV_SRC_COMPAT_ID:-unknown}"
+  report_add "dv_src_el_present" "${DV_SRC_EL_PRESENT:-unknown}"
+}
+
+# Validate RPU integrity via dovi_tool info.
+# Args: $1 — path to RPU file
+# Returns: 0 if valid, 1 if invalid or dovi_tool unavailable.
+# Side effect: logs RPU frame count and detected profile.
+# Globals: WORKDIR (read)
+_validate_dv_rpu() {
+  local rpu_path="$1" rpu_info=""
+  [[ -s "$rpu_path" ]] || { warn "RPU file is empty: $rpu_path"; return 1; }
+
+  if ! command -v dovi_tool >/dev/null 2>&1; then
+    warn "dovi_tool not available — cannot validate RPU integrity."
+    return 0  # Non-fatal; proceed optimistically
+  fi
+
+  rpu_info="$(dovi_tool info -i "$rpu_path" --summary 2>"$WORKDIR/rpu_validate.err")" || {
+    warn "dovi_tool info failed on RPU — RPU may be corrupt. See: $WORKDIR/rpu_validate.err"
+    return 1
+  }
+
+  # Extract profile from RPU info
+  local rpu_profile
+  rpu_profile="$(printf '%s\n' "$rpu_info" | grep -oiE 'profile [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+  if [[ -n "$rpu_profile" ]]; then
+    note "RPU validated: DV Profile $rpu_profile"
+    report_add "dv_rpu_profile" "$rpu_profile"
+  fi
+
+  return 0
+}
+
+# Count video frames in an HEVC elementary stream or container.
+# Args: $1 — file path
+# Returns: frame count on stdout (0 if counting fails)
+# Globals: FFPROBE_FLAGS (read)
+_count_video_frames() {
+  local file="$1" count
+  count="$(ffprobe "${FFPROBE_FLAGS[@]}" -count_packets -select_streams v:0 \
+           -show_entries stream=nb_read_packets -of csv=p=0 "$file" 2>/dev/null)" || true
+  [[ "$count" =~ ^[0-9]+$ ]] && echo "$count" || echo "0"
+}
+
+# Verify DOVI configuration record (dvcC/dvvC box) is present in muxed output.
+# For MP4/MOV containers, the dvcC box is required for players to activate DV rendering.
+# If missing, attempts a fallback remux. If still missing, warns clearly.
+# Args: none (operates on TMP_OUT)
+# Globals: OUTPUT_HAS_DV, DRY_RUN, MUX_FORMAT, TMP_OUT, FFPROBE_FLAGS, WORKDIR,
+#          V_MIXED, VIDEO_COPY_FROM_SOURCE
+verify_dv_container_record() {
+  (( OUTPUT_HAS_DV )) || return 0
+  (( DRY_RUN )) && return 0
+
+  # MKV uses different DV signaling (codec private data, not MP4 boxes)
+  [[ "$MUX_FORMAT" == "matroska" ]] && {
+    note "MKV container — DV signaling uses codec private data (no dvcC box needed)."
+    report_add "dv_container_record" "n/a (matroska)"
+    return 0
+  }
+
+  local out_probe
+  out_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
+               stream_side_data -select_streams v:0 "$TMP_OUT" 2>&1)" || true
+
+  if printf '%s\n' "$out_probe" | grep -qiE 'DOVI configuration record|dv_profile|dv_version'; then
+    note "✅ DOVI configuration record confirmed in output container."
+    report_add "dv_container_record" "present"
+    return 0
+  fi
+
+  warn "DOVI configuration record (dvcC/dvvC box) NOT found in output container."
+  warn "  RPU NAL units are present in the bitstream but the container lacks DV signaling."
+  warn "  Impact: Some players (Apple TV, iPhone, iPad) may not activate DV rendering"
+  warn "  and will fall back to HDR10/HLG base layer instead."
+
+  # Attempt fallback: remux with dovi_tool mux to create proper DV container signaling,
+  # then merge audio/subs back with ffmpeg.
+  if command -v dovi_tool >/dev/null 2>&1 && (( ! VIDEO_COPY_FROM_SOURCE )); then
+    note "→ Attempting dovi_tool mux fallback for DV container signaling…"
+    local dv_video_mp4="$WORKDIR/dv_video_only.mp4"
+
+    # dovi_tool mux creates a proper DV-signaled MP4 from the raw HEVC ES
+    if dovi_tool mux --codec hevc -i "$V_MIXED" --output "$dv_video_mp4" >"$WORKDIR/dovi_mux.log" 2>&1 && [[ -s "$dv_video_mp4" ]]; then
+      # Verify the muxed video has dvcC
+      local mux_probe
+      mux_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
+                   stream_side_data -select_streams v:0 "$dv_video_mp4" 2>&1)" || true
+
+      if printf '%s\n' "$mux_probe" | grep -qiE 'DOVI configuration record|dv_profile|dv_version'; then
+        # Success: now remux using dovi_tool's DV-signaled video + original audio/subs
+        local dv_final="$WORKDIR/dv_final_remux.${OUTPUT_EXT}"
+        local -a remux_cmd=("${FFMPEG_FLAGS[@]}")
+        remux_cmd+=(-i "$dv_video_mp4")  # Video from dovi_tool (has dvcC)
+        remux_cmd+=(-i "$TMP_OUT")       # Audio/subs from original mux
+        remux_cmd+=(-map 0:v:0)          # Video from dovi_tool mux
+        # Map all audio and subtitle streams from original mux
+        remux_cmd+=(-map 1:a? -map 1:s?)
+        remux_cmd+=(-c copy)
+        remux_cmd+=(-movflags +faststart)
+        remux_cmd+=(-f "$MUX_FORMAT" "$dv_final")
+
+        if ffmpeg "${remux_cmd[@]}" 2>"$WORKDIR/dv_remux.err" && [[ -s "$dv_final" ]]; then
+          # Final verification
+          local final_probe
+          final_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
+                         stream_side_data -select_streams v:0 "$dv_final" 2>&1)" || true
+
+          if printf '%s\n' "$final_probe" | grep -qiE 'DOVI configuration record|dv_profile|dv_version'; then
+            mv -f "$dv_final" "$TMP_OUT"
+            note "✅ dovi_tool mux fallback succeeded — DOVI configuration record added."
+            report_add "dv_container_record" "added via dovi_tool mux fallback"
+            return 0
+          fi
+        fi
+        warn "dovi_tool mux fallback remux failed. See: $WORKDIR/dv_remux.err"
+      fi
+    else
+      warn "dovi_tool mux failed. See: $WORKDIR/dovi_mux.log"
+    fi
+  fi
+
+  report_add "dv_container_record" "missing — players may fall back to HDR10/HLG"
+  return 0  # Non-fatal; output is still usable, just without DV activation on some players
+}
+
+# Check if source has valid HDR10 static metadata (MaxCLL, mastering display).
+# Warns if metadata is absent, which causes dim/washed-out playback when DV is stripped.
+# Globals: METADATA_CACHE (read), FFPROBE_FLAGS (read), SRC_ABS (read)
+_check_hdr10_static_metadata() {
+  local has_mastering=0 has_cll=0 side_data
+
+  # Check JSON metadata cache for mastering display and content light level
+  if [[ -n "${METADATA_CACHE:-}" ]]; then
+    side_data="$(printf '%s\n' "$METADATA_CACHE" | jq -r '
+      [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]?.side_data_type // empty' 2>/dev/null)" || true
+
+    printf '%s\n' "$side_data" | grep -qiE 'mastering.display' && has_mastering=1
+    printf '%s\n' "$side_data" | grep -qiE 'content.light.level' && has_cll=1
+  fi
+
+  # Fallback: text probe
+  if (( ! has_mastering && ! has_cll )); then
+    local probe_out
+    probe_out="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#1 \
+                 -select_streams v:0 "$SRC_ABS" 2>&1)" || true
+    printf '%s\n' "$probe_out" | grep -qiE 'mastering.display|mastering_display' && has_mastering=1
+    printf '%s\n' "$probe_out" | grep -qiE 'max_content|max_average|content.light' && has_cll=1
+  fi
+
+  if (( ! has_mastering && ! has_cll )); then
+    warn "Source has DV but NO HDR10 static metadata (mastering display, MaxCLL/MaxFALL)."
+    warn "  Stripping DV will produce an HDR10 stream with missing brightness metadata."
+    warn "  Impact: Playback may appear dim or washed-out on HDR10-only displays."
+    warn "  Consider using dv-archival profile to preserve DV, or adding HDR10 metadata manually."
+    report_add "hdr10_static_metadata" "missing (mastering=$has_mastering, cll=$has_cll)"
+  elif (( ! has_mastering )); then
+    warn "Source has MaxCLL/MaxFALL but no mastering display metadata. HDR10 output may have suboptimal tone-mapping on some displays."
+    report_add "hdr10_static_metadata" "partial (mastering=0, cll=1)"
+  elif (( ! has_cll )); then
+    note "Source has mastering display metadata but no MaxCLL/MaxFALL. Most players handle this gracefully."
+    report_add "hdr10_static_metadata" "partial (mastering=1, cll=0)"
+  else
+    report_add "hdr10_static_metadata" "present"
+  fi
+}
+
 # ===== Section 19: Temp paths ==================================================================
 V_SRC_ES="$WORKDIR/video_src.es"
 RPU_P7="$WORKDIR/rpu_p7.bin"
 RPU_P81="$WORKDIR/rpu_p81.bin"
+RPU_FINAL="$WORKDIR/rpu_final.bin"
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
 
@@ -1376,9 +1582,7 @@ _video_is_copy_compliant() {
   # profiles (e.g., P7) require RPU conversion and cannot be stream-copied.
   if (( IS_DV && ! DISABLE_DV )); then
     if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
-      local dv_check
-      dv_check="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)"
-      if ! printf '%s\n' "$dv_check" | grep -qiE 'dv_profile.*8'; then
+      if [[ "${DV_SRC_PROFILE:-}" != "8" ]]; then
         return 1  # Not copy-compliant; needs DV conversion
       fi
     fi
@@ -1400,6 +1604,30 @@ run_video_pipeline() {
       VIDEO_COPY_FROM_SOURCE=1
 
       if (( IS_DV && ! DISABLE_DV )); then
+        # Validate DV integrity in source before committing to copy path.
+        # A corrupt RPU would pass through silently without this check.
+        if command -v dovi_tool >/dev/null 2>&1; then
+          note "→ Validating DV RPU integrity in source (copy path)…"
+          # Quick RPU extraction to validate (piped, no temp file needed)
+          local rpu_check="$WORKDIR/rpu_copy_check.bin"
+          if ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy \
+               -bsf:v hevc_mp4toannexb -f hevc - 2>/dev/null \
+             | dovi_tool extract-rpu - -o "$rpu_check" >/dev/null 2>&1 && [[ -s "$rpu_check" ]]; then
+            if _validate_dv_rpu "$rpu_check"; then
+              note "DV RPU integrity verified for copy path."
+              report_add "dv_copy_rpu_check" "passed"
+            else
+              warn "DV RPU validation failed on source — RPU may be corrupt."
+              warn "  Copy will proceed (source data is unchanged), but DV playback may be affected."
+              report_add "dv_copy_rpu_check" "failed (proceeding with copy)"
+            fi
+            rm -f "$rpu_check" 2>/dev/null || true
+          else
+            note "Could not extract RPU for validation (non-fatal). Proceeding with copy."
+            report_add "dv_copy_rpu_check" "extraction failed (proceeding)"
+          fi
+        fi
+
         OUTPUT_HAS_DV=1
         note "DV metadata will be preserved via direct source copy."
         mark_done "DV preserved (direct source copy)"
@@ -1592,24 +1820,96 @@ run_video_pipeline() {
     die 40 "Dolby Vision RPU extraction failed and fallback is disabled"
   fi
 
-  # Convert DV RPU from Profile 7 to Profile 8.1 if requested.
-  # Profile 7 uses a separate enhancement layer incompatible with single-track MP4.
-  # Profile 8.1 embeds DV metadata in the base layer, enabling playback on
-  # Apple TV 4K while maintaining HDR10 fallback for non-DV devices.
-  if (( DV_CONVERT_TO_P81_IF_FAIL )); then
-    if dovi_tool convert --rpu-in "$RPU_P7" --rpu-out "$RPU_P81" >/dev/null 2>&1; then
-      note "DV profile converted (P7 → P8.1)"
+  # ---- DV RPU conversion (profile-aware) ----
+  # Decision tree for RPU handling based on source DV profile:
+  #
+  # ┌─ Source is P8 (any compat_id) → RPU passes through unchanged
+  # │   P8.1 (compat_id=1, PQ), P8.2 (compat_id=2, SDR), P8.4 (compat_id=4, HLG)
+  # │   are all single-layer and compatible with re-encoded base layer.
+  # ├─ Source is P7 (dual-layer) → needs conversion to P8
+  # │   ├─ EL present → warn about enhancement layer data loss (irreversible)
+  # │   ├─ HLG source (compat_id=4) → warn about PQ compat_id mismatch
+  # │   └─ Attempt dovi_tool convert → P8.1 (best-effort)
+  # ├─ Source is P5 (IPT) → attempt conversion to P8.1
+  # └─ Unknown profile → attempt passthrough with warning
+
+  # Start with extracted RPU; will be updated if conversion is performed
+  cp -f "$RPU_P7" "$RPU_FINAL" 2>/dev/null || true
+
+  if [[ "${DV_SRC_PROFILE:-}" == "8" ]]; then
+    # Source is already Profile 8 — RPU is single-layer compatible, no conversion needed.
+    # Preserves original compat_id (1=PQ, 2=SDR, 4=HLG) and all RPU metadata.
+    note "Source DV is Profile 8 (compat_id=${DV_SRC_COMPAT_ID:-?}) — RPU passes through unchanged."
+    report_add "dv_rpu_action" "passthrough (already P8, compat_id=${DV_SRC_COMPAT_ID:-?})"
+
+  elif [[ "${DV_SRC_PROFILE:-}" == "7" || "${DV_SRC_PROFILE:-}" == "5" ]]; then
+    # Source is dual-layer (P7) or IPT (P5) — needs conversion to single-layer P8
+    if (( DV_CONVERT_TO_P81_IF_FAIL )); then
+      note "Source DV is Profile ${DV_SRC_PROFILE} — attempting conversion to Profile 8…"
+
+      # Warn about enhancement layer data loss for P7
+      if [[ "${DV_SRC_EL_PRESENT:-}" == "1" ]]; then
+        warn "DV Profile ${DV_SRC_PROFILE} has an enhancement layer (EL) that carries additional"
+        warn "  highlight/shadow detail. The EL will be discarded during P7→P8 conversion."
+        warn "  This is a lossy operation — DV image quality may be slightly reduced."
+        report_add "dv_el_loss" "true (P${DV_SRC_PROFILE} EL discarded)"
+      fi
+
+      # Warn about HLG compat_id mismatch: dovi_tool convert produces P8.1 (PQ, compat_id=1)
+      # but HLG sources use compat_id=4. Players may misinterpret the fallback layer.
+      if [[ "${DV_SRC_COMPAT_ID:-}" == "4" ]]; then
+        warn "Source is HLG Dolby Vision (compat_id=4) but dovi_tool convert targets P8.1 (PQ, compat_id=1)."
+        warn "  The DV RPU will be converted, but the compatibility ID will change from HLG to PQ."
+        warn "  Impact: Non-DV players may interpret the base layer as PQ instead of HLG."
+        report_add "dv_compat_id_mismatch" "source=4(HLG) → output=1(PQ)"
+      fi
+
+      if dovi_tool convert --rpu-in "$RPU_P7" --rpu-out "$RPU_P81" >"$WORKDIR/rpu_convert.log" 2>&1 && [[ -s "$RPU_P81" ]]; then
+        cp -f "$RPU_P81" "$RPU_FINAL"
+        note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
+        report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
+      else
+        warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
+        warn "  Using unconverted P${DV_SRC_PROFILE} RPU — this is technically invalid for"
+        warn "  single-layer output. DV playback may be unpredictable or fail."
+        warn "  Reason: Profile ${DV_SRC_PROFILE} RPU references a dual-layer structure that"
+        warn "  doesn't exist in the re-encoded single-layer output."
+        report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
+      fi
     else
-      cp -f "$RPU_P7" "$RPU_P81" 2>/dev/null || true
+      warn "Source DV is Profile ${DV_SRC_PROFILE} (dual-layer) but conversion is disabled"
+      warn "  (DV_CONVERT_TO_P81_IF_FAIL=0). Using raw RPU — DV playback will likely fail."
+      report_add "dv_rpu_action" "passthrough (P${DV_SRC_PROFILE}, conversion disabled)"
     fi
+
   else
-    cp -f "$RPU_P7" "$RPU_P81" 2>/dev/null || true
+    # Unknown or unrecognized DV profile — attempt passthrough
+    if [[ -n "${DV_SRC_PROFILE:-}" ]]; then
+      warn "Unrecognized DV profile: ${DV_SRC_PROFILE}. Attempting RPU passthrough."
+      warn "  DV playback behavior is unpredictable for this profile."
+    else
+      warn "Could not determine source DV profile. Attempting RPU passthrough."
+    fi
+    report_add "dv_rpu_action" "passthrough (unknown profile ${DV_SRC_PROFILE:-?})"
+  fi
+
+  # Validate RPU integrity before injection
+  if ! _validate_dv_rpu "$RPU_FINAL"; then
+    warn "RPU validation failed — RPU may be corrupt or incompatible."
+    if (( ALLOW_DV_FALLBACK )); then
+      warn "Falling back to base video without DV."
+      cp -f "$V_BASE" "$V_MIXED"
+      mark_done "Use base video (RPU validation failed)"
+      return 0
+    fi
+    die 40 "DV RPU validation failed and fallback is disabled"
   fi
 
   # Inject RPU into encoded video
-  if ! dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_P81" -o "$V_MIXED" >/dev/null 2>&1; then
-    warn "DV RPU injection failed; using base video."
+  if ! dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_FINAL" -o "$V_MIXED" >"$WORKDIR/rpu_inject.log" 2>&1; then
+    warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
+      warn "Falling back to base video without DV."
       cp -f "$V_BASE" "$V_MIXED"
       mark_done "Use base video (DV inject failed)"
       return 0
@@ -1617,16 +1917,55 @@ run_video_pipeline() {
     die 41 "Dolby Vision RPU injection failed and fallback is disabled"
   fi
 
-  # Validate DV-injected output
+  # Validate DV-injected output exists and is non-empty
   if [[ ! -s "$V_MIXED" ]]; then
-    warn "DV injection produced empty file; using base video."
-    cp -f "$V_BASE" "$V_MIXED"
-    mark_done "Use base video (DV inject empty)"
-    return 0
+    warn "DV injection produced empty file."
+    if (( ALLOW_DV_FALLBACK )); then
+      warn "Falling back to base video without DV."
+      cp -f "$V_BASE" "$V_MIXED"
+      mark_done "Use base video (DV inject empty)"
+      return 0
+    fi
+    die 41 "DV injection produced empty output and fallback is disabled"
+  fi
+
+  # Verify RPU frame count matches encoded video frame count.
+  # Mismatched counts cause DV flicker, color shifts, or player crashes
+  # on frames where the RPU and video desync.
+  local v_frames rpu_frames
+  v_frames="$(_count_video_frames "$V_MIXED")"
+  # RPU frame count from dovi_tool info (if available)
+  if command -v dovi_tool >/dev/null 2>&1; then
+    rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
+                  | grep -oiE '[0-9]+ RPU' | grep -oE '[0-9]+' | head -1)" || true
+    # Fallback: try parsing "Parsed X RPU" format
+    if [[ -z "$rpu_frames" ]]; then
+      rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
+                    | grep -oiE 'parsed [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    fi
+  fi
+
+  if [[ -n "$rpu_frames" && "$rpu_frames" =~ ^[0-9]+$ && -n "$v_frames" && "$v_frames" =~ ^[0-9]+$ ]]; then
+    if (( v_frames > 0 && rpu_frames > 0 )); then
+      local frame_diff=$(( v_frames - rpu_frames ))
+      # Allow ±2 frame tolerance (encoder may add/drop frames at boundaries)
+      if (( frame_diff > 2 || frame_diff < -2 )); then
+        warn "RPU frame count mismatch: video has $v_frames frames but RPU has $rpu_frames frames."
+        warn "  Difference: ${frame_diff} frames. DV may flicker or desync on mismatched frames."
+        warn "  This can occur when the re-encode changes frame count (e.g., framerate conversion)."
+        report_add "dv_frame_count_match" "MISMATCH (video=$v_frames, rpu=$rpu_frames, diff=$frame_diff)"
+      else
+        note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
+        report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"
+      fi
+    fi
+  else
+    note "Could not verify RPU/video frame count alignment (counting unavailable)."
+    report_add "dv_frame_count_match" "unverified"
   fi
 
   OUTPUT_HAS_DV=1
-  mark_done "DV inject (best-effort)"
+  mark_done "DV inject (profile-aware)"
 }
 
 # ===== Section 21: Audio selection & pipeline ==================================================
@@ -2527,6 +2866,16 @@ main() {
     IS_DV=1
     note "Dolby Vision detected — extraction/injection will be attempted in the video pipeline."
     report_add "dv_detected" "true"
+
+    # Extract detailed DV source info (profile, compat_id, layer flags)
+    detect_dv_info
+
+    # Warn if hdr10-hq profile will strip DV from a source without HDR10 fallback metadata.
+    # DV-only sources (especially P5 and some P7) may lack mastering display / MaxCLL data,
+    # which causes dim or washed-out playback when DV is stripped and only HDR10 remains.
+    if (( DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "hdr10-hq" ]]; then
+      _check_hdr10_static_metadata
+    fi
   else
     IS_DV=0
     note "No Dolby Vision detected."
@@ -2567,6 +2916,9 @@ main() {
   fi
 
   mux_final
+
+  # Verify DV container signaling is present in output (dvcC/dvvC box for MP4/MOV)
+  verify_dv_container_record
 
   if (( DRY_RUN )); then
     note "DRY-RUN: DV output status not evaluated (no real encode performed)."
