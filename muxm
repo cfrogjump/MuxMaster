@@ -1449,8 +1449,9 @@ verify_dv_container_record() {
     note "→ Attempting dovi_tool mux fallback for DV container signaling…"
     local dv_video_mp4="$WORKDIR/dv_video_only.mp4"
 
-    # dovi_tool mux creates a proper DV-signaled MP4 from the raw HEVC ES
-    if dovi_tool mux --codec hevc -i "$V_MIXED" --output "$dv_video_mp4" >"$WORKDIR/dovi_mux.log" 2>&1 && [[ -s "$dv_video_mp4" ]]; then
+    # dovi_tool mux --bl reads RPU NAL units from the HEVC bitstream and
+    # generates a proper DV-signaled MP4 with dvcC/dvvC box.
+    if dovi_tool mux --bl "$V_MIXED" --output "$dv_video_mp4" >"$WORKDIR/dovi_mux.log" 2>&1 && [[ -s "$dv_video_mp4" ]]; then
       # Verify the muxed video has dvcC
       local mux_probe
       mux_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
@@ -1541,6 +1542,11 @@ RPU_P81="$WORKDIR/rpu_p81.bin"
 RPU_FINAL="$WORKDIR/rpu_final.bin"
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
+
+# Pre-wrapped DV MP4: V_MIXED wrapped into MP4 with proper dvcC/dvvC box via dovi_tool.
+# When available, mux_final uses this instead of the raw V_MIXED ES so that ffmpeg
+# copies the dvcC box through to the final output container.
+V_DV_MP4=""
 
 # When copy-compliant, we map video directly from source in final mux to preserve
 # container-level metadata (DOVI configuration record, displaymatrix, etc.) that
@@ -1962,6 +1968,46 @@ run_video_pipeline() {
   else
     note "Could not verify RPU/video frame count alignment (counting unavailable)."
     report_add "dv_frame_count_match" "unverified"
+  fi
+
+  # Pre-wrap the DV-injected HEVC ES into an MP4 with proper dvcC/dvvC signaling.
+  #
+  # Why: When mux_final feeds a raw HEVC ES to ffmpeg, ffmpeg cannot infer the DV
+  # profile/level/compat_id needed to write the dvcC container box — even with
+  # -strict unofficial -tag:v dvh1. The dvcC box lives in the container, not the
+  # bitstream, so ffmpeg needs to see it in an input container to copy it through.
+  #
+  # Solution: Use dovi_tool mux to create a video-only MP4 with the correct dvcC box.
+  # mux_final then uses this MP4 as the video input instead of the raw ES, and
+  # ffmpeg's -c copy preserves the dvcC box in the final output.
+  #
+  # dovi_tool mux syntax:
+  #   dovi_tool mux --bl <hevc_es> --output <mp4>   (HEVC with RPU already injected)
+  # The --bl flag indicates a base-layer HEVC input; dovi_tool reads the RPU NAL
+  # units from the bitstream and generates the correct dvcC/dvvC box.
+  if [[ "$MUX_FORMAT" != "matroska" ]] && command -v dovi_tool >/dev/null 2>&1; then
+    local dv_prewrap="$WORKDIR/video_dv_prewrap.mp4"
+    note "→ Pre-wrapping DV video into MP4 with dvcC signaling via dovi_tool…"
+
+    if dovi_tool mux --bl "$V_MIXED" --output "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 && [[ -s "$dv_prewrap" ]]; then
+      # Verify dvcC is present in the pre-wrapped MP4
+      local pw_probe
+      pw_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
+                   stream_side_data -select_streams v:0 "$dv_prewrap" 2>&1)" || true
+
+      if printf '%s\n' "$pw_probe" | grep -qiE 'DOVI configuration record|dv_profile|dv_version'; then
+        V_DV_MP4="$dv_prewrap"
+        note "✅ DV pre-wrap succeeded — dvcC box present in video MP4."
+        report_add "dv_prewrap" "success"
+      else
+        warn "dovi_tool mux produced MP4 but dvcC box not detected. Will use raw ES as fallback."
+        report_add "dv_prewrap" "failed (no dvcC in output)"
+      fi
+    else
+      warn "dovi_tool mux pre-wrap failed. See: $WORKDIR/dv_prewrap.log"
+      warn "  Final mux will use raw HEVC ES — dvcC box may be missing in output."
+      report_add "dv_prewrap" "failed (dovi_tool error)"
+    fi
   fi
 
   OUTPUT_HAS_DV=1
@@ -2689,6 +2735,13 @@ mux_final() {
     # Map video directly from source to preserve container-level metadata
     # (DOVI configuration record, displaymatrix, etc.)
     ff_in+=( -i "$SRC_ABS" )
+    vid_idx=$next_idx
+    next_idx=$(( next_idx + 1 ))
+  elif [[ -n "${V_DV_MP4:-}" && -s "$V_DV_MP4" ]]; then
+    # Prefer DV pre-wrapped MP4 over raw ES — it carries the dvcC/dvvC box
+    # that ffmpeg will copy through to the final output container.
+    note "Using DV pre-wrapped MP4 as video input (dvcC box present)."
+    ff_in+=( -i "$V_DV_MP4" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
   elif [[ -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
