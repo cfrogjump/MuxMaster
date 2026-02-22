@@ -290,8 +290,20 @@ ffmpeg_has_muxer(){
 # DV pipeline:  dovi_tool, mp4box (gpac)
 # Subtitles:    tesseract, pgsrip (Python, via pipx)
 #
-# This function is intentionally placed before config chain / CLI parsing so that
-# --install-dependencies can short-circuit before any source file validation.
+# Config chain is sourced first (Section 6 below) so the installer sees the
+# user's resolved SUB_OCR_TOOL and other config-file settings.
+
+# ===== Section 6: Config chain: Defaults → /etc → ~ → project =================================
+_muxm_try_source(){
+  local f="$1"
+  [[ -r "$f" ]] || return 0
+  # shellcheck disable=SC1090
+  . "$f"
+  MUXM_CONFIG_LOADED+=("$f")
+}
+_muxm_try_source /etc/.muxmrc
+_muxm_try_source "$HOME/.muxmrc"
+_muxm_try_source "./.muxmrc"
 
 _dep_install_dependencies(){
   say "=== ${APP_NAME} v${VERSION} — Dependency Installer ==="
@@ -481,17 +493,6 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ===== Section 6: Config chain: Defaults → /etc → ~ → project =================================
-_muxm_try_source(){
-  local f="$1"
-  [[ -r "$f" ]] || return 0
-  # shellcheck disable=SC1090
-  . "$f"
-  MUXM_CONFIG_LOADED+=("$f")
-}
-_muxm_try_source /etc/.muxmrc
-_muxm_try_source "$HOME/.muxmrc"
-_muxm_try_source "./.muxmrc"
 
 # ===== Section 6b: Profile pre-scan & application ==============================================
 # Two-pass CLI: first extract --profile, apply it, then let full CLI parse override.
