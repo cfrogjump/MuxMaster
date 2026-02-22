@@ -29,7 +29,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="0.10.1"
+readonly VERSION="0.10.2"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -41,12 +41,17 @@ FAIL_MSG=""
 EXIT_CODE=1
 PRINT_EFFCONF=0
 # TODO(future): Config file rotation — write-back of resolved config to disk
+# shellcheck disable=SC2034  # Reserved for future use
 CONFIG_WRITE_ROTATE=0
+# shellcheck disable=SC2034  # Reserved for future use
 CONFIG_WRITE_PATH=""
 PROFILE_NAME=""
 
 # Metadata cache for performance optimization
 METADATA_CACHE=""
+
+# Tracks whether DV actually made it into the output (not just detected in source)
+declare -i OUTPUT_HAS_DV=0
 
 # JSON report accumulator (for dv-archival reporting)
 declare -a REPORT_ENTRIES=()
@@ -90,6 +95,7 @@ declare -i ADD_STEREO_IF_MULTICH=1
 EAC3_BITRATE_5_1="640k"
 EAC3_BITRATE_7_1="768k"
 # TODO(future): Parallel audio transcode when multiple outputs needed
+# shellcheck disable=SC2034  # Reserved for future use
 declare -i PARALLEL_AUDIO=0
 
 # ---- Subtitles
@@ -106,9 +112,11 @@ SUB_OCR_LANG="eng"
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
 # TODO(future): MP4 interleave duration for streaming optimization
+# shellcheck disable=SC2034  # Reserved for future use
 declare -i MP4_INTERLEAVE_MS=500
 TAG_LANGUAGE_DEFAULT="und"
 # TODO(future): Include descriptive titles in audio stream metadata tags
+# shellcheck disable=SC2034  # Reserved for future use
 declare -i INCLUDE_AUDIO_TITLES=1
 
 # ---- Operational defaults
@@ -908,7 +916,7 @@ fi
 
 # Resolve output directory and validate
 OUT_DIR="$(dirname -- "$OUT")"
-OUT_DIR="$(cd -- "$OUT_DIR" 2>/dev/null && pwd || echo "$OUT_DIR")"
+OUT_DIR="$(if cd -- "$OUT_DIR" 2>/dev/null; then pwd; else echo "$OUT_DIR"; fi)"
 [[ -d "$OUT_DIR" ]] || die 11 "Output directory does not exist: $OUT_DIR"
 [[ -w "$OUT_DIR" ]] || die 11 "Output directory not writable: $OUT_DIR"
 
@@ -990,6 +998,7 @@ on_exit() {
 
   if (( FAILED == 0 && have_result == 1 )); then
     if (( DRY_RUN )); then
+      [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
       note "DRY-RUN complete — no real files were created."
     else
       [[ -f "$TMP_OUT" ]] && mv -f "$TMP_OUT" "$OUT"
@@ -1062,7 +1071,7 @@ report_add() {
 # Write JSON report alongside output
 write_json_report() {
   (( REPORT_JSON )) || return 0
-  local report_path="${OUT%.${OUTPUT_EXT}}.report.json"
+  local report_path="${OUT%."${OUTPUT_EXT}"}.report.json"
   {
     printf '{\n'
     printf '  "tool": "%s",\n' "$APP_NAME v$VERSION"
@@ -1327,6 +1336,11 @@ RPU_P81="$WORKDIR/rpu_p81.bin"
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
 
+# When copy-compliant, we map video directly from source in final mux to preserve
+# container-level metadata (DOVI configuration record, displaymatrix, etc.) that
+# would be stripped by extracting to raw HEVC elementary stream.
+declare -i VIDEO_COPY_FROM_SOURCE=0
+
 A_PRIMARY=""
 AAC_STEREO=""
 declare -i HAS_AUDIO=0
@@ -1377,31 +1391,22 @@ run_video_pipeline() {
   # Check copy-if-compliant first
   if (( VIDEO_COPY_IF_COMPLIANT )); then
     if _video_is_copy_compliant; then
-      note "→ Source video is compliant for target profile — copying without re-encode."
+      note "→ Source video is compliant for target profile — will copy directly from source during mux."
       report_add "video_action" "copy (compliant)"
 
-      if (( DRY_RUN )); then
-        : > "$V_MIXED" 2>/dev/null || true
-        mark_done "Video stream copy (compliant, dry-run)"
-        return 0
+      # Flag for mux_final to map video directly from source file.
+      # This preserves container-level metadata (DOVI configuration record,
+      # displaymatrix, etc.) that would be lost by extracting to raw HEVC ES.
+      VIDEO_COPY_FROM_SOURCE=1
+
+      if (( IS_DV && ! DISABLE_DV )); then
+        OUTPUT_HAS_DV=1
+        note "DV metadata will be preserved via direct source copy."
+        mark_done "DV preserved (direct source copy)"
       fi
 
-      # Extract video stream as-is
-      if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c:v copy \
-        -an -sn -dn -f hevc "$V_MIXED" 2>"$WORKDIR/copy.err"; then
-        warn "Video copy failed — falling back to re-encode. See: $WORKDIR/copy.err"
-        # Fall through to encode path
-      else
-        _validate_media_file "$V_MIXED" "Video stream copy"
-        mark_done "Video stream copy (compliant)"
-        # Still attempt DV handling on the copied stream
-        if (( IS_DV && ! DISABLE_DV )); then
-          # Already has DV in the copied stream, no RPU injection needed
-          note "DV metadata preserved in copied video stream."
-          mark_done "DV preserved (copy)"
-        fi
-        return 0
-      fi
+      mark_done "Video stream copy (compliant — direct source)"
+      return 0
     else
       note "Source video not compliant for copy — will re-encode."
       report_add "video_action" "re-encode (not compliant)"
@@ -1414,8 +1419,11 @@ run_video_pipeline() {
     : > "$V_SRC_ES" 2>/dev/null || true
     mark_done "Demux raw ES → video_src.es (dry-run)"
   else
-    # Extract HEVC elementary stream for DV RPU extraction
-    if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err"; then
+    # Extract HEVC elementary stream for DV RPU extraction.
+    # -bsf:v hevc_mp4toannexb ensures proper conversion from hvc1/hev1
+    # length-prefixed NAL units to Annex B start codes, which preserves
+    # DV RPU NAL units that dovi_tool requires for extraction.
+    if ! ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err"; then
       local codec
       codec="$(_probe_field codec_name)"
       warn "Could not demux raw ES - source codec: ${codec:-unknown}. DV extraction may be skipped."
@@ -1464,6 +1472,7 @@ run_video_pipeline() {
   # Build -vf string
   local vf_str=""
   if [[ ${#vf_filters[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2030  # Subshell-scoped IFS change is intentional
     vf_str="$(IFS=','; echo "${vf_filters[*]}")"
   fi
 
@@ -1576,6 +1585,7 @@ run_video_pipeline() {
     return 0
   fi
 
+  OUTPUT_HAS_DV=1
   mark_done "DV inject (best-effort)"
 }
 
@@ -1647,7 +1657,7 @@ _audio_codec_rank(){
     item="${item// /}"   # strip spaces
     [[ -z "$item" ]] && continue
     if [[ "$item" == "$codec" ]]; then echo "$i"; return 0; fi
-    ((i++))
+    i=$(( i + 1 ))
   done
   echo "99"
 }
@@ -1781,6 +1791,7 @@ audio_transcode_target(){
 }
 
 run_audio_pipeline(){
+  # shellcheck disable=SC2034
   local n best idx codec ch lang br title
   n="$(_audio_stream_count)"
   
@@ -2022,6 +2033,7 @@ _is_text_sub_codec(){
 
 _pick_direct_text_sub_relidx(){
   local i lang codec
+  # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
     [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
@@ -2147,8 +2159,10 @@ _export_or_embed_sub(){
   local srt_path="$1" label="$2"
   _SUB_EMBED_PATH=""
   if (( SUB_EXPORT_EXTERNAL )); then
-    local ext_srt="${OUT%.${OUTPUT_EXT}}.${label}.srt"
-    (( ! DRY_RUN )) && cp -f "$srt_path" "$ext_srt" 2>/dev/null || true
+    local ext_srt="${OUT%."${OUTPUT_EXT}"}.${label}.srt"
+    if (( ! DRY_RUN )); then
+      cp -f "$srt_path" "$ext_srt" 2>/dev/null || true
+    fi
     EXTERNAL_SRT_PATHS+=("$ext_srt")
     note "[Subs] Exported $label → external $ext_srt"
     report_add "sub_${label}" "external srt"
@@ -2175,6 +2189,7 @@ build_subtitle_plan(){
 
   say "→ Scanning subtitle streams:"
   local i
+  # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
     describe_sub_stream "$i" || true
   done
@@ -2183,6 +2198,7 @@ build_subtitle_plan(){
   local lang title forced is_sdh
 
   # Find best subtitle candidates
+  # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
     [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
@@ -2220,7 +2236,7 @@ build_subtitle_plan(){
         report_add "sub_forced" "burn-in"
       else
         SRT_FORCED="$p"
-        ((pick_count++))
+        pick_count=$(( pick_count + 1 ))
         note "[Subs] Prepared Forced → $SRT_FORCED"
         report_add "sub_forced" "embedded"
       fi
@@ -2232,7 +2248,7 @@ build_subtitle_plan(){
       _export_or_embed_sub "$p" "full"
       if [[ -n "$_SUB_EMBED_PATH" ]]; then
         SRT_FULL="$_SUB_EMBED_PATH"
-        ((pick_count++))
+        pick_count=$(( pick_count + 1 ))
       fi
     fi
   fi
@@ -2242,7 +2258,7 @@ build_subtitle_plan(){
       _export_or_embed_sub "$p" "sdh"
       if [[ -n "$_SUB_EMBED_PATH" ]]; then
         SRT_SDH="$_SUB_EMBED_PATH"
-        ((pick_count++))
+        pick_count=$(( pick_count + 1 ))
       fi
     fi
   fi
@@ -2290,14 +2306,20 @@ mux_final() {
     die 42 "Video was skipped but output container requires a video stream."
   fi
   
-  if [[ -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
+  if (( VIDEO_COPY_FROM_SOURCE )); then
+    # Map video directly from source to preserve container-level metadata
+    # (DOVI configuration record, displaymatrix, etc.)
+    ff_in+=( -i "$SRC_ABS" )
+    vid_idx=$next_idx
+    next_idx=$(( next_idx + 1 ))
+  elif [[ -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
     # Validate video before muxing
     if ! ffprobe -v error "$V_MIXED" >/dev/null 2>&1; then
       die 42 "Encoded video exists but is invalid/corrupt"
     fi
     ff_in+=( -i "$V_MIXED" )
     vid_idx=$next_idx
-    ((next_idx++))
+    next_idx=$(( next_idx + 1 ))
   else
     die 42 "No encoded video stream found."
   fi
@@ -2306,13 +2328,13 @@ mux_final() {
   if (( ! SKIP_AUDIO )) && (( HAS_AUDIO )) && [[ -n "${A_PRIMARY:-}" && -s "$A_PRIMARY" ]]; then
     ff_in+=( -i "$A_PRIMARY" )
     a_primary_idx=$next_idx
-    ((next_idx++))
+    next_idx=$(( next_idx + 1 ))
   fi
   
   if (( ! SKIP_AUDIO )) && [[ -n "${AAC_STEREO:-}" && -s "$AAC_STEREO" ]]; then
     ff_in+=( -i "$AAC_STEREO" )
     a_stereo_idx=$next_idx
-    ((next_idx++))
+    next_idx=$(( next_idx + 1 ))
   fi
 
   # Add subtitle streams
@@ -2320,21 +2342,21 @@ mux_final() {
     if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
       ff_in+=( -i "$SRT_FORCED" )
       s_forced_idx=$next_idx
-      ((next_idx++))
+      next_idx=$(( next_idx + 1 ))
       forced_present=1
     fi
     
     if [[ -n "${SRT_FULL:-}" && -s "$SRT_FULL" ]]; then
       ff_in+=( -i "$SRT_FULL" )
       s_full_idx=$next_idx
-      ((next_idx++))
+      next_idx=$(( next_idx + 1 ))
       full_present=1
     fi
     
     if [[ -n "${SRT_SDH:-}" && -s "$SRT_SDH" ]]; then
       ff_in+=( -i "$SRT_SDH" )
       s_sdh_idx=$next_idx
-      ((next_idx++))
+      next_idx=$(( next_idx + 1 ))
       sdh_present=1
     fi
   fi
@@ -2343,10 +2365,12 @@ mux_final() {
   if (( ! SKIP_SUBS )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
     ff_in+=( -i "$SRC_ABS" )
     src_sub_idx=$next_idx
-    ((next_idx++))
+    next_idx=$(( next_idx + 1 ))
   fi
 
   # Build stream mapping
+  # When VIDEO_COPY_FROM_SOURCE, source is the first input; -map N:v:0
+  # selects only the video stream, excluding audio/subs/data tracks.
   ff_map+=( -map "$vid_idx":v:0 )
 
   [[ -n "$a_primary_idx" ]] && ff_map+=( -map "$a_primary_idx":a:0 )
@@ -2492,7 +2516,15 @@ main() {
 
   mux_final
 
-  (( IS_DV == 1 && DISABLE_DV == 0 )) && note "Dolby Vision present in output (best-effort)." || note "Output is non-DV."
+  if (( OUTPUT_HAS_DV )); then
+    note "Dolby Vision present in output."
+    report_add "dv_output" "preserved"
+  elif (( IS_DV == 1 && DISABLE_DV == 0 )); then
+    warn "Dolby Vision was detected in source but could not be preserved in output."
+    report_add "dv_output" "failed"
+  else
+    note "Output is non-DV."
+  fi
 
   say "→ Verifying output streams…"
   if (( DRY_RUN )); then
@@ -2503,7 +2535,11 @@ main() {
   mark_done "Verify output"
 
   say "→ Output (temp) size:"
-  (( DRY_RUN )) && say "DRY-RUN: size of $TMP_OUT" || filesize_pretty "$TMP_OUT"
+  if (( DRY_RUN )); then
+    say "DRY-RUN: size of $TMP_OUT"
+  else
+    filesize_pretty "$TMP_OUT"
+  fi
 
   # Write JSON report if requested
   write_json_report
