@@ -5,8 +5,24 @@
 # ================================================================
 
 # =========================
-# Video (x265) fundamentals
+# Profile (format presets)
 # =========================
+
+# Default profile to apply. CLI --profile overrides this value.
+# Valid profiles: dv-archival, hdr10-hq, atv-directplay-hq, universal
+# Profiles set many variables at once; CLI flags still override individual values.
+# Leave empty to use standalone defaults (no profile).
+#PROFILE_NAME=
+
+
+# =========================
+# Video (x265/x264) fundamentals
+# =========================
+
+# Video encoder: libx265 (default, HEVC) or libx264 (H.264, universal compat)
+#   libx265: HDR/DV capable, better compression, modern devices
+#   libx264: widest device support, SDR only
+#VIDEO_CODEC=libx265
 
 # CRF (Constant Rate Factor): 0–51 (lower = higher quality, larger files)
 #   0: lossless (huge files)
@@ -22,7 +38,7 @@
 #PRESET_VALUE=slower
 
 # Base x265 params: advanced tuning as a single string
-# Keep values colon-separated. Override entirely if you know what you’re doing.
+# Keep values colon-separated. Override entirely if you know what you're doing.
 #X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
 
 # Level/IDR constraint for compatibility (e.g., 5.1). Leave empty to let encoder decide.
@@ -31,7 +47,7 @@
 
 # Conservative VBV guardrails (apply when LEVEL_VALUE is set)
 #   1 = apply cautious vbv-maxrate/bufsize suited to Apple TV-like playbacks
-#   0 = don’t apply additional limits (may increase risk on strict players)
+#   0 = don't apply additional limits (may increase risk on strict players)
 #CONSERVATIVE_VBV=1
 
 # Internal VBV ceilings used when CONSERVATIVE_VBV==1 and a level is set:
@@ -40,6 +56,12 @@
 #LEVEL_VBV_5_0_MAXRATE=25000k; LEVEL_VBV_5_0_BUFSIZE=50000k
 #LEVEL_VBV_5_1_MAXRATE=40000k; LEVEL_VBV_5_1_BUFSIZE=80000k
 #LEVEL_VBV_5_2_MAXRATE=60000k; LEVEL_VBV_5_2_BUFSIZE=120000k
+
+# Skip encode if source video already matches profile requirements
+# (codec, resolution, color, etc. are all compliant → stream copy instead)
+#   1 = copy video stream if compliant (much faster)
+#   0 = always re-encode
+#VIDEO_COPY_IF_COMPLIANT=0
 
 
 # =========================
@@ -59,6 +81,20 @@
 # Target pixel format when HDR (HLG/HDR10/DV base) is detected
 # Usually leave as yuv420p10le for HDR compatibility.
 #HDR_TARGET_PIXFMT=yuv420p10le
+
+
+# =========================
+# Tone-mapping (HDR → SDR)
+# =========================
+
+# Tone-map HDR to SDR (used by the universal profile for max compatibility)
+#   1 = convert HDR/HLG sources to SDR via tone-mapping
+#   0 = preserve HDR (default)
+#TONEMAP_HDR_TO_SDR=0
+
+# Tone-map filter chain: advanced ffmpeg filter string for HDR→SDR conversion.
+# Override only if you understand zscale/tonemap filter syntax.
+#TONEMAP_FILTER='zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
 
 
 # =========================
@@ -100,7 +136,12 @@
 
 # Codec preference order (leftmost best)
 # Common: eac3,ac3,aac,other — favors passthrough when possible.
-#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,other
+#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,alac,other
+
+# Force a specific audio track by index (0-based, relative to audio streams)
+# When set, bypasses automatic scoring entirely.
+# Leave empty for automatic selection (default).
+#AUDIO_TRACK_OVERRIDE=
 
 # Scoring weights (advanced):
 #   Channels multiplier: score += channels * MULTIPLIER
@@ -134,6 +175,16 @@
 #EAC3_BITRATE_5_1=640k
 #EAC3_BITRATE_7_1=768k
 
+# Force all audio to a specific codec (e.g., "aac" for universal playback)
+# When set, overrides automatic codec selection for all audio tracks.
+# Leave empty for automatic selection based on source and preferences.
+#AUDIO_FORCE_CODEC=
+
+# Allow lossless audio codecs (TrueHD, DTS-HD MA, FLAC) to pass through untouched
+#   1 = copy lossless codecs directly (archival / high-end setups)
+#   0 = transcode to lossy (E-AC-3/AAC) for compatibility
+#AUDIO_LOSSLESS_PASSTHROUGH=0
+
 # Run stereo and primary audio jobs in parallel (faster on many-core CPUs)
 #   1 = parallel
 #   0 = serial (simpler logs, similar total time for short audio)
@@ -141,10 +192,63 @@
 
 
 # =========================
+# Subtitles
+# =========================
+
+# Language preference for subtitle track selection (comma-separated)
+#SUB_LANG_PREF=eng
+
+# Include forced subtitles (foreign dialogue, signs)
+#   1 = include forced tracks
+#   0 = skip forced tracks
+#SUB_INCLUDE_FORCED=1
+
+# Include full (non-forced) subtitle tracks
+#   1 = include full tracks
+#   0 = skip full tracks
+#SUB_INCLUDE_FULL=1
+
+# Include SDH/HI (subtitles for the deaf and hard of hearing)
+#   1 = include SDH tracks
+#   0 = skip SDH tracks
+#SUB_INCLUDE_SDH=1
+
+# Maximum subtitle tracks to include in output
+# Tracks are ranked by type (forced > full > SDH) then language preference.
+#SUB_MAX_TRACKS=3
+
+# Burn forced subtitles into the video stream (hardcoded, cannot be turned off)
+# Useful for Apple TV / devices that ignore forced-flag subtitle tracks.
+#   1 = burn forced subs into video
+#   0 = include as soft subs only (default)
+#SUB_BURN_FORCED=0
+
+# Export non-forced subtitles as external .srt files alongside output
+# Useful for players that prefer sidecar subtitles or when container can't carry them.
+#   1 = export external .srt files
+#   0 = embed in container only
+#SUB_EXPORT_EXTERNAL=0
+
+# Enable OCR for bitmap subtitles (PGS/VobSub → SRT)
+# MP4 cannot carry PGS bitmaps; OCR converts them to text-based SRT.
+#   1 = attempt OCR
+#   0 = drop bitmap subtitles that can't be embedded
+#SUB_ENABLE_OCR=1
+
+# OCR tool for bitmap → text subtitle conversion
+# Supported: "sub2srt", "pgsrip"
+# pgsrip requires: pgsrip (pipx) + tesseract. Install via --install-dependencies.
+#SUB_OCR_TOOL=sub2srt
+
+# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)
+#SUB_OCR_LANG=eng
+
+
+# =========================
 # Mux / output container
 # =========================
 
-# Output extension: mp4|m4v|mov
+# Output extension: mp4|m4v|mov|mkv
 #OUTPUT_EXT=mp4
 
 # MP4 interleave in milliseconds (larger = fewer seeks; smaller = smoother start on some players)
@@ -159,10 +263,16 @@
 #   0 = omit
 #INCLUDE_AUDIO_TITLES=1
 
-# MP4Box verbosity: keep quiet unless debugging mux issues
-#   1 = -quiet (recommended)
-#   0 = verbose
-#MP4BOX_QUIET=1
+# Keep chapter markers in output
+#   1 = preserve chapters from source (default)
+#   0 = strip all chapter markers
+#KEEP_CHAPTERS=1
+
+# Strip non-essential metadata from output (tags, comments, etc.)
+# Chapters are controlled separately by KEEP_CHAPTERS.
+#   1 = strip metadata
+#   0 = preserve metadata (default)
+#STRIP_METADATA=0
 
 
 # =========================
@@ -192,6 +302,19 @@
 # Warn if output volume has less than N GB free
 #DISK_FREE_WARN_GB=5
 
+# Skip processing entirely if source already matches profile requirements
+# (codec, container, color space, audio, etc. are already ideal)
+# When triggered, source is linked/copied to output without re-encoding.
+#   1 = check and skip if ideal
+#   0 = always process
+#SKIP_IF_IDEAL=0
+
+# Generate a JSON report alongside output with encode details and DV metadata
+# Useful for batch workflows and archival auditing.
+#   1 = write .json report
+#   0 = no report
+#REPORT_JSON=0
+
 
 # =========================
 # ffmpeg / ffprobe UX
@@ -213,13 +336,3 @@
 
 # ffprobe log level (same scale as ffmpeg)
 #FFPROBE_LOGLEVEL=error
-
-
-# =========================
-# Demux / raw prep policy
-# =========================
-
-# Use Annex-B bitstream filter when demuxing raw ES (helps DV/H.264/H.265 workflows)
-#   1 = apply mp4toannexb bsf
-#   0 = direct copy elementary stream
-#ANNEXB_FOR_DEMUX=1

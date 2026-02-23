@@ -9,7 +9,6 @@
 - [Usage](#usage)
 - [Examples](#examples)
 - [Configuration](#configuration)
-- [Troubleshooting](#troubleshooting)
 - [Going Forward](#goingforward)
 - [License](#license)
 - [Contributing](#contributing)
@@ -18,7 +17,7 @@
 
 ## ✨ Features <a id="features"></a>
 
-- **Format Profiles** – One-flag presets for common workflows: `dv-archival`, `hdr10-hq`, `atv-directplay-hq`, `universal`
+- **Format Profiles** – One-flag presets for common workflows: `dv-archival`, `hdr10-hq`, `atv-directplay-hq`, `streaming`, `animation`, `universal`
 - **Preserves HDR & Dolby Vision** – Keeps original color depth and HDR metadata where possible
 - **Audio Preservation** – Retains E-AC-3, AC-3, or AAC without re-encoding; converts others to best Direct Play-compatible format
 - **Lossless Audio Passthrough** – TrueHD, DTS-HD MA, and FLAC pass through untouched when the profile and container support it
@@ -50,6 +49,8 @@ muxm --profile <name> input.mkv
 | `dv-archival` | Lossless preservation | MKV | Copy (no re-encode) | Lossless passthrough | Preserve |
 | `hdr10-hq` | Max HDR10 quality | MKV | HEVC CRF 17 | Lossless + stereo fallback | Strip |
 | `atv-directplay-hq` | Apple TV Direct Play | MP4 | HEVC Main10 (copy if compliant) | E-AC-3 + AAC stereo | P8.1 auto |
+| `streaming` | Modern HEVC streaming | MP4 | HEVC CRF 20 | E-AC-3 448k + AAC stereo | Strip |
+| `animation` | Anime/cartoon optimized | MKV | HEVC CRF 16, 10-bit | Lossless + stereo fallback | Strip |
 | `universal` | Play anywhere | MP4 | H.264 SDR (tone-map HDR) | AAC stereo | Strip |
 
 ### `dv-archival` — Dolby Vision Archival
@@ -74,6 +75,22 @@ Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 wit
 
 ```bash
 muxm --profile atv-directplay-hq movie.mkv
+```
+
+### `streaming` — Modern HEVC Streaming
+
+Optimized for Plex, Jellyfin, and Emby on modern clients: Shield, Fire TV, Roku Ultra, smart TVs, and web browsers. HEVC CRF 20 with E-AC-3 surround at streaming-friendly bitrates, AAC stereo fallback, and soft subtitles. Strips DV and keeps HDR10. Balances quality with file size.
+
+```bash
+muxm --profile streaming movie.mkv
+```
+
+### `animation` — Anime & Cartoon Optimized
+
+Tuned for animation content: lower psy-rd/psy-rdoq to avoid ringing on hard cel edges, 10-bit even for SDR to eliminate banding in gradients, and lossless audio passthrough. MKV container preserves styled ASS/SSA subtitles. Keeps all subtitle tracks (up to 6) and chapter markers.
+
+```bash
+muxm --profile animation movie.mkv
 ```
 
 ### `universal` — Universal Compatibility
@@ -115,29 +132,11 @@ chmod +x muxm
 sudo mv muxm /usr/local/bin/muxm
 ```
 
-### Quick Setup (macOS)
-
-If you have Homebrew installed, `muxm` can check and install everything it needs automatically:
-
-```bash
-muxm --install-dependencies
-```
-
-This checks for all required and optional tools, installs missing ones via Homebrew and pipx, and verifies your environment (including Tesseract language data and `TESSDATA_PREFIX`).
-
 ### Dependencies
 
-**Required:**
-- **ffmpeg** and **ffprobe** — media encoding and probing
-- **jq** — JSON processing (used internally for stream metadata)
-
-**Recommended (Dolby Vision pipeline):**
-- **dovi_tool** — DV RPU extraction and injection (auto-disabled if missing)
-- **mp4box** (GPAC) — DV container signaling (`dvcC`/`dvvC` box writing). Install: `brew install gpac` (macOS) or `apt install gpac` (Linux)
-
-**Optional (PGS subtitle OCR):**
-- **sub2srt** or **pgsrip** — PGS bitmap subtitle OCR (set via `--ocr-tool`)
-- **tesseract** — OCR engine used by pgsrip
+- **ffmpeg** and **ffprobe** (required)
+- **dovi_tool** (required for Dolby Vision handling; auto-disabled if missing)
+- **sub2srt** or equivalent OCR tool (optional, for PGS subtitle conversion)
 
 ---
 
@@ -155,7 +154,7 @@ muxm [options] <source> [target.mp4]
 
 | Flag | Description |
 |---|---|
-| `--profile NAME` | Apply a format profile (`dv-archival`, `hdr10-hq`, `atv-directplay-hq`, `universal`) |
+| `--profile NAME` | Apply a format profile (`dv-archival`, `hdr10-hq`, `atv-directplay-hq`, `streaming`, `animation`, `universal`) |
 | `--dry-run` | Simulate without writing output |
 | `--crf N` | Set video CRF value |
 | `-p, --preset NAME` | x265 encoder preset (e.g., `slow`, `medium`) |
@@ -168,12 +167,6 @@ muxm [options] <source> [target.mp4]
 | `--strip-metadata` | Strip non-essential metadata |
 | `--skip-if-ideal` | Skip processing if source matches target |
 | `--print-effective-config` | Show resolved config after all overrides |
-| `--install-dependencies` | Check and install all required/optional tools |
-| `--checksum` | Write SHA-256 checksum for final output |
-| `-k, --keep-temp` | Keep temp workdir on failure (useful for debugging) |
-| `-K, --keep-temp-always` | Keep temp workdir even on success |
-
-> **Tip:** Most boolean flags support a `--no-*` counterpart (e.g., `--no-tonemap`, `--no-stereo-fallback`, `--no-strip-metadata`). This lets you override profile defaults on a per-run basis.
 
 Run `muxm --help` for the full flag reference.
 
@@ -193,6 +186,12 @@ muxm --profile dv-archival input.mkv
 
 # Universal compatibility — H.264 SDR, AAC stereo, burn forced subs
 muxm --profile universal input.mkv
+
+# Streaming — HEVC CRF 20, E-AC-3, modern device targeting
+muxm --profile streaming input.mkv
+
+# Animation — 10-bit HEVC, animation-tuned x265, lossless audio, MKV
+muxm --profile animation input.mkv
 
 # HDR10 high quality with custom CRF
 muxm --profile hdr10-hq --crf 20 input.mkv
@@ -238,69 +237,6 @@ muxm --profile hdr10-hq --crf 20 --print-effective-config
 ```
 
 This shows every variable grouped by section, the active profile name, and whether the profile came from a config file or the CLI.
-
----
-
-## 🔧 Troubleshooting <a id="troubleshooting"></a>
-
-All errors are prefixed with `❌ ERROR:` and printed to stderr. Warnings (`⚠️`) are non-fatal and never stop execution.
-
-### Exit Codes
-
-| Code | Category | Meaning |
-|---|---|---|
-| `0` | Success | Processing completed normally |
-| `10` | Dependency | A required tool is missing (ffmpeg, ffprobe, jq) |
-| `11` | Input / Arguments | Bad CLI flag, unknown option, missing source file, invalid output path, or source and output are the same file |
-| `12` | Source problem | Source file is corrupt, has no video streams, or ffprobe returned invalid data |
-| `40` | Video pipeline | Video encode failed, DV RPU extraction failed (with fallback disabled) |
-| `41` | Mux / Output | Final mux failed, DV injection failed, or output file is empty/corrupt |
-| `42` | Pipeline logic | Missing video stream for output, `--skip-video` used with a real encode job |
-| `43` | Audio pipeline | Audio copy or transcode failed |
-| `130` | Interrupted | User pressed Ctrl+C (SIGINT) |
-| `143` | Terminated | Process received SIGTERM |
-
-### Common Errors and What to Do
-
-**`Missing required tool: jq`** (exit 10)
-Install the missing dependency. On macOS: `brew install jq`. Or run `muxm --install-dependencies` to check and install everything at once.
-
-**`Source file not found`** (exit 11)
-Double-check the path. `muxm` resolves the source to an absolute path — typos, broken symlinks, and missing files all trigger this.
-
-**`Source file contains no video streams`** (exit 12)
-The file exists but ffprobe found no video tracks. It may be audio-only, corrupt, or in a format ffprobe can't read.
-
-**`ffmpeg final mux failed`** (exit 41)
-Check the detailed error log at `$WORKDIR/mux.err` (printed in the error message). Common causes include incompatible codec/container combinations (e.g., PGS subtitles in MP4) or disk full.
-
-**`DV RPU extraction failed and fallback is disabled`** (exit 40)
-`dovi_tool` couldn't extract RPU data and `--no-allow-dv-fallback` was set. Remove that flag to allow graceful fallback to non-DV output, or check that `dovi_tool` is installed and the source actually contains DV metadata.
-
-**`⚠️ Less than ~5GB free on output volume`** (warning)
-Not fatal, but encodes may fail mid-process if disk space runs out. Free up space or encode to a different volume.
-
-**`⚠️ dovi_tool not found`** (warning)
-Dolby Vision handling is auto-disabled. Install it (`brew install dovi_tool`) or run `muxm --install-dependencies`.
-
-**`⚠️ mp4box (GPAC) not found`** (warning)
-DV container signaling (`dvcC`/`dvvC` box) may fail without it. Install: `brew install gpac` (macOS) or `apt install gpac` (Linux).
-
-### Debugging Tips
-
-Use `--keep-temp` (or `-k`) to preserve the temp workdir on failure — it contains per-stage error logs (`encode.err`, `audio_primary.err`, `mux.err`) and intermediate files. Use `--keep-temp-always` (or `-K`) to keep it even on success.
-
-Use `--print-effective-config` to verify which settings are active after config files, profiles, and CLI flags are merged. Combine it with `--profile` to inspect what a profile actually sets:
-
-```bash
-muxm --profile atv-directplay-hq --print-effective-config
-```
-
-Set `DEBUG=1` in the environment to enable bash trace output (`set -x`) for low-level debugging:
-
-```bash
-DEBUG=1 muxm --profile universal input.mkv
-```
 
 ---
 

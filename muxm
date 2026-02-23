@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MuxMaster™ Freeware License v0.9
+#  MuxMaster™ Freeware License v0.12.0
 #  Copyright © 2025–2026 Jamey Wicklund (theBluWiz)
 #
 #  "Do what you want, just don't pretend I warranty the universe."
@@ -29,7 +29,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="0.11.0"
+readonly VERSION="0.12.0"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -40,6 +40,11 @@ FAILED=0
 FAIL_MSG=""
 EXIT_CODE=1
 PRINT_EFFCONF=0
+# TODO(future): Config file rotation — write-back of resolved config to disk
+# shellcheck disable=SC2034  # Reserved for future use
+CONFIG_WRITE_ROTATE=0
+# shellcheck disable=SC2034  # Reserved for future use
+CONFIG_WRITE_PATH=""
 PROFILE_NAME=""
 
 # Metadata cache for performance optimization
@@ -113,7 +118,13 @@ SUB_OCR_LANG="eng"
 
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
+# TODO(future): MP4 interleave duration for streaming optimization
+# shellcheck disable=SC2034  # Reserved for future use
+declare -i MP4_INTERLEAVE_MS=500
 TAG_LANGUAGE_DEFAULT="und"
+# TODO(future): Include descriptive titles in audio stream metadata tags
+# shellcheck disable=SC2034  # Reserved for future use
+declare -i INCLUDE_AUDIO_TITLES=1
 
 # ---- Operational defaults
 declare -i CHECKSUM=0
@@ -672,7 +683,7 @@ while (( _i < ${#_prescan_args[@]} )); do
       _PROFILE_SOURCE="cli"
       _i=$((_i + 2))
     else
-      die 11 "--profile requires a profile name (dv-archival, hdr10-hq, atv-directplay-hq, universal)"
+      die 11 "--profile requires a profile name (dv-archival, hdr10-hq, atv-directplay-hq, streaming, animation, universal)"
     fi
   else
     _filtered_args+=("${_prescan_args[$_i]}")
@@ -724,7 +735,7 @@ apply_profile_hdr10_hq() {
   VIDEO_CODEC="libx265"
   VIDEO_COPY_IF_COMPLIANT=0
   CRF_VALUE=17
-  PRESET_VALUE="slow"
+  PRESET_VALUE="slower"
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
@@ -753,8 +764,8 @@ apply_profile_atv_directplay_hq() {
   VIDEO_CODEC="libx265"
   VIDEO_COPY_IF_COMPLIANT=1
   CRF_VALUE=17
-  PRESET_VALUE="slow"
-  X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+  PRESET_VALUE="slower"
+  X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
   # Audio: E-AC-3 for surround (ATV can't Direct Play TrueHD), AAC stereo fallback
@@ -787,7 +798,7 @@ apply_profile_universal() {
   VIDEO_CODEC="libx264"
   VIDEO_COPY_IF_COMPLIANT=0
   TONEMAP_HDR_TO_SDR=1
-  CRF_VALUE=18
+  CRF_VALUE=22
   PRESET_VALUE="slow"
   FORCE_CHROMA_420=1
   # Audio: AAC stereo forced; optional AC3 5.1
@@ -807,6 +818,70 @@ apply_profile_universal() {
   STRIP_METADATA=1
 }
 
+apply_profile_streaming() {
+  # Goal: Smaller files, broad modern-device support, good quality.
+  DISABLE_DV=1
+  ALLOW_DV_FALLBACK=0
+  DV_CONVERT_TO_P81_IF_FAIL=0
+  # Container: mp4
+  OUTPUT_EXT="mp4"
+  # Video: HEVC re-encode targeting streaming file sizes
+  VIDEO_CODEC="libx265"
+  VIDEO_COPY_IF_COMPLIANT=0
+  CRF_VALUE=20
+  PRESET_VALUE="medium"
+  X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+  HDR_TARGET_PIXFMT="yuv420p10le"
+  FORCE_CHROMA_420=1
+  # Audio: E-AC-3 surround (streaming bitrates), AAC stereo fallback
+  AUDIO_LOSSLESS_PASSTHROUGH=0
+  ADD_STEREO_IF_MULTICH=1
+  STEREO_BITRATE="192k"
+  EAC3_BITRATE_5_1="448k"
+  EAC3_BITRATE_7_1="640k"
+  # Subs: soft forced, full embedded, no SDH
+  SUB_INCLUDE_FORCED=1
+  SUB_INCLUDE_FULL=1
+  SUB_INCLUDE_SDH=0
+  SUB_BURN_FORCED=0
+  SUB_EXPORT_EXTERNAL=0
+  # Chapters/metadata: keep
+  KEEP_CHAPTERS=1
+  STRIP_METADATA=0
+}
+
+apply_profile_animation() {
+  # Goal: Banding-free, artifact-free animation. Preserve flat gradients and hard edges.
+  DISABLE_DV=1
+  ALLOW_DV_FALLBACK=0
+  DV_CONVERT_TO_P81_IF_FAIL=0
+  # Container: mkv (ASS/SSA subtitle support, lossless audio)
+  OUTPUT_EXT="mkv"
+  # Video: HEVC, quality-first, animation-tuned x265 params
+  VIDEO_CODEC="libx265"
+  VIDEO_COPY_IF_COMPLIANT=0
+  CRF_VALUE=16
+  PRESET_VALUE="slower"
+  X265_PARAMS_BASE='profile=main10:repeat-headers=1:aq-mode=3:aq-strength=0.8:psy-rd=1.0:psy-rdoq=0.5:rc-lookahead=60:deblock=-1,-1:bframes=8'
+  HDR_TARGET_PIXFMT="yuv420p10le"
+  FORCE_CHROMA_420=1
+  SDR_USE_10BIT_IF_SRC_10BIT=1
+  # Audio: lossless passthrough + stereo fallback
+  AUDIO_LOSSLESS_PASSTHROUGH=1
+  ADD_STEREO_IF_MULTICH=1
+  STEREO_BITRATE="192k"
+  # Subs: keep all, never burn (preserve ASS styling)
+  SUB_INCLUDE_FORCED=1
+  SUB_INCLUDE_FULL=1
+  SUB_INCLUDE_SDH=1
+  SUB_MAX_TRACKS=6
+  SUB_BURN_FORCED=0
+  SUB_EXPORT_EXTERNAL=0
+  # Chapters/metadata: keep (OP/ED chapter markers)
+  KEEP_CHAPTERS=1
+  STRIP_METADATA=0
+}
+
 # Dispatcher
 apply_profile() {
   [[ -z "${PROFILE_NAME:-}" ]] && return 0
@@ -814,10 +889,12 @@ apply_profile() {
     dv-archival)         apply_profile_dv_archival ;;
     hdr10-hq)            apply_profile_hdr10_hq ;;
     atv-directplay-hq)   apply_profile_atv_directplay_hq ;;
+    streaming)           apply_profile_streaming ;;
+    animation)           apply_profile_animation ;;
     universal)           apply_profile_universal ;;
     *)
       printf "❌ ERROR: Unknown profile: %s\n" "$PROFILE_NAME" >&2
-      printf "   Valid profiles: dv-archival, hdr10-hq, atv-directplay-hq, universal\n" >&2
+      printf "   Valid profiles: dv-archival, hdr10-hq, atv-directplay-hq, streaming, animation, universal\n" >&2
       exit 11
       ;;
   esac
@@ -846,6 +923,12 @@ Profile (format presets):
                               + stereo fallback. MKV container.
     atv-directplay-hq         Apple TV Direct Play. MP4, HEVC Main10, DV P8.1,
                               E-AC-3 audio, AAC stereo fallback, burn forced subs.
+    streaming                 Modern HEVC streaming. CRF 20, E-AC-3 448k, AAC
+                              stereo, soft subs. MP4. Targets Plex/Jellyfin on
+                              Shield, Fire TV, Roku, smart TVs, web.
+    animation                 Anime/cartoon optimized. HEVC CRF 16, 10-bit (even
+                              SDR), animation-tuned x265, lossless audio, preserve
+                              all subs (ASS/SSA). MKV container.
     universal                 Play anywhere. H.264 SDR (tone-map HDR), AAC stereo,
                               burn forced subs, strip chapters/metadata. MP4.
 
@@ -1092,6 +1175,55 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
           "TrueHD/DTS-HD MA won’t Direct Play on Apple TV. E-AC-3 is recommended."
       ;;
 
+    streaming)
+      # MKV is unusual for streaming targets
+      [[ "$OUTPUT_EXT" == "mkv" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
+          "MKV is unusual for streaming targets. MP4 recommended for broadest client support."
+
+      # MOV is unusual for streaming targets
+      [[ "$OUTPUT_EXT" == "mov" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
+          "MOV is unusual for streaming targets. MP4 recommended for broadest client support."
+
+      # Lossless audio increases file size significantly
+      (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
+        _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
+          "Lossless audio increases file size significantly. E-AC-3/AAC recommended for streaming."
+
+      # H.264 cannot carry HDR10
+      [[ "$VIDEO_CODEC" == "libx264" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
+          "H.264 cannot carry HDR10 metadata. HEVC recommended for streaming."
+      ;;
+
+    animation)
+      # MP4 cannot carry styled ASS/SSA subtitles
+      [[ "$OUTPUT_EXT" == "mp4" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mp4" \
+          "MP4 cannot carry styled ASS/SSA subtitles. MKV recommended for animation."
+
+      # MOV has similar subtitle limitations
+      [[ "$OUTPUT_EXT" == "mov" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
+          "MOV cannot carry styled ASS/SSA subtitles. MKV recommended for animation."
+
+      # Burning subs destroys ASS styling
+      (( SUB_BURN_FORCED )) && \
+        _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
+          "Burning subs destroys ASS styling (typesetting, signs, karaoke). Soft subs recommended."
+
+      # H.264 8-bit causes banding in animation
+      [[ "$VIDEO_CODEC" == "libx264" ]] && \
+        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
+          "H.264 8-bit causes visible banding in animation gradients. HEVC 10-bit recommended."
+
+      # Transcoding lossless audio loses quality unnecessarily
+      (( ! AUDIO_LOSSLESS_PASSTHROUGH )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-audio-lossless-passthrough" \
+          "Transcoding lossless audio loses quality. MKV supports lossless natively."
+      ;;
+
     universal)
       # MKV is unusual for max-compat
       [[ "$OUTPUT_EXT" == "mkv" ]] && \
@@ -1137,6 +1269,17 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
   if (( SUB_EXPORT_EXTERNAL )) && [[ "$OUTPUT_EXT" == "mkv" ]]; then
     warn "SUB_EXPORT_EXTERNAL with MKV: MKV natively supports multiple subtitle tracks. External SRT export is unnecessary but will proceed as requested."
   fi
+fi
+
+# Global safeguard: H.264 cannot carry HDR metadata. If the user has selected
+# libx264 without tone-mapping, HDR sources will produce washed-out output.
+# This warning fires regardless of whether a profile is active.
+if [[ "$VIDEO_CODEC" == "libx264" ]] && (( ! TONEMAP_HDR_TO_SDR )); then
+  # We can't probe the source yet (no file parsed), so we note the risk.
+  # The video pipeline will re-check once source HDR status is known.
+  _H264_HDR_WARN_PENDING=1
+else
+  _H264_HDR_WARN_PENDING=0
 fi
 
 
@@ -3548,6 +3691,12 @@ main() {
   # Decide color space and build x265 params
   decide_color_and_pixfmt
   build_x265_params
+
+  # Deferred warning: H.264 + HDR source + no tone-mapping → washed-out output
+  if (( _H264_HDR_WARN_PENDING )) && [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]]; then
+    warn "Source is HDR but tone-mapping is disabled. H.264 cannot preserve HDR metadata — output will appear washed out."
+  fi
+
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
   # When burning forced subs, we need the subtitle plan BEFORE video encode
