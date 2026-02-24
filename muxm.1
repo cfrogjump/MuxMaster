@@ -66,6 +66,29 @@ Show the resolved configuration after all sources merge, then exit.
 .BR \-\-install\-dependencies
 Check and install required/optional tools via Homebrew and pipx.
 .TP
+.BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
+Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
+and exit. Profile\-specific variables are uncommented and set; all other
+variables are commented with defaults.
+.RS
+.TP
+.B system
+writes to \fI/etc/.muxmrc\fR (may require sudo)
+.TP
+.B user
+writes to \fI~/.muxmrc\fR
+.TP
+.B project
+writes to \fI$PWD/.muxmrc\fR
+.RE
+.IP
+\fIPROFILE\fR defaults to \fBatv\-directplay\-hq\fR if omitted.
+Refuses to overwrite an existing file; use \fB\-\-force\-create\-config\fR
+to overwrite.
+.TP
+.BR \-\-force\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
+Same as \fB\-\-create\-config\fR but overwrites an existing file.
+.TP
 .BR \-\-output\-ext " " \fIEXT\fR
 Output container: mp4|m4v|mov|mkv. Default: mp4.
 .TP
@@ -148,6 +171,11 @@ muxm \-\-profile hdr10\-hq \-\-crf 20 Movie.mkv
 muxm \-\-crf 20 \-p slow Movie.mkv out.mp4
 muxm \-\-profile atv\-directplay\-hq \-\-print\-effective\-config
 muxm \-\-dry\-run \-\-profile streaming Movie.mkv
+muxm \-\-create\-config user atv\-directplay\-hq
+muxm \-\-create\-config project streaming
+muxm \-\-create\-config user
+sudo muxm \-\-create\-config system dv\-archival
+muxm \-\-force\-create\-config user animation
 .fi
 .SH FILES
 \fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR

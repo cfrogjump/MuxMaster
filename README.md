@@ -201,6 +201,21 @@ muxm --profile atv-directplay-hq --print-effective-config
 
 # Dry run to preview the pipeline
 muxm --profile universal --dry-run input.mkv
+
+# Generate a config file for Apple TV Direct Play in your home dir
+muxm --create-config user atv-directplay-hq
+
+# Generate a project-specific config for streaming (in current directory)
+muxm --create-config project streaming
+
+# Default profile is atv-directplay-hq if omitted
+muxm --create-config user
+
+# System-wide config (requires sudo)
+sudo muxm --create-config system dv-archival
+
+# Overwrite an existing config
+muxm --force-create-config user animation
 ```
 
 ---
@@ -228,6 +243,24 @@ PROFILE_NAME="atv-directplay-hq"
 ```
 
 CLI `--profile` always overrides a config-file `PROFILE_NAME`.
+
+### Creating a Config File
+
+Use `--create-config` to generate a full `.muxmrc` file pre-configured for a specific profile:
+
+```bash
+muxm --create-config <scope> [profile]
+```
+
+| Scope | Path | Use case |
+|---|---|---|
+| `system` | `/etc/.muxmrc` | Organization-wide defaults (requires sudo) |
+| `user` | `~/.muxmrc` | Personal defaults across all projects |
+| `project` | `$PWD/.muxmrc` | Per-project settings |
+
+The generated file contains the complete config template. Variables set by the chosen profile are uncommented and active; everything else is commented with defaults for easy customization.
+
+Profile defaults to `atv-directplay-hq` if omitted. Use `--force-create-config` to overwrite an existing file.
 
 ### Verifying Effective Configuration
 
