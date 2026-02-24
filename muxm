@@ -3330,7 +3330,8 @@ run_audio_pipeline(){
   # Persist audio metadata for mux_final tagging
   A_PRIMARY_LANG="$lang"
   A_PRIMARY_TITLE="${title:-}"
-  A_PRIMARY_CHANNELS="$ch"  # shellcheck disable=SC2034
+  # shellcheck disable=SC2034
+  A_PRIMARY_CHANNELS="$ch"
   A_STEREO_LANG="$lang"
 
   # Enforce MAX_AUDIO_CHANNELS
