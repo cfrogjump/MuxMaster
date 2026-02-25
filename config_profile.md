@@ -1,10 +1,10 @@
-# muxm Presets
+# muxm Format Profiles
 
-Below are the four main presets for `muxm`, listed **from highest fidelity to widest compatibility**.  
-Each preset includes **who/where it's for**, **its goal**, and **default behaviors**.
+Below are the six format profiles for `muxm`, listed **from highest fidelity to widest compatibility**.  
+Each profile includes **who/where it's for**, **its goal**, and **default behaviors**.
 
-> **Implementation status:** All four profiles are implemented and available via `--profile <name>`.  
-> Features marked ✅ are fully implemented. Features marked 🔜 have variable scaffolding in place but the pipeline behavior is pending.
+> **Implementation status:** All six profiles are implemented and available via `--profile <n>`.  
+> Features marked ✅ are fully implemented.
 
 ---
 
@@ -41,9 +41,9 @@ Maximize HDR10 quality while avoiding DV playback issues. Keep HDR10 metadata in
 - **DV policy:** `strip` ✅ `DISABLE_DV=1`
 - **Container:** `mkv` ✅
 - **Video:** HEVC re-encode if needed: ✅  
-  `-c:v libx265 -preset slow -crf 17` with HDR10 x265 params
+  `-c:v libx265 -preset slower -crf 17` with HDR10 x265 params
 - **Pixel format:** `yuv420p10le` ✅ `HDR_TARGET_PIXFMT=yuv420p10le`, `FORCE_CHROMA_420=1`
-- **Audio:** keep lossless **and** add stereo fallback (AC3 256k, `-ac 2`) ✅ `AUDIO_LOSSLESS_PASSTHROUGH=1`, `ADD_STEREO_IF_MULTICH=1`, `STEREO_BITRATE=256k`
+- **Audio:** keep lossless **and** add AAC stereo fallback (256k) ✅ `AUDIO_LOSSLESS_PASSTHROUGH=1`, `ADD_STEREO_IF_MULTICH=1`, `STEREO_BITRATE=256k`
 - **Subs:** keep all; default by language; no burn ✅
 - **Chapters/metadata:** preserve ✅
 
@@ -66,7 +66,7 @@ Conform to tvOS/Plex playback constraints while keeping high quality: MP4 contai
 - **Video:** ✅  
   - Prefer copy if already compliant (`VIDEO_COPY_IF_COMPLIANT=1`); else:
     ```
-    -c:v libx265 -preset slow -crf 17 -pix_fmt yuv420p10le
+    -c:v libx265 -preset slower -crf 17 -pix_fmt yuv420p10le
     ```
   - If DV kept: add `:dv-profile=8.1:dv-bl-compatible-id=1`.
 - **Audio:** ✅  
@@ -83,7 +83,53 @@ Conform to tvOS/Plex playback constraints while keeping high quality: MP4 contai
 
 ---
 
-## 4) `universal` — Universal Compatibility
+## 4) `streaming` — Modern HEVC Streaming
+**Who/Where:**  
+For Plex, Jellyfin, and Emby users targeting modern clients: Shield, Fire TV, Roku Ultra, smart TVs, and web browsers. Balances quality with file size.
+
+**Goal:**  
+Smaller files with broad modern-device support. HEVC CRF 20 with streaming-friendly audio bitrates. Strip DV, keep HDR10.
+
+**Defaults:**
+- **DV policy:** `strip` ✅ `DISABLE_DV=1`
+- **Container:** `mp4` ✅
+- **Video:** HEVC re-encode: ✅  
+  `-c:v libx265 -preset medium -crf 20` with HDR10 x265 params
+- **Pixel format:** `yuv420p10le` ✅ `HDR_TARGET_PIXFMT=yuv420p10le`, `FORCE_CHROMA_420=1`
+- **Audio:** E-AC-3 surround at streaming bitrates + AAC stereo fallback ✅  
+  `EAC3_BITRATE_5_1=448k`, `EAC3_BITRATE_7_1=640k`, `ADD_STEREO_IF_MULTICH=1`, `STEREO_BITRATE=192k`, `AUDIO_LOSSLESS_PASSTHROUGH=0`
+- **Subs:** soft forced, full embedded, no SDH ✅  
+  `SUB_INCLUDE_FORCED=1`, `SUB_INCLUDE_FULL=1`, `SUB_INCLUDE_SDH=0`, `SUB_BURN_FORCED=0`
+- **Chapters/metadata:** keep ✅ `KEEP_CHAPTERS=1`, `STRIP_METADATA=0`
+
+**CLI:** `muxm --profile streaming input.mkv`
+
+---
+
+## 5) `animation` — Anime & Cartoon Optimized
+**Who/Where:**  
+For anime and cartoon content where banding-free gradients, clean hard edges, and styled subtitle preservation matter. Ideal for archival-quality animation encodes.
+
+**Goal:**  
+Artifact-free animation encoding. 10-bit even for SDR to eliminate banding, animation-tuned x265 params (low psy-rd, adjusted deblock, extra b-frames), lossless audio, and MKV to preserve styled ASS/SSA subtitles.
+
+**Defaults:**
+- **DV policy:** `strip` ✅ `DISABLE_DV=1`
+- **Container:** `mkv` (ASS/SSA subtitle support, lossless audio) ✅
+- **Video:** HEVC, quality-first, animation-tuned: ✅  
+  `-c:v libx265 -preset slower -crf 16` with `psy-rd=1.0:psy-rdoq=0.5:deblock=-1,-1:bframes=8`
+- **Pixel format:** `yuv420p10le` (10-bit even for SDR) ✅ `SDR_USE_10BIT_IF_SRC_10BIT=1`
+- **Audio:** lossless passthrough + AAC stereo fallback ✅  
+  `AUDIO_LOSSLESS_PASSTHROUGH=1`, `ADD_STEREO_IF_MULTICH=1`, `STEREO_BITRATE=192k`
+- **Subs:** keep all (up to 6 tracks), never burn (preserve ASS styling) ✅  
+  `SUB_INCLUDE_FORCED=1`, `SUB_INCLUDE_FULL=1`, `SUB_INCLUDE_SDH=1`, `SUB_MAX_TRACKS=6`, `SUB_BURN_FORCED=0`
+- **Chapters/metadata:** keep (OP/ED chapter markers) ✅ `KEEP_CHAPTERS=1`, `STRIP_METADATA=0`
+
+**CLI:** `muxm --profile animation input.mkv`
+
+---
+
+## 6) `universal` — Universal Compatibility
 **Who/Where:**  
 For playback **anywhere**: old Rokus, mobile devices, web browsers, non-HDR TVs. Ideal for sharing with friends/family without worrying about playback capability.
 
@@ -94,7 +140,7 @@ Prioritize compatibility over fidelity. Tone-map HDR to SDR H.264, ensure AAC st
 - **DV policy:** `strip` ✅ `DISABLE_DV=1`
 - **Container:** `mp4` ✅
 - **Video:** SDR H.264, tone-mapped from HDR if present: ✅  
-  `VIDEO_CODEC=libx264`, `TONEMAP_HDR_TO_SDR=1`, `CRF_VALUE=18`, `PRESET_VALUE=slow`
+  `VIDEO_CODEC=libx264`, `TONEMAP_HDR_TO_SDR=1`, `CRF_VALUE=22`, `PRESET_VALUE=slow`
 - **Audio:** AAC stereo ✅  
   `AUDIO_FORCE_CODEC=aac`, `MAX_AUDIO_CHANNELS=2`, `STEREO_BITRATE=256k`, `ADD_STEREO_IF_MULTICH=0`
 - **Subs:** burn forced; export all others as external `.srt` ✅  
@@ -108,7 +154,7 @@ Prioritize compatibility over fidelity. Tone-map HDR to SDR H.264, ensure AAC st
 
 ## Configuration Flexibility
 
-These presets are **opinionated starting points** — every option is adjustable.
+These profiles are **opinionated starting points** — every option is adjustable.
 
 `muxm` reads configuration from multiple levels, applied in the following order  
 (**lowest precedence** → **highest precedence**):

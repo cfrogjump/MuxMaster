@@ -115,14 +115,18 @@ Advanced x265 parameter string.
 .BR \-\-tonemap " , " \-\-no\-tonemap
 Enable/disable HDR/HLG to SDR tone\-mapping.
 .TP
-.BR \-\-video\-copy\-if\-compliant
-Copy video stream if source already matches target profile.
+.BR \-\-video\-copy\-if\-compliant " , " \-\-no\-video\-copy\-if\-compliant
+Copy/re\-encode video stream when source already matches target profile.
 .TP
 .BR \-\-no\-dv
 Disable Dolby Vision extraction/injection.
 .TP
-.BR \-\-no\-allow\-dv\-fallback
-If DV handling fails, hard\-fail instead of falling back to non\-DV.
+.BR \-\-allow\-dv\-fallback " , " \-\-no\-allow\-dv\-fallback
+If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
+.TP
+.BR \-\-dv\-convert\-p81 " , " \-\-no\-dv\-convert\-p81
+Enable/disable automatic conversion to DV Profile 8.1 when native DV
+injection fails. Default: enabled.
 .TP
 .BR \-\-no\-conservative\-vbv
 Disable VBV guardrails.
@@ -190,8 +194,8 @@ Skip processing if source already matches profile requirements.
 .BR \-\-report\-json " , " \-\-no\-report\-json
 Generate/suppress JSON report alongside output.
 .TP
-.BR \-\-checksum
-Write SHA\-256 checksum for final output.
+.BR \-\-checksum " , " \-\-no\-checksum
+Write/suppress SHA\-256 checksum for final output.
 .TP
 .BR \-K ", " \-\-keep\-temp\-always
 Keep temporary workdir even on success.
@@ -202,10 +206,23 @@ Keep temporary workdir on failure.
 .TP
 .BR \-\-skip\-video " , " \-\-skip\-audio " , " \-\-skip\-subs
 Disable respective pipelines (useful for quick tests).
+.SH FFMPEG OPTIONS
+.TP
+.BR \-\-ffmpeg\-loglevel " " \fILEVEL\fR
+Set ffmpeg log verbosity (e.g., quiet, error, warning, info). Default: error.
+.TP
+.BR \-\-ffprobe\-loglevel " " \fILEVEL\fR
+Set ffprobe log verbosity. Default: error.
+.TP
+.BR \-\-no\-hide\-banner
+Show the ffmpeg/ffprobe startup banner (hidden by default).
+.TP
+.BR \-\-no\-overwrite
+Do not overwrite existing intermediate files (ffmpeg overwrites by default).
 .SH EXAMPLES
 .TP
 .B muxm Movie.mkv
-Encode with defaults (HEVC, CRF 20, MP4). Output name is derived from input.
+Encode with defaults (HEVC, CRF 18, MP4). Output name is derived from input.
 .TP
 .B muxm \-\-profile atv\-directplay\-hq Movie.mkv
 Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
@@ -257,6 +274,27 @@ Install this manual page so \fBman muxm\fR works.
 .PP
 Configuration files use shell variable syntax. CLI flags always override
 config files. Profiles override config files but are overridden by CLI flags.
+.SH DEPENDENCIES
+.TP
+.B Required
+\fBffmpeg\fR, \fBffprobe\fR \(em core encoding and media inspection.
+.br
+\fBjq\fR \(em JSON parsing for stream metadata and reporting.
+.TP
+.B Optional
+\fBdovi_tool\fR \(em Dolby Vision RPU extraction/injection. DV handling is
+automatically disabled if missing.
+.br
+\fBMP4Box\fR (gpac) \(em DV container\-level signaling verification.
+Detected at runtime as \fBmp4box\fR or \fBMP4Box\fR.
+.br
+\fBbc\fR \(em fractional frame\-rate display in output verification.
+.br
+\fBsub2srt\fR or \fBpgsrip\fR \(em PGS bitmap subtitle OCR to SRT.
+Configurable via \fB\-\-ocr\-tool\fR.
+.PP
+Run \fBmuxm \-\-install\-dependencies\fR to check for and install all
+tools via Homebrew and pipx.
 .SH EXIT CODES
 .TP
 .B 0
@@ -267,6 +305,9 @@ General error.
 .TP
 .B 11
 Invalid arguments or unknown profile.
+.TP
+.B 12
+Source file contains no video streams.
 .TP
 .B 42
 Pipeline error (video processing failure).

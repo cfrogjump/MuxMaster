@@ -1,6 +1,6 @@
 # ![muxm](./assets/muxm_header_small.png) MuxMaster
 
-**MuxMaster** – a versatile, cross-platform video repacking and encoding utility that preserves HDR, Dolby Vision, and high-quality audio while optimizing for Plex and Apple TV Direct Play. Supports smart codec handling, color space matching, error recovery, and optional stereo fallback.
+**MuxMaster** – a versatile, cross-platform video repacking and encoding utility with format profiles for Apple TV Direct Play, Plex/Jellyfin streaming, archival storage, animation, and universal compatibility. Preserves HDR, Dolby Vision, and high-quality audio with smart codec handling, color space matching, error recovery, and optional stereo fallback.
 
 ## Table of Contents
 - [Features](#features)
@@ -134,9 +134,32 @@ sudo mv muxm /usr/local/bin/muxm
 
 ### Dependencies
 
-- **ffmpeg** and **ffprobe** (required)
-- **dovi_tool** (required for Dolby Vision handling; auto-disabled if missing)
-- **sub2srt** or equivalent OCR tool (optional, for PGS subtitle conversion)
+**Required:**
+- **ffmpeg** and **ffprobe** – core encoding and media inspection
+- **jq** – JSON parsing for stream metadata and reporting
+
+**Optional (auto-disabled if missing):**
+- **dovi_tool** – Dolby Vision RPU extraction/injection; DV handling is automatically disabled if missing
+- **MP4Box** (gpac) – DV container-level signaling verification
+- **bc** – fractional frame-rate display in output verification
+- **sub2srt** or **pgsrip** – PGS bitmap subtitle OCR to SRT (configurable via `--ocr-tool`)
+
+### Quick Setup
+
+```bash
+# Install all required and optional tools via Homebrew and pipx
+muxm --install-dependencies
+
+# Install the man page so `man muxm` works
+muxm --install-man
+
+# Generate a config file pre-filled with a profile's defaults
+muxm --create-config user atv-directplay-hq   # ~/.muxmrc
+muxm --create-config project streaming         # ./.muxmrc
+
+# Remove the installed man page
+muxm --uninstall-man
+```
 
 ---
 
