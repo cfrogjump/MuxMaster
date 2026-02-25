@@ -1,7 +1,7 @@
 # MuxMaster (muxm) Testing Plan
 
 **Version:** v0.12.0  
-**Date:** 2026-02-24  
+**Date:** 2026-02-25  
 **Scope:** Comprehensive feature coverage — automated test harness + manual testing checklist
 
 ---
@@ -14,7 +14,7 @@ muxm has grown to include 6 format profiles, 60+ CLI flags, layered configuratio
 
 | File | Purpose |
 |------|---------|
-| `tests/test_muxm.sh` | Automated test harness — generates synthetic media, runs ~80 assertions |
+| `tests/test_muxm.sh` | Automated test harness — generates synthetic media, runs ~120 assertions |
 | This document | Manual testing procedures for features that require real media or subjective verification |
 
 ### Running the Automated Tests
@@ -31,7 +31,8 @@ muxm has grown to include 6 format profiles, 60+ CLI flags, layered configuratio
 # Verbose (shows output on failures)
 ./tests/test_muxm.sh --muxm ./muxm.sh --verbose
 
-# Available suites: all, cli, config, profiles, conflicts, dryrun, video, audio, subs, output, edge, e2e
+# Available suites: all, cli, config, profiles, conflicts, dryrun, video, hdr,
+#                   audio, subs, output, containers, metadata, edge, e2e
 ```
 
 ### Prerequisites
@@ -59,102 +60,167 @@ The test harness (`tests/test_muxm.sh`) generates synthetic test media — short
 | 8 | Missing source file | Exits 11, "not found" | ✅ |
 | 9 | Too many positionals | Exits 11 | ✅ |
 | 10 | Source = output | Exits 11, "same file" | ✅ |
+| 11 | `--no-overwrite` | Refuses when output already exists | ✅ |
 
 ### 1.2 Configuration Precedence (suite: `config`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 11 | `--print-effective-config` | Displays all sections | ✅ |
-| 12 | Profile visible in config | PROFILE_NAME shows in output | ✅ |
-| 13 | CLI overrides profile | `--crf 25` overrides profile CRF | ✅ |
-| 14 | `--create-config project streaming` | Creates `.muxmrc` with correct values | ✅ |
-| 15 | `--create-config` refuses overwrite | Error on existing file | ✅ |
-| 16 | `--force-create-config` overwrites | New profile written | ✅ |
-| 17 | Invalid config scope | "Invalid scope" error | ✅ |
+| 12 | `--print-effective-config` | Displays all sections | ✅ |
+| 13 | Profile visible in config | PROFILE_NAME shows in output | ✅ |
+| 14 | CLI overrides profile | `--crf 25` overrides profile CRF | ✅ |
+| 15 | `--create-config project streaming` | Creates `.muxmrc` with correct values | ✅ |
+| 16 | `--create-config` refuses overwrite | Error on existing file | ✅ |
+| 17 | `--force-create-config` overwrites | New profile written | ✅ |
+| 18 | Invalid config scope | "Invalid scope" error | ✅ |
 
 ### 1.3 Profile Variable Assignment (suite: `profiles`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 18 | All 6 profiles accepted | Each shows in effective config | ✅ |
-| 19 | `dv-archival` defaults | VIDEO_COPY=1, SKIP_IF_IDEAL=1, REPORT_JSON=1, MKV | ✅ |
-| 20 | `hdr10-hq` defaults | DISABLE_DV=1, CRF=17, MKV | ✅ |
-| 21 | `atv-directplay-hq` defaults | MP4, SUB_BURN_FORCED=1, SKIP_IF_IDEAL=1 | ✅ |
-| 22 | `streaming` defaults | CRF=20, preset=medium | ✅ |
-| 23 | `animation` defaults | CRF=16, MKV, LOSSLESS_PASSTHROUGH=1 | ✅ |
-| 24 | `universal` defaults | libx264, TONEMAP=1, STRIP_METADATA=1, MP4 | ✅ |
+| 19 | All 6 profiles accepted | Each shows in effective config | ✅ |
+| 20 | `dv-archival` defaults | VIDEO_COPY=1, SKIP_IF_IDEAL=1, REPORT_JSON=1, MKV | ✅ |
+| 21 | `hdr10-hq` defaults | DISABLE_DV=1, CRF=17, MKV | ✅ |
+| 22 | `atv-directplay-hq` defaults | MP4, SUB_BURN_FORCED=1, SKIP_IF_IDEAL=1 | ✅ |
+| 23 | `streaming` defaults | CRF=20, preset=medium | ✅ |
+| 24 | `animation` defaults | CRF=16, MKV, LOSSLESS_PASSTHROUGH=1 | ✅ |
+| 25 | `universal` defaults | libx264, TONEMAP=1, STRIP_METADATA=1, MP4 | ✅ |
 
 ### 1.4 Conflict Warnings (suite: `conflicts`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 25 | `dv-archival` + `--no-dv` | ⚠️ warning emitted | ✅ |
-| 26 | `hdr10-hq` + `--tonemap` | ⚠️ warning emitted | ✅ |
-| 27 | `atv-directplay-hq` + `--output-ext mkv` | ⚠️ warning emitted | ✅ |
-| 28 | `animation` + `--sub-burn-forced` | ⚠️ warning emitted | ✅ |
-| 29 | `animation` + `--video-codec libx264` | ⚠️ warning emitted | ✅ |
-| 30 | `universal` + `--output-ext mkv` | ⚠️ warning emitted | ✅ |
-| 31 | `--sub-burn-forced` + `--no-subtitles` | ⚠️ warning about no subs to burn | ✅ |
+| 26 | `dv-archival` + `--no-dv` | ⚠️ warning emitted | ✅ |
+| 27 | `dv-archival` + `--strip-metadata` | ⚠️ warning emitted | ✅ |
+| 28 | `dv-archival` + `--no-keep-chapters` | ⚠️ warning emitted | ✅ |
+| 29 | `dv-archival` + `--sub-burn-forced` | ⚠️ warning emitted | ✅ |
+| 30 | `hdr10-hq` + `--tonemap` | ⚠️ warning emitted | ✅ |
+| 31 | `hdr10-hq` + `--video-codec libx264` | ⚠️ warning emitted | ✅ |
+| 32 | `atv-directplay-hq` + `--output-ext mkv` | ⚠️ warning emitted | ✅ |
+| 33 | `atv-directplay-hq` + `--tonemap` | ⚠️ warning emitted | ✅ |
+| 34 | `atv-directplay-hq` + `--video-codec libx264` | ⚠️ warning emitted | ✅ |
+| 35 | `atv-directplay-hq` + `--audio-lossless-passthrough` | ⚠️ warning emitted | ✅ |
+| 36 | `streaming` + `--output-ext mkv` | ⚠️ warning emitted | ✅ |
+| 37 | `streaming` + `--audio-lossless-passthrough` | ⚠️ warning emitted | ✅ |
+| 38 | `streaming` + `--video-codec libx264` | ⚠️ warning emitted | ✅ |
+| 39 | `animation` + `--sub-burn-forced` | ⚠️ warning emitted | ✅ |
+| 40 | `animation` + `--video-codec libx264` | ⚠️ warning emitted | ✅ |
+| 41 | `animation` + `--output-ext mp4` | ⚠️ warning emitted | ✅ |
+| 42 | `animation` + `--no-audio-lossless-passthrough` | ⚠️ warning emitted | ✅ |
+| 43 | `universal` + `--output-ext mkv` | ⚠️ warning emitted | ✅ |
+| 44 | `universal` + `--audio-lossless-passthrough` | ⚠️ warning emitted | ✅ |
+| 45 | `universal` + `--video-codec libx265` | ⚠️ warning emitted | ✅ |
+| 46 | Cross: `--video-copy-if-compliant` + `--tonemap` | ⚠️ warning about conflicting flags | ✅ |
+| 47 | Cross: `--sub-export-external` with MKV output | ⚠️ warning emitted | ✅ |
+| 48 | Cross: `--sub-burn-forced` + `--no-subtitles` | ⚠️ warning about no subs to burn | ✅ |
 
 ### 1.5 Dry-Run Mode (suite: `dryrun`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 32 | `--dry-run` with source | "DRY-RUN" announced, no output file | ✅ |
-| 33 | `--dry-run` + profile | Profile announced, no files | ✅ |
-| 34 | `--dry-run` + `--skip-audio` | "[Quick Test]" announced | ✅ |
-| 35 | `--dry-run` + `--skip-subs` | "[Quick Test]" announced | ✅ |
+| 49 | `--dry-run` with source | "DRY-RUN" announced, no output file | ✅ |
+| 50 | `--dry-run` + profile | Profile announced, no files | ✅ |
+| 51 | `--dry-run` + `--skip-audio` | "[Quick Test]" announced | ✅ |
+| 52 | `--dry-run` + `--skip-subs` | "[Quick Test]" announced | ✅ |
+| 53 | `--dry-run` + HDR source | "DRY-RUN" announced for HDR input | ✅ |
 
 ### 1.6 Video Pipeline (suite: `video`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 36 | Basic SDR → HEVC MP4 | Output exists, codec is `hevc` | ✅ |
-| 37 | `--video-codec libx264` | Output codec is `h264` | ✅ |
-| 38 | `--output-ext mkv` | Output format is `matroska` | ✅ |
+| 54 | Basic SDR → HEVC MP4 | Output exists, codec is `hevc` | ✅ |
+| 55 | `--video-codec libx264` | Output codec is `h264` | ✅ |
+| 56 | `--output-ext mkv` | Output format is `matroska` | ✅ |
+| 57 | `--x265-params "aq-mode=3"` | Encode succeeds with custom x265 params | ✅ |
+| 58 | `--threads 2` | Encode succeeds with thread limit | ✅ |
+| 59 | `--video-copy-if-compliant` | HEVC source copied without re-encode | ✅ |
 
-### 1.7 Audio Pipeline (suite: `audio`)
-
-| # | Test | Assertion | Auto |
-|---|------|-----------|------|
-| 39 | 5.1 source → output has audio | ≥1 audio track | ✅ |
-| 40 | Stereo fallback added | ≥2 audio tracks for surround source | ✅ |
-| 41 | `--no-stereo-fallback` | Single audio track | ✅ |
-| 42 | `--skip-audio` announced | Quick Test message in output | ✅ |
-
-### 1.8 Subtitle Pipeline (suite: `subs`)
+### 1.7 HDR Pipeline (suite: `hdr`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 43 | Multi-sub source → MKV | ≥1 subtitle tracks in output | ✅ |
-| 44 | `--no-subtitles` | 0 subtitle tracks | ✅ |
-| 45 | `--skip-subs` announced | Quick Test message | ✅ |
+| 60 | HDR10-tagged source encode | HEVC output, BT.2020 primaries and SMPTE 2084 transfer preserved | ✅ |
+| 61 | `--no-tonemap` config flag | TONEMAP_HDR_TO_SDR = 0 in effective config | ✅ |
 
-### 1.9 Output Features (suite: `output`)
-
-| # | Test | Assertion | Auto |
-|---|------|-----------|------|
-| 46 | `--keep-chapters` | Chapters present in output | ✅ |
-| 47 | `--no-keep-chapters` | Chapters stripped | ✅ |
-| 48 | `--checksum` | `.sha256` sidecar created | ✅ |
-| 49 | `--report-json` | `.report.json` sidecar created, valid JSON | ✅ |
-
-### 1.10 Edge Cases & Security (suite: `edge`)
+### 1.8 Audio Pipeline (suite: `audio`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 50 | Empty source file | Rejected with error | ✅ |
-| 51 | Filename with spaces | Handled correctly | ✅ |
-| 52 | `--output-ext "mp4;"` | Rejected (injection prevention) | ✅ |
-| 53 | `--ocr-tool "sub2srt;rm -rf /"` | Rejected (injection prevention) | ✅ |
+| 62 | 5.1 source → output has audio | ≥1 audio track | ✅ |
+| 63 | Stereo fallback added | ≥2 audio tracks for surround source | ✅ |
+| 64 | `--no-stereo-fallback` | Single audio track | ✅ |
+| 65 | `--skip-audio` announced | "Audio processing disabled" in output | ✅ |
+| 66 | Multi-audio auto-selection | Scoring algorithm prefers surround track | ✅ |
+| 67 | `--audio-track 0` override | Specific track selected regardless of scoring | ✅ |
+| 68 | `--audio-lang-pref spa` | Spanish audio track selected | ✅ |
+| 69 | `--audio-force-codec aac` | Audio transcoded to AAC | ✅ |
+| 70 | `--stereo-bitrate 192k` | Config shows 192k in effective config | ✅ |
+| 71 | `--audio-lossless-passthrough` | AUDIO_LOSSLESS_PASSTHROUGH = 1 in config | ✅ |
+| 72 | `--no-audio-lossless-passthrough` | AUDIO_LOSSLESS_PASSTHROUGH = 0 in config | ✅ |
 
-### 1.11 Profile End-to-End Encodes (suite: `e2e`)
+### 1.9 Subtitle Pipeline (suite: `subs`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
-| 54 | `streaming` full encode | Output exists, correct extension | ✅ |
-| 55 | `animation` full encode | Output exists (MKV) | ✅ |
-| 56 | `universal` full encode | Output exists, codec is H.264 | ✅ |
+| 73 | Multi-sub source → MKV | ≥1 subtitle tracks in output | ✅ |
+| 74 | `--no-subtitles` | 0 subtitle tracks | ✅ |
+| 75 | `--skip-subs` announced | "Subtitle processing disabled" in output | ✅ |
+| 76 | `--sub-lang-pref jpn` | SUB_LANG_PREF = jpn in effective config | ✅ |
+| 77 | `--no-sub-sdh` | SUB_INCLUDE_SDH = 0 in effective config | ✅ |
+| 78 | `--sub-export-external` | Output produced; SRT sidecar(s) created | ✅ |
+| 79 | `--no-ocr` | SUB_ENABLE_OCR = 0 in effective config | ✅ |
+| 80 | `--ocr-lang jpn` | SUB_OCR_LANG = jpn in effective config | ✅ |
+
+### 1.10 Output Features (suite: `output`)
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 81 | `--keep-chapters` | Chapters present in output | ✅ |
+| 82 | `--no-keep-chapters` | Chapters stripped | ✅ |
+| 83 | `--checksum` | `.sha256` sidecar created | ✅ |
+| 84 | `--report-json` | `.report.json` sidecar created, valid JSON, contains tool/version and source/input keys | ✅ |
+| 85 | `--skip-if-ideal` with compliant source | Recognized as compliant or produced output | ✅ |
+| 86 | `--keep-temp-always` (`-K`) | Workdir preserved on successful encode | ✅ |
+| 87 | `--keep-temp` (`-k`) | KEEP_TEMP registered in effective config | ✅ |
+
+### 1.11 Container Formats (suite: `containers`)
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 88 | `--output-ext mov` | Output produced, container is MOV/MP4 family | ✅ |
+| 89 | `--output-ext m4v` | Output produced, container is MP4 family | ✅ |
+
+### 1.12 Metadata & Miscellaneous Flags (suite: `metadata`)
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 90 | `--strip-metadata` real encode | Title and comment removed from output | ✅ |
+| 91 | Metadata preservation (no flag) | Title preserved in output | ✅ |
+| 92 | `--ffmpeg-loglevel warning` | Accepted without error | ✅ |
+| 93 | `--no-hide-banner` | Accepted without error | ✅ |
+
+### 1.13 Edge Cases & Security (suite: `edge`)
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 94 | Empty source file | Rejected with error | ✅ |
+| 95 | Filename with spaces | Handled correctly | ✅ |
+| 96 | `--output-ext "mp4;"` | Rejected (injection prevention) | ✅ |
+| 97 | `--ocr-tool "sub2srt;rm -rf /"` | Rejected (injection prevention) | ✅ |
+| 98 | `--skip-video` | Behavior validated (can't produce output) | ✅ |
+| 99 | Non-readable source file | Rejected with "not readable" error | ✅ |
+| 100 | Non-writable output directory | Rejected with "not writable" error | ✅ |
+
+### 1.14 Profile End-to-End Encodes (suite: `e2e`)
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 101 | `streaming` full encode | Output exists, correct extension (.mp4) | ✅ |
+| 102 | `animation` full encode | Output exists (MKV) | ✅ |
+| 103 | `universal` full encode | Output exists, codec is H.264 | ✅ |
+| 104 | `dv-archival` full encode | Output exists (.mkv), HEVC preserved, audio present | ✅ |
+| 105 | `hdr10-hq` full encode | Output exists (.mkv), HEVC codec, 10-bit pixel format | ✅ |
+| 106 | `atv-directplay-hq` full encode | Output exists (.mp4), HEVC codec, audio present | ✅ |
 
 ---
 
@@ -360,27 +426,32 @@ jobs:
 
 | Area | Automated | Manual Required | Notes |
 |------|-----------|-----------------|-------|
-| CLI parsing | ✅ Full | — | |
-| Config precedence | ✅ Partial | Layered configs (M33–M35) | Automated tests cover single-layer |
+| CLI parsing | ✅ Full | — | Includes --no-overwrite |
+| Config precedence | ✅ Partial | Layered configs (M33–M35) | Automated tests cover single-layer + project-level config file |
 | Profile defaults | ✅ Full | — | All 6 profiles validated |
-| Conflict warnings | ✅ Full | — | |
-| Dry-run mode | ✅ Full | — | |
-| Video encode (SDR) | ✅ Full | — | |
+| Conflict warnings | ✅ Full | — | 23 conflict combinations tested across all profiles + cross-flag |
+| Dry-run mode | ✅ Full | — | Includes HDR source dry-run |
+| Video encode (SDR) | ✅ Full | — | Includes x265-params, threads, video-copy-if-compliant |
 | Video encode (HDR) | ⚠️ Tagged only | Real HDR quality (M8–M15) | Synthetic clips have HDR tags but no real HDR content |
+| Container formats | ✅ Full | — | MOV and M4V validated |
+| Metadata stripping | ✅ Full | — | Strip and preserve verified with ffprobe |
 | Dolby Vision | ❌ None | Full DV pipeline (M1–M7) | Requires real DV source + dovi_tool + MP4Box |
 | Tone-mapping quality | ❌ None | Visual evaluation (M13–M15) | Requires HDR source + human judgment |
-| Audio scoring | ✅ Basic | Complex multi-track (M16–M22) | Automated tests verify track count, not scoring logic |
+| Audio scoring | ✅ Partial | Complex multi-track (M16–M22) | Auto-selection, track override, language pref, force-codec tested; subjective quality not covered |
 | Audio quality | ❌ None | Listening test (M22) | Subjective |
+| Subtitle pipeline | ✅ Partial | PGS OCR, burn-in, styling (M23–M29) | Config flags, external export, and track counts verified; OCR and visual burn-in require real media |
 | Subtitle OCR | ❌ None | PGS → SRT (M23) | Requires pgsrip/tesseract + PGS source |
 | Subtitle burn-in | ❌ None | Visual verification (M25) | Requires forced-sub source + eyes |
 | ASS/SSA styling | ❌ None | Visual verification (M24) | Requires styled ASS source + eyes |
-| Skip-if-ideal | ⚠️ Partial | Full roundtrip (M30–M32) | Hard to generate truly "ideal" synthetic source |
+| Skip-if-ideal | ⚠️ Partial | Full roundtrip (M30–M32) | Basic compliant-source test exists; hard to generate truly "ideal" synthetic source |
+| Output features | ✅ Full | — | Chapters, checksum, JSON report, keep-temp all tested |
+| Edge cases & security | ✅ Full | — | Includes permissions tests (non-readable, non-writable) |
+| E2E profiles | ✅ Full | — | All 6 profiles validated with real encodes |
 | Error recovery | ❌ None | SIGINT, disk full (M36–M41) | Requires manual intervention |
 | Cross-platform | ❌ None | macOS + Linux (M42–M45) | Requires both platforms |
 | Playback verification | ❌ None | Device testing (M46–M51) | Requires target hardware |
 
 **Priority for expanding automation:**
-1. Skip-if-ideal roundtrip (generate ideal file, verify skip)
-2. Audio scoring validation (multi-track selection correctness)  
-3. Subtitle burn-in (check for video filter applied in dry-run ffmpeg command)
-4. External SRT export (verify sidecar files created)
+1. Audio scoring validation (verify scoring algorithm selects correct track with complex multi-track sources)
+2. Subtitle burn-in detection (check for video filter applied in dry-run ffmpeg command)
+3. Skip-if-ideal full roundtrip (generate ideal file matching a profile, verify skip behavior)
