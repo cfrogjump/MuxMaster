@@ -14,7 +14,7 @@ PGS\(->SRT OCR.
 .PP
 Configuration layers (lowest to highest precedence):
 .PP
-Defaults → /etc/.muxmrc → ~/.muxmrc → ./.muxmrc → \-\-profile → CLI flags
+Defaults \(-> /etc/.muxmrc \(-> ~/.muxmrc \(-> ./.muxmrc \(-> \-\-profile \(-> CLI flags
 .SH FORMAT PROFILES
 Profiles are named presets that configure muxm for a specific use case in a
 single flag. Every setting a profile changes can be individually overridden
@@ -52,7 +52,7 @@ strip chapters/metadata. MP4.
 .SH COMMON OPTIONS
 .TP
 .BR \-h ", " \-\-help
-Show usage and available options.
+Show condensed usage and available profiles.
 .TP
 .BR \-V ", " \-\-version
 Show version.
@@ -65,6 +65,13 @@ Show the resolved configuration after all sources merge, then exit.
 .TP
 .BR \-\-install\-dependencies
 Check and install required/optional tools via Homebrew and pipx.
+.TP
+.BR \-\-install\-man
+Install this manual page to the system man directory. Uses sudo if the
+target directory is not writable. Detects Homebrew prefix automatically.
+.TP
+.BR \-\-uninstall\-man
+Remove the installed manual page.
 .TP
 .BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
 Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
@@ -88,9 +95,7 @@ to overwrite.
 .TP
 .BR \-\-force\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
 Same as \fB\-\-create\-config\fR but overwrites an existing file.
-.TP
-.BR \-\-output\-ext " " \fIEXT\fR
-Output container: mp4|m4v|mov|mkv. Default: mp4.
+.SH VIDEO OPTIONS
 .TP
 .BR \-\-crf " " \fIN\fR
 Video quality CRF (lower = higher quality). Typical: 16\(en22.
@@ -113,6 +118,19 @@ Enable/disable HDR/HLG to SDR tone\-mapping.
 .BR \-\-video\-copy\-if\-compliant
 Copy video stream if source already matches target profile.
 .TP
+.BR \-\-no\-dv
+Disable Dolby Vision extraction/injection.
+.TP
+.BR \-\-no\-allow\-dv\-fallback
+If DV handling fails, hard\-fail instead of falling back to non\-DV.
+.TP
+.BR \-\-no\-conservative\-vbv
+Disable VBV guardrails.
+.TP
+.BR \-\-threads " " \fIN\fR
+ffmpeg threads.
+.SH AUDIO OPTIONS
+.TP
 .BR \-\-audio\-track " " \fIN\fR
 Select specific audio stream index (0\-based).
 .TP
@@ -128,6 +146,13 @@ Allow/disallow lossless codecs (TrueHD, DTS\-HD MA, FLAC) to copy through.
 .BR \-\-stereo\-fallback " , " \-\-no\-stereo\-fallback
 Enable/disable automatic AAC stereo track when primary >2ch.
 .TP
+.BR \-\-stereo\-bitrate " " \fIRATE\fR
+Stereo track bitrate (e.g., 192k).
+.SH SUBTITLE OPTIONS
+.TP
+.BR \-\-no\-subtitles
+Disable all subtitle processing.
+.TP
 .BR \-\-sub\-lang\-pref " " \fILIST\fR
 Preferred subtitle languages (comma\-separated).
 .TP
@@ -137,14 +162,27 @@ Burn/don't burn forced subtitles into the video stream.
 .BR \-\-sub\-export\-external " , " \-\-no\-sub\-export\-external
 Export/embed subtitles as external .srt files.
 .TP
+.BR \-\-no\-sub\-sdh
+Exclude SDH/HI subtitle tracks.
+.TP
 .BR \-\-no\-ocr
 Disable PGS\(->SRT OCR.
 .TP
-.BR \-\-strip\-metadata " , " \-\-no\-strip\-metadata
-Strip/keep non\-essential metadata.
+.BR \-\-ocr\-tool " " \fITOOL\fR
+OCR backend: sub2srt or pgsrip.
+.TP
+.BR \-\-ocr\-lang " " \fILANG\fR
+OCR language (default: eng).
+.SH OUTPUT OPTIONS
+.TP
+.BR \-\-output\-ext " " \fIEXT\fR
+Output container: mp4|m4v|mov|mkv. Default: mp4.
 .TP
 .BR \-\-keep\-chapters " , " \-\-no\-keep\-chapters
 Keep/strip chapter markers.
+.TP
+.BR \-\-strip\-metadata " , " \-\-no\-strip\-metadata
+Strip/keep non\-essential metadata.
 .TP
 .BR \-\-skip\-if\-ideal " , " \-\-no\-skip\-if\-ideal
 Skip processing if source already matches profile requirements.
@@ -155,28 +193,65 @@ Generate/suppress JSON report alongside output.
 .BR \-\-checksum
 Write SHA\-256 checksum for final output.
 .TP
+.BR \-K ", " \-\-keep\-temp\-always
+Keep temporary workdir even on success.
+.TP
+.BR \-k ", " \-\-keep\-temp
+Keep temporary workdir on failure.
+.SH QUICK TEST OPTIONS
+.TP
 .BR \-\-skip\-video " , " \-\-skip\-audio " , " \-\-skip\-subs
 Disable respective pipelines (useful for quick tests).
-.SH FULL OPTIONS
-See \fBmuxm \-\-help\fR for the comprehensive list, defaults, and notes.
 .SH EXAMPLES
-.nf
-muxm Movie.mkv out.mp4
-muxm \-\-profile atv\-directplay\-hq Movie.mkv
-muxm \-\-profile streaming Movie.mkv
-muxm \-\-profile animation Movie.mkv
-muxm \-\-profile universal Movie.mkv
-muxm \-\-profile dv\-archival Movie.mkv
-muxm \-\-profile hdr10\-hq \-\-crf 20 Movie.mkv
-muxm \-\-crf 20 \-p slow Movie.mkv out.mp4
-muxm \-\-profile atv\-directplay\-hq \-\-print\-effective\-config
-muxm \-\-dry\-run \-\-profile streaming Movie.mkv
-muxm \-\-create\-config user atv\-directplay\-hq
-muxm \-\-create\-config project streaming
-muxm \-\-create\-config user
-sudo muxm \-\-create\-config system dv\-archival
-muxm \-\-force\-create\-config user animation
-.fi
+.TP
+.B muxm Movie.mkv
+Encode with defaults (HEVC, CRF 20, MP4). Output name is derived from input.
+.TP
+.B muxm \-\-profile atv\-directplay\-hq Movie.mkv
+Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
+AAC stereo fallback, and burned forced subtitles.
+.TP
+.B muxm \-\-profile streaming \-\-audio\-lang\-pref spa,eng Movie.mkv
+Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.
+.TP
+.B muxm \-\-profile dv\-archival Movie.mkv
+Archival remux: copy video/audio without re\-encoding, preserve Dolby Vision
+and lossless audio. Skips the file if it already matches.
+.TP
+.B muxm \-\-profile animation \-\-crf 14 Anime.mkv
+Anime encode with animation\-tuned x265, overriding the profile's CRF 16
+down to 14 for higher quality.
+.TP
+.B muxm \-\-profile universal Movie.mkv
+Maximum compatibility: tone\-map HDR to SDR, H.264, AAC stereo, burned
+forced subs. Plays on virtually any device.
+.TP
+.B muxm \-\-crf 18 \-p slow \-\-no\-subtitles Movie.mkv out.mp4
+Custom encode without any profile: CRF 18, slow preset, strip all
+subtitles, explicit output filename.
+.TP
+.B muxm \-\-profile hdr10\-hq \-\-audio\-lossless\-passthrough Movie.mkv
+HDR10 encode keeping lossless audio (TrueHD/DTS\-HD MA) passed through
+instead of transcoding.
+.TP
+.B muxm \-\-dry\-run \-\-profile streaming Movie.mkv
+Preview what muxm would do without actually encoding. Creates placeholder
+files and prints the planned pipeline.
+.TP
+.B muxm \-\-profile atv\-directplay\-hq \-\-print\-effective\-config
+Show every resolved setting after config files and profile merge, then exit.
+Useful for debugging config precedence.
+.TP
+.B muxm \-\-create\-config user streaming
+Generate a ~/.muxmrc pre\-filled with streaming profile defaults. Edit to
+taste; CLI flags still override everything.
+.TP
+.B muxm \-\-install\-dependencies
+Check for and install all required/optional tools (ffmpeg, dovi_tool,
+pgsrip, etc.) via Homebrew and pipx.
+.TP
+.B muxm \-\-install\-man
+Install this manual page so \fBman muxm\fR works.
 .SH FILES
 \fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
 .PP

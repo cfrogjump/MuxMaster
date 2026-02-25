@@ -654,7 +654,379 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ===== Section 5c: Config generator (--create-config) ==========================================
+# ===== Section 5b½: Man page installer (--install-man / --uninstall-man) =======================
+# Embedded man page content, installed to the system man1 directory.
+# Detects Homebrew prefix on macOS (Apple Silicon vs Intel) and falls back to
+# /usr/local/share/man/man1. Uses sudo if the target directory isn't writable.
+
+_man_target_dir(){
+  # Prefer Homebrew man path if brew is installed
+  if command -v brew >/dev/null 2>&1; then
+    echo "$(brew --prefix)/share/man/man1"
+  else
+    echo "/usr/local/share/man/man1"
+  fi
+}
+
+_man_emit(){
+  cat <<'MANPAGE_EOF'
+.TH MUXM 1 "2026-02-23" "MuxMaster v0.12.0" "User Commands"
+.SH NAME
+muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
+.SH SYNOPSIS
+.B muxm
+[\fIoptions\fR] \fIsource\fR [\fItarget\fR]
+.SH DESCRIPTION
+MuxMaster converts and muxes video for various playback targets including
+Apple TV direct play, Plex/Jellyfin streaming, archival storage, animation
+workflows, and universal compatibility. It handles Dolby Vision
+(extract/convert/inject), HDR/HLG/SDR color handling, tone-mapping HDR to
+SDR, audio selection/transcoding, and subtitle selection with optional
+PGS\(->SRT OCR.
+.PP
+Configuration layers (lowest to highest precedence):
+.PP
+Defaults \(-> /etc/.muxmrc \(-> ~/.muxmrc \(-> ./.muxmrc \(-> \-\-profile \(-> CLI flags
+.SH FORMAT PROFILES
+Profiles are named presets that configure muxm for a specific use case in a
+single flag. Every setting a profile changes can be individually overridden
+with CLI flags.
+.TP
+.BR \-\-profile " " NAME
+Apply a named format profile.
+.PP
+Available profiles:
+.TP
+.B dv\-archival
+Preserve DV + HDR10 + lossless audio. Copy video (no re\-encode). MKV.
+Skip if already ideal. JSON report.
+.TP
+.B hdr10\-hq
+Strip DV, keep HDR10. HEVC CRF 17, preset slower. Lossless audio +
+stereo fallback. MKV.
+.TP
+.B atv\-directplay\-hq
+Apple TV Direct Play. MP4, HEVC Main10, DV P8.1, E\-AC\-3 audio,
+AAC stereo fallback, burn forced subs.
+.TP
+.B streaming
+Modern HEVC streaming. CRF 20, preset medium, E\-AC\-3 448k, AAC stereo.
+MP4. Targets Plex/Jellyfin on Shield, Fire TV, Roku, smart TVs, web.
+.TP
+.B animation
+Anime/cartoon optimized. HEVC CRF 16, 10\-bit (even SDR),
+animation\-tuned x265 (low psy\-rd, adjusted deblock, extra b\-frames),
+lossless audio, preserve all subs (ASS/SSA). MKV.
+.TP
+.B universal
+Play anywhere. H.264 SDR (tone\-map HDR), AAC stereo, burn forced subs,
+strip chapters/metadata. MP4.
+.SH COMMON OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show condensed usage and available profiles.
+.TP
+.BR \-V ", " \-\-version
+Show version.
+.TP
+.BR \-\-dry\-run
+Plan steps without encoding/muxing (creates placeholders only).
+.TP
+.BR \-\-print\-effective\-config
+Show the resolved configuration after all sources merge, then exit.
+.TP
+.BR \-\-install\-dependencies
+Check and install required/optional tools via Homebrew and pipx.
+.TP
+.BR \-\-install\-man
+Install this manual page to the system man directory. Uses sudo if the
+target directory is not writable. Detects Homebrew prefix automatically.
+.TP
+.BR \-\-uninstall\-man
+Remove the installed manual page.
+.TP
+.BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
+Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
+and exit. Profile\-specific variables are uncommented and set; all other
+variables are commented with defaults.
+.RS
+.TP
+.B system
+writes to \fI/etc/.muxmrc\fR (may require sudo)
+.TP
+.B user
+writes to \fI~/.muxmrc\fR
+.TP
+.B project
+writes to \fI$PWD/.muxmrc\fR
+.RE
+.IP
+\fIPROFILE\fR defaults to \fBatv\-directplay\-hq\fR if omitted.
+Refuses to overwrite an existing file; use \fB\-\-force\-create\-config\fR
+to overwrite.
+.TP
+.BR \-\-force\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
+Same as \fB\-\-create\-config\fR but overwrites an existing file.
+.SH VIDEO OPTIONS
+.TP
+.BR \-\-crf " " \fIN\fR
+Video quality CRF (lower = higher quality). Typical: 16\(en22.
+.TP
+.BR \-p ", " \-\-preset " " \fINAME\fR
+Encoder preset: ultrafast..placebo. Default: slower.
+.TP
+.BR \-\-video\-codec " " libx265|libx264
+Video encoder. Default: libx265.
+.TP
+.BR \-l ", " \-\-level " " \fIN\fR
+x265 level\-idc (e.g., 5.1).
+.TP
+.BR \-\-x265\-params " " \fISTR\fR
+Advanced x265 parameter string.
+.TP
+.BR \-\-tonemap " , " \-\-no\-tonemap
+Enable/disable HDR/HLG to SDR tone\-mapping.
+.TP
+.BR \-\-video\-copy\-if\-compliant
+Copy video stream if source already matches target profile.
+.TP
+.BR \-\-no\-dv
+Disable Dolby Vision extraction/injection.
+.TP
+.BR \-\-no\-allow\-dv\-fallback
+If DV handling fails, hard\-fail instead of falling back to non\-DV.
+.TP
+.BR \-\-no\-conservative\-vbv
+Disable VBV guardrails.
+.TP
+.BR \-\-threads " " \fIN\fR
+ffmpeg threads.
+.SH AUDIO OPTIONS
+.TP
+.BR \-\-audio\-track " " \fIN\fR
+Select specific audio stream index (0\-based).
+.TP
+.BR \-\-audio\-lang\-pref " " \fILIST\fR
+Preferred audio languages (comma\-separated, e.g., eng,spa).
+.TP
+.BR \-\-audio\-force\-codec " " \fICODEC\fR
+Force all audio to a specific codec (e.g., aac).
+.TP
+.BR \-\-audio\-lossless\-passthrough " , " \-\-no\-audio\-lossless\-passthrough
+Allow/disallow lossless codecs (TrueHD, DTS\-HD MA, FLAC) to copy through.
+.TP
+.BR \-\-stereo\-fallback " , " \-\-no\-stereo\-fallback
+Enable/disable automatic AAC stereo track when primary >2ch.
+.TP
+.BR \-\-stereo\-bitrate " " \fIRATE\fR
+Stereo track bitrate (e.g., 192k).
+.SH SUBTITLE OPTIONS
+.TP
+.BR \-\-no\-subtitles
+Disable all subtitle processing.
+.TP
+.BR \-\-sub\-lang\-pref " " \fILIST\fR
+Preferred subtitle languages (comma\-separated).
+.TP
+.BR \-\-sub\-burn\-forced " , " \-\-no\-sub\-burn\-forced
+Burn/don't burn forced subtitles into the video stream.
+.TP
+.BR \-\-sub\-export\-external " , " \-\-no\-sub\-export\-external
+Export/embed subtitles as external .srt files.
+.TP
+.BR \-\-no\-sub\-sdh
+Exclude SDH/HI subtitle tracks.
+.TP
+.BR \-\-no\-ocr
+Disable PGS\(->SRT OCR.
+.TP
+.BR \-\-ocr\-tool " " \fITOOL\fR
+OCR backend: sub2srt or pgsrip.
+.TP
+.BR \-\-ocr\-lang " " \fILANG\fR
+OCR language (default: eng).
+.SH OUTPUT OPTIONS
+.TP
+.BR \-\-output\-ext " " \fIEXT\fR
+Output container: mp4|m4v|mov|mkv. Default: mp4.
+.TP
+.BR \-\-keep\-chapters " , " \-\-no\-keep\-chapters
+Keep/strip chapter markers.
+.TP
+.BR \-\-strip\-metadata " , " \-\-no\-strip\-metadata
+Strip/keep non\-essential metadata.
+.TP
+.BR \-\-skip\-if\-ideal " , " \-\-no\-skip\-if\-ideal
+Skip processing if source already matches profile requirements.
+.TP
+.BR \-\-report\-json " , " \-\-no\-report\-json
+Generate/suppress JSON report alongside output.
+.TP
+.BR \-\-checksum
+Write SHA\-256 checksum for final output.
+.TP
+.BR \-K ", " \-\-keep\-temp\-always
+Keep temporary workdir even on success.
+.TP
+.BR \-k ", " \-\-keep\-temp
+Keep temporary workdir on failure.
+.SH QUICK TEST OPTIONS
+.TP
+.BR \-\-skip\-video " , " \-\-skip\-audio " , " \-\-skip\-subs
+Disable respective pipelines (useful for quick tests).
+.SH EXAMPLES
+.TP
+.B muxm Movie.mkv
+Encode with defaults (HEVC, CRF 20, MP4). Output name is derived from input.
+.TP
+.B muxm \-\-profile atv\-directplay\-hq Movie.mkv
+Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
+AAC stereo fallback, and burned forced subtitles.
+.TP
+.B muxm \-\-profile streaming \-\-audio\-lang\-pref spa,eng Movie.mkv
+Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.
+.TP
+.B muxm \-\-profile dv\-archival Movie.mkv
+Archival remux: copy video/audio without re\-encoding, preserve Dolby Vision
+and lossless audio. Skips the file if it already matches.
+.TP
+.B muxm \-\-profile animation \-\-crf 14 Anime.mkv
+Anime encode with animation\-tuned x265, overriding the profile's CRF 16
+down to 14 for higher quality.
+.TP
+.B muxm \-\-profile universal Movie.mkv
+Maximum compatibility: tone\-map HDR to SDR, H.264, AAC stereo, burned
+forced subs. Plays on virtually any device.
+.TP
+.B muxm \-\-crf 18 \-p slow \-\-no\-subtitles Movie.mkv out.mp4
+Custom encode without any profile: CRF 18, slow preset, strip all
+subtitles, explicit output filename.
+.TP
+.B muxm \-\-profile hdr10\-hq \-\-audio\-lossless\-passthrough Movie.mkv
+HDR10 encode keeping lossless audio (TrueHD/DTS\-HD MA) passed through
+instead of transcoding.
+.TP
+.B muxm \-\-dry\-run \-\-profile streaming Movie.mkv
+Preview what muxm would do without actually encoding. Creates placeholder
+files and prints the planned pipeline.
+.TP
+.B muxm \-\-profile atv\-directplay\-hq \-\-print\-effective\-config
+Show every resolved setting after config files and profile merge, then exit.
+Useful for debugging config precedence.
+.TP
+.B muxm \-\-create\-config user streaming
+Generate a ~/.muxmrc pre\-filled with streaming profile defaults. Edit to
+taste; CLI flags still override everything.
+.TP
+.B muxm \-\-install\-dependencies
+Check for and install all required/optional tools (ffmpeg, dovi_tool,
+pgsrip, etc.) via Homebrew and pipx.
+.TP
+.B muxm \-\-install\-man
+Install this manual page so \fBman muxm\fR works.
+.SH FILES
+\fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
+.PP
+Configuration files use shell variable syntax. CLI flags always override
+config files. Profiles override config files but are overridden by CLI flags.
+.SH EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error.
+.TP
+.B 11
+Invalid arguments or unknown profile.
+.TP
+.B 42
+Pipeline error (video processing failure).
+.TP
+.B 43
+Audio transcode or copy failure.
+.SH AUTHOR
+Jamey Wicklund (theBluWiz).
+MANPAGE_EOF
+}
+
+_install_man(){
+  local mandir
+  mandir="$(_man_target_dir)"
+  local target="${mandir}/${CLI_NAME}.1"
+
+  say "=== ${APP_NAME} v${VERSION} — Manual Page Installer ==="
+  echo ""
+  printf '  Target: %s\n' "$target"
+
+  # Create directory if needed
+  if [[ ! -d "$mandir" ]]; then
+    printf '  📁 Creating %s ...\n' "$mandir"
+    if [[ -w "$(dirname "$mandir")" ]]; then
+      mkdir -p "$mandir"
+    else
+      sudo mkdir -p "$mandir"
+    fi
+  fi
+
+  # Write the man page
+  if [[ -w "$mandir" ]]; then
+    _man_emit > "$target"
+  else
+    printf '  🔐 Requires elevated permissions.\n'
+    _man_emit | sudo tee "$target" > /dev/null
+  fi
+
+  printf '  ✅ Installed %s\n' "$target"
+  echo ""
+
+  # Update man database if mandb/makewhatis available
+  if command -v mandb >/dev/null 2>&1; then
+    printf '  🔄 Updating man database ...\n'
+    if [[ -w "$mandir" ]]; then
+      mandb -q 2>/dev/null || true
+    else
+      sudo mandb -q 2>/dev/null || true
+    fi
+  fi
+
+  printf '\n  View with: man %s\n' "$CLI_NAME"
+  exit 0
+}
+
+_uninstall_man(){
+  local mandir
+  mandir="$(_man_target_dir)"
+  local target="${mandir}/${CLI_NAME}.1"
+
+  say "=== ${APP_NAME} v${VERSION} — Manual Page Uninstaller ==="
+  echo ""
+
+  if [[ ! -f "$target" ]]; then
+    printf '  ⚠️  Man page not found at %s — nothing to remove.\n' "$target"
+    exit 0
+  fi
+
+  printf '  Target: %s\n' "$target"
+  if [[ -w "$mandir" ]]; then
+    rm -f "$target"
+  else
+    printf '  🔐 Requires elevated permissions.\n'
+    sudo rm -f "$target"
+  fi
+
+  printf '  ✅ Removed %s\n' "$target"
+  exit 0
+}
+
+# Pre-scan for --install-man / --uninstall-man
+for _arg in "$@"; do
+  case "$_arg" in
+    --install-man)   _install_man ;;
+    --uninstall-man) _uninstall_man ;;
+  esac
+done
+unset _arg
 # Invoked via --create-config <scope> [profile]. Generates a .muxmrc file at the
 # appropriate location with the full template and profile-specific variables
 # uncommented. Halts all other operations.
@@ -1393,92 +1765,31 @@ ${APP_NAME} v${VERSION} — ${CLI_NAME}
 
 $USAGE_SHORT
 
-Profile (format presets):
-  --profile NAME              Apply a named format profile. Overrides config-file
-                              defaults; CLI flags still override the profile.
+Profiles (--profile NAME):
+  dv-archival          Preserve DV + HDR10 + lossless audio. MKV.
+  hdr10-hq             Strip DV, keep HDR10. HEVC CRF 17. MKV.
+  atv-directplay-hq    Apple TV Direct Play. MP4, DV P8.1, E-AC-3.
+  streaming            HEVC streaming for Plex/Jellyfin. MP4.
+  animation            Anime/cartoon optimized. 10-bit, lossless audio. MKV.
+  universal            H.264 SDR, AAC stereo, play anywhere. MP4.
 
-  Available profiles:
-    dv-archival               Preserve DV + HDR10 + lossless audio. Copy video
-                              (no re-encode). Skip if already ideal. JSON report.
-    hdr10-hq                  Strip DV, keep HDR10. HEVC CRF 17. Lossless audio
-                              + stereo fallback. MKV container.
-    atv-directplay-hq         Apple TV Direct Play. MP4, HEVC Main10, DV P8.1,
-                              E-AC-3 audio, AAC stereo fallback, burn forced subs.
-    streaming                 Modern HEVC streaming. CRF 20, E-AC-3 448k, AAC
-                              stereo, soft subs. MP4. Targets Plex/Jellyfin on
-                              Shield, Fire TV, Roku, smart TVs, web.
-    animation                 Anime/cartoon optimized. HEVC CRF 16, 10-bit (even
-                              SDR), animation-tuned x265, lossless audio, preserve
-                              all subs (ASS/SSA). MKV container.
-    universal                 Play anywhere. H.264 SDR (tone-map HDR), AAC stereo,
-                              burn forced subs, strip chapters/metadata. MP4.
-
-  Profiles can also be set in .muxmrc files:
-    PROFILE_NAME="atv-directplay-hq"
-
-Core options:
-  -h, --help                  Show help
+Common options:
+  -h, --help                  Show this help
   -V, --version               Show version
-  --install-dependencies      Check and install all required/optional tools via
-                              Homebrew and pipx. Skips encoding; exits after install.
-  --create-config SCOPE [PROFILE]
-                              Generate a .muxmrc config file and exit.
-                              SCOPE: system (/etc/.muxmrc), user (~/.muxmrc),
-                                     project (\$PWD/.muxmrc)
-                              PROFILE: dv-archival, hdr10-hq, atv-directplay-hq,
-                                       streaming, animation, universal
-                                       (default: atv-directplay-hq)
-                              Refuses to overwrite existing files.
-  --force-create-config SCOPE [PROFILE]
-                              Same as --create-config but overwrites existing files.
-  -K, --keep-temp-always      Keep workdir even on success
-  -k, --keep-temp             Keep workdir on failure (default behavior keeps on failure anyway)
-  --dry-run                   Print actions and create stub artifacts (no real encode)
-  --checksum                  Write sha256 checksum for final output
-  --skip-if-ideal             Skip processing if source already matches profile
-  --report-json               Generate JSON report alongside output
-
-Video:
-  --crf N                     Set CRF (default: ${CRF_VALUE})
+  --profile NAME              Apply a format profile (overrides config defaults)
+  --crf N                     Video quality (default: ${CRF_VALUE})
   -p, --preset NAME           x265 preset (default: ${PRESET_VALUE})
-  --x265-params "..."         Extra/override x265 params
-  -l, --level N               HEVC level (e.g., 4.1, 5.1)
-  --no-conservative-vbv       Disable VBV guardrails
-  --threads N                 ffmpeg threads
-  --no-dv                     Disable Dolby Vision extraction/injection
-  --no-allow-dv-fallback      If DV handling fails, hard fail (default is fallback to non-DV)
-  --video-codec libx265|libx264  Video encoder (default: libx265)
-  --video-copy-if-compliant   Copy video if source already matches target
-  --tonemap                   Tone-map HDR to SDR (used by universal profile)
+  --dry-run                   Plan steps without encoding
+  --print-effective-config    Show resolved config and exit
+  --install-dependencies      Install required tools via Homebrew/pipx
+  --install-man               Install the muxm(1) manual page
+  --uninstall-man             Remove the installed manual page
+  --create-config SCOPE [PROFILE]
+                              Generate .muxmrc (system|user|project)
 
-Audio:
-  --audio-track N             Force select audio track (0-based, relative to audio streams)
-  --audio-lang-pref "eng,..." Language preference order (default: ${AUDIO_LANG_PREF})
-  --stereo-bitrate 192k       Stereo AC3 bitrate (default: ${STEREO_BITRATE})
-  --no-stereo-fallback        Do not add stereo track when primary is multichannel
-  --audio-force-codec CODEC   Force all audio to CODEC (e.g., aac)
-  --audio-lossless-passthrough Allow lossless codecs (TrueHD, DTS-HD MA, FLAC) to copy through
-
-Subtitles:
-  --no-subtitles              Do not include subtitles
-  --no-sub-sdh                Do not include SDH/HI
-  --no-ocr                    Disable OCR (PGS will be dropped)
-  --ocr-tool TOOL             OCR tool (default: ${SUB_OCR_TOOL})
-  --ocr-lang LANG             OCR language (default: ${SUB_OCR_LANG})
-  --sub-burn-forced           Burn forced subtitles into video
-  --sub-export-external       Export subtitles as external .srt files
-
-Output:
-  --output-ext mp4|m4v|mov|mkv  Output container extension (default: ${OUTPUT_EXT})
-  --keep-chapters             Keep chapter markers (default: on)
-  --no-keep-chapters          Strip chapter markers
-  --strip-metadata            Strip non-essential metadata
-
-Quick tests:
-  --skip-video                Skip video pipeline
-  --skip-audio                Skip audio pipeline
-  --skip-subs                 Skip subtitle pipeline
-
+See muxm(1) for the full option reference, profiles, and examples.
+  Install:  muxm --install-man
+  Then:     man muxm
 EOF
 }
 
