@@ -13,7 +13,7 @@
 #   - dovi_tool (optional for Dolby Vision RPU extraction/injection; script will fallback)
 #
 # Optional (for PGS subtitle OCR):
-#   - pgsrip (or sub2srt; configurable via --ocr-tool)
+#   - sub2srt (or another OCR tool you set via --ocr-tool)
 #
 # Notes:
 #   - MP4 cannot carry PGS bitmap subtitles. If OCR can't produce SRT, subtitles are omitted.
@@ -122,7 +122,7 @@ declare -i SUB_INCLUDE_SDH=1
 declare -i SUB_MAX_TRACKS=3
 
 declare -i SUB_ENABLE_OCR=1
-SUB_OCR_TOOL="pgsrip"
+SUB_OCR_TOOL="sub2srt"
 SUB_OCR_LANG="eng"
 
 # ---- Muxing / output
@@ -503,15 +503,91 @@ _muxm_try_source "./.muxmrc"
 # DV pipeline:  dovi_tool, mp4box (gpac)
 # Subtitles:    tesseract, pgsrip (Python, via pipx)
 
+# Check-only mode for non-Homebrew systems (Linux distros without brew).
+# Reports which tools are present/missing and prints a manual-install reference.
+# Does NOT attempt to install anything — the user's package manager is unknown.
+_dep_check_only(){
+  say "=== ${APP_NAME} v${VERSION} — Dependency Check (no package manager detected) ==="
+  echo ""
+  say "Homebrew not found — skipping automatic installation."
+  say "Checking which tools are already available:"
+  echo ""
+
+  local -i total=0 found=0 missing=0
+
+  _check_tool(){
+    local _tool="$1"
+    total=$(( total + 1 ))
+    printf "  %-14s" "$_tool"
+    if command -v "$_tool" >/dev/null 2>&1; then
+      printf "✅ found (%s)\n" "$(command -v "$_tool")"
+      found=$(( found + 1 ))
+    else
+      printf "❌ not found\n"
+      missing=$(( missing + 1 ))
+    fi
+  }
+
+  say "Core (required):"
+  _check_tool ffmpeg
+  _check_tool ffprobe
+  _check_tool jq
+  _check_tool bc
+  echo ""
+
+  say "Dolby Vision pipeline (recommended):"
+  _check_tool dovi_tool
+  # mp4box: check both names
+  total=$(( total + 1 ))
+  printf "  %-14s" "mp4box"
+  if command -v MP4Box >/dev/null 2>&1 || command -v mp4box >/dev/null 2>&1; then
+    local _mp4box_path
+    _mp4box_path="$(command -v MP4Box 2>/dev/null || command -v mp4box 2>/dev/null)"
+    printf "✅ found (%s)\n" "$_mp4box_path"
+    found=$(( found + 1 ))
+  else
+    printf "❌ not found\n"
+    missing=$(( missing + 1 ))
+  fi
+  echo ""
+
+  say "Subtitle OCR (recommended):"
+  _check_tool tesseract
+  _check_tool pgsrip
+  echo ""
+
+  say "Summary: $total checked, $found found, $missing missing"
+  echo ""
+
+  if (( missing > 0 )); then
+    say "Install missing tools with your system package manager:"
+    echo ""
+    printf "  %-14s %-24s %-24s %s\n" "Tool" "apt (Debian/Ubuntu)" "dnf (Fedora/RHEL)" "brew (macOS)"
+    printf "  %-14s %-24s %-24s %s\n" "──────────" "────────────────────" "────────────────────" "────────────────"
+    printf "  %-14s %-24s %-24s %s\n" "ffmpeg"     "apt install ffmpeg"     "dnf install ffmpeg"     "brew install ffmpeg"
+    printf "  %-14s %-24s %-24s %s\n" "jq"         "apt install jq"         "dnf install jq"         "brew install jq"
+    printf "  %-14s %-24s %-24s %s\n" "bc"         "apt install bc"         "dnf install bc"         "brew install bc"
+    printf "  %-14s %-24s %-24s %s\n" "dovi_tool"  "(GitHub release)"       "(GitHub release)"       "brew install dovi_tool"
+    printf "  %-14s %-24s %-24s %s\n" "mp4box"     "apt install gpac"       "dnf install gpac"       "brew install gpac"
+    printf "  %-14s %-24s %-24s %s\n" "tesseract"  "apt install tesseract-ocr" "dnf install tesseract" "brew install tesseract"
+    printf "  %-14s %-24s %-24s %s\n" "pgsrip"     "pipx install pgsrip"    "pipx install pgsrip"    "pipx install pgsrip"
+    echo ""
+    say "After installing, re-run: ${CLI_NAME} --install-dependencies"
+    exit 1
+  fi
+
+  say "✅ All tools found."
+  exit 0
+}
+
 _dep_install_dependencies(){
   say "=== ${APP_NAME} v${VERSION} — Dependency Installer ==="
   echo ""
 
-  # ---- Preflight: need Homebrew and a working shell
+  # ---- Preflight: need Homebrew for auto-install; fall back to check-only mode
   if ! command -v brew >/dev/null 2>&1; then
-    printf "❌ Homebrew is not installed. Install it first:\n" >&2
-    printf "   /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"\n" >&2
-    exit 10
+    _dep_check_only
+    # _dep_check_only always exits; this line is unreachable
   fi
 
   local -i total=0 installed=0 skipped=0 failed=0
@@ -659,15 +735,16 @@ _dep_install_dependencies(){
 
   # .muxmrc OCR tool configuration check
   printf "  %-14s" "OCR config"
-  if command -v "${SUB_OCR_TOOL:-pgsrip}" >/dev/null 2>&1; then
-    printf "✅ SUB_OCR_TOOL=%s\n" "${SUB_OCR_TOOL:-pgsrip}"
-  elif [[ "${SUB_OCR_TOOL:-pgsrip}" == "pgsrip" ]] && command -v sub2srt >/dev/null 2>&1; then
-    printf "⚠️  pgsrip is not installed but sub2srt is available.\n"
-    printf "              Set in ~/.muxmrc:  SUB_OCR_TOOL=\"sub2srt\"\n"
-    printf "              Or use per-run:    --ocr-tool sub2srt\n"
+  if command -v pgsrip >/dev/null 2>&1; then
+    if [[ "${SUB_OCR_TOOL:-sub2srt}" == "sub2srt" ]]; then
+      printf "⚠️  pgsrip is installed but SUB_OCR_TOOL is '%s'.\n" "${SUB_OCR_TOOL:-sub2srt}"
+      printf "              Set in ~/.muxmrc:  SUB_OCR_TOOL=\"pgsrip\"\n"
+      printf "              Or use per-run:    --ocr-tool pgsrip\n"
+    else
+      printf "✅ SUB_OCR_TOOL=%s\n" "$SUB_OCR_TOOL"
+    fi
   else
-    printf "⚠️  SUB_OCR_TOOL=%s is not installed.\n" "${SUB_OCR_TOOL:-pgsrip}"
-    printf "              Run: muxm --install-dependencies\n"
+    printf "ℹ️  SUB_OCR_TOOL=%s (pgsrip not installed)\n" "${SUB_OCR_TOOL:-sub2srt}"
   fi
   echo ""
 
@@ -1459,6 +1536,10 @@ _create_config_emit() {
   #
   # Shared base: variables set by ALL profiles (DV, container, video, audio, subs, output).
   # Per-profile deltas add profile-specific variables on top.
+  # Space-padded set of "active" variable names for this profile.
+  # _V checks membership via: [[ "$_active" == *" VARNAME "* ]]
+  # Leading/trailing spaces ensure whole-word matching (prevents "FOO"
+  # from matching "FOO_BAR"). Each name must be space-delimited.
   local _active=" "
   local _base="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
   _base+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT "
@@ -1504,7 +1585,9 @@ _create_config_emit() {
   PROFILE_NAME="$profile"
   "apply_profile_${profile//-/_}"
 
-  # Helper: emit a variable — uncommented if active, commented otherwise.
+  # Helper: emit a variable — uncommented if it's in the _active set, commented otherwise.
+  # Uses indirect expansion (${!var}) to read the variable's current value.
+  # Membership test: _active is space-padded, so *" VARNAME "* matches whole names only.
   # Usage: _V VARNAME [quoted]
   # "quoted" wraps the value in single quotes (for strings with special chars).
   _V() {
@@ -1529,7 +1612,7 @@ _create_config_emit() {
 # ================================================================
 #  MuxMaster .muxmrc — configuration file
 #  Generated by: muxm --create-config
-#  Precedence: Script defaults → /etc/.muxmrc → ~/.muxmrc → ./.muxmrc → --profile → CLI flags
+#  Precedence: Script defaults → /etc/.muxmrc → ~/.muxmrc → ./.muxmrc → CLI flags
 #  Tip: Uncomment a line to override. Keep values shell-safe.
 # ================================================================
 HEADER
@@ -1738,7 +1821,7 @@ HEADER
     printf 'SUB_OCR_TOOL=%s\n' "$_detected_ocr_tool"
   else
     printf '# No OCR tool detected. Install pgsrip or sub2srt and regenerate, or uncomment manually.\n'
-    printf '#SUB_OCR_TOOL=pgsrip\n'
+    printf '#SUB_OCR_TOOL=sub2srt\n'
   fi
   echo ""
   echo "# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)"
@@ -3623,8 +3706,8 @@ run_video_pipeline() {
     log "ffmpeg encode command: ffmpeg ${ff_cmd[*]}"
     ffmpeg "${ff_cmd[@]}" -progress "$progress_pipe" 2>"$WORKDIR/encode.err" &
     local enc_pid=$!
-    ffmpeg_progress_bar "$enc_pid" "$progress_pipe" "$total_secs" "Encoding video"
-    if ! wait "$enc_pid" 2>/dev/null; then
+    # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
+    if ! ffmpeg_progress_bar "$enc_pid" "$progress_pipe" "$total_secs" "Encoding video"; then
       rm -f "$progress_pipe" 2>/dev/null || true
       die 40 "Base video encode failed. See: $WORKDIR/encode.err"
     fi
@@ -4359,8 +4442,8 @@ run_audio_pipeline(){
 
     ffmpeg "${transcode_args[@]}" -progress "$a_progress_pipe" 2>"$WORKDIR/audio_primary.err" &
     local atx_pid=$!
-    ffmpeg_progress_bar "$atx_pid" "$a_progress_pipe" "$total_secs" "Transcoding audio"
-    if ! wait "$atx_pid" 2>/dev/null; then
+    # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
+    if ! ffmpeg_progress_bar "$atx_pid" "$a_progress_pipe" "$total_secs" "Transcoding audio"; then
       rm -f "$a_progress_pipe" 2>/dev/null || true
       die 43 "Audio transcode to $tgt_codec failed. See: $WORKDIR/audio_primary.err"
     fi
@@ -4386,8 +4469,8 @@ run_audio_pipeline(){
       -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" \
       -progress "$stereo_progress_pipe" 2>"$WORKDIR/audio_stereo.err" &
     local stereo_pid=$!
-    ffmpeg_progress_bar "$stereo_pid" "$stereo_progress_pipe" "$stereo_total_secs" "Creating stereo fallback"
-    if ! wait "$stereo_pid" 2>/dev/null; then
+    # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
+    if ! ffmpeg_progress_bar "$stereo_pid" "$stereo_progress_pipe" "$stereo_total_secs" "Creating stereo fallback"; then
       warn "Stereo fallback creation failed - continuing without it. See: $WORKDIR/audio_stereo.err"
       AAC_STEREO=""
     else
