@@ -13,7 +13,7 @@
 #   - dovi_tool (optional for Dolby Vision RPU extraction/injection; script will fallback)
 #
 # Optional (for PGS subtitle OCR):
-#   - sub2srt (or another OCR tool you set via --ocr-tool)
+#   - pgsrip (or sub2srt; configurable via --ocr-tool)
 #
 # Notes:
 #   - MP4 cannot carry PGS bitmap subtitles. If OCR can't produce SRT, subtitles are omitted.
@@ -122,7 +122,7 @@ declare -i SUB_INCLUDE_SDH=1
 declare -i SUB_MAX_TRACKS=3
 
 declare -i SUB_ENABLE_OCR=1
-SUB_OCR_TOOL="sub2srt"
+SUB_OCR_TOOL="pgsrip"
 SUB_OCR_LANG="eng"
 
 # ---- Muxing / output
@@ -659,16 +659,15 @@ _dep_install_dependencies(){
 
   # .muxmrc OCR tool configuration check
   printf "  %-14s" "OCR config"
-  if command -v pgsrip >/dev/null 2>&1; then
-    if [[ "${SUB_OCR_TOOL:-sub2srt}" == "sub2srt" ]]; then
-      printf "⚠️  pgsrip is installed but SUB_OCR_TOOL is '%s'.\n" "${SUB_OCR_TOOL:-sub2srt}"
-      printf "              Set in ~/.muxmrc:  SUB_OCR_TOOL=\"pgsrip\"\n"
-      printf "              Or use per-run:    --ocr-tool pgsrip\n"
-    else
-      printf "✅ SUB_OCR_TOOL=%s\n" "$SUB_OCR_TOOL"
-    fi
+  if command -v "${SUB_OCR_TOOL:-pgsrip}" >/dev/null 2>&1; then
+    printf "✅ SUB_OCR_TOOL=%s\n" "${SUB_OCR_TOOL:-pgsrip}"
+  elif [[ "${SUB_OCR_TOOL:-pgsrip}" == "pgsrip" ]] && command -v sub2srt >/dev/null 2>&1; then
+    printf "⚠️  pgsrip is not installed but sub2srt is available.\n"
+    printf "              Set in ~/.muxmrc:  SUB_OCR_TOOL=\"sub2srt\"\n"
+    printf "              Or use per-run:    --ocr-tool sub2srt\n"
   else
-    printf "ℹ️  SUB_OCR_TOOL=%s (pgsrip not installed)\n" "${SUB_OCR_TOOL:-sub2srt}"
+    printf "⚠️  SUB_OCR_TOOL=%s is not installed.\n" "${SUB_OCR_TOOL:-pgsrip}"
+    printf "              Run: muxm --install-dependencies\n"
   fi
   echo ""
 
@@ -1739,7 +1738,7 @@ HEADER
     printf 'SUB_OCR_TOOL=%s\n' "$_detected_ocr_tool"
   else
     printf '# No OCR tool detected. Install pgsrip or sub2srt and regenerate, or uncomment manually.\n'
-    printf '#SUB_OCR_TOOL=sub2srt\n'
+    printf '#SUB_OCR_TOOL=pgsrip\n'
   fi
   echo ""
   echo "# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)"

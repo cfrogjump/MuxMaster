@@ -238,7 +238,7 @@
 # OCR tool for bitmap → text subtitle conversion
 # Supported: "sub2srt", "pgsrip"
 # pgsrip requires: pgsrip (pipx) + tesseract. Install via --install-dependencies.
-#SUB_OCR_TOOL=sub2srt
+#SUB_OCR_TOOL=pgsrip
 
 # OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)
 #SUB_OCR_LANG=eng
