@@ -1,0 +1,115 @@
+# =============================================================================
+#  muxm — Bash/Zsh tab completion
+#  Source this file in your shell config:
+#    echo 'source /path/to/muxm-completion.bash' >> ~/.bashrc   # bash
+#    echo 'source /path/to/muxm-completion.bash' >> ~/.zshrc    # zsh
+#
+#  Or install system-wide:
+#    cp muxm-completion.bash /etc/bash_completion.d/muxm        # Linux
+#    cp muxm-completion.bash /usr/local/etc/bash_completion.d/muxm  # macOS
+# =============================================================================
+
+_muxm_completions() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # ---- Flags that take a specific set of values ----
+    case "$prev" in
+        --profile)
+            COMPREPLY=( $(compgen -W "dv-archival hdr10-hq atv-directplay-hq streaming animation universal" -- "$cur") )
+            return ;;
+        --video-codec)
+            COMPREPLY=( $(compgen -W "libx265 libx264" -- "$cur") )
+            return ;;
+        --output-ext)
+            COMPREPLY=( $(compgen -W "mp4 mkv m4v mov" -- "$cur") )
+            return ;;
+        -p|--preset)
+            COMPREPLY=( $(compgen -W "ultrafast superfast veryfast faster fast medium slow slower veryslow placebo" -- "$cur") )
+            return ;;
+        --ocr-tool)
+            COMPREPLY=( $(compgen -W "pgsrip sub2srt" -- "$cur") )
+            return ;;
+        --ffmpeg-loglevel|--ffprobe-loglevel)
+            COMPREPLY=( $(compgen -W "quiet panic fatal error warning info verbose debug trace" -- "$cur") )
+            return ;;
+        --create-config|--force-create-config)
+            COMPREPLY=( $(compgen -W "system user project" -- "$cur") )
+            return ;;
+
+        # Flags that take a free-form value — offer no completion, fall through to files
+        --crf|--stereo-bitrate|--threads|-l|--level|--x265-params|\
+        --audio-track|--audio-lang-pref|--audio-force-codec|\
+        --sub-lang-pref|--ocr-lang)
+            COMPREPLY=()
+            return ;;
+    esac
+
+    # ---- After --create-config <scope>, offer profile names ----
+    if (( COMP_CWORD >= 3 )); then
+        local pprev="${COMP_WORDS[COMP_CWORD-2]}"
+        if [[ "$pprev" == "--create-config" || "$pprev" == "--force-create-config" ]]; then
+            COMPREPLY=( $(compgen -W "dv-archival hdr10-hq atv-directplay-hq streaming animation universal" -- "$cur") )
+            return
+        fi
+    fi
+
+    # ---- If typing a flag, complete from all known flags ----
+    if [[ "$cur" == -* ]]; then
+        local flags="
+            -h --help -V --version
+            --profile --dry-run --print-effective-config
+            --install-dependencies --install-man --uninstall-man
+            --install-completions --uninstall-completions
+            --create-config --force-create-config
+
+            --crf -p --preset --x265-params -l --level
+            --video-codec --tonemap --no-tonemap
+            --no-conservative-vbv
+            --no-dv --allow-dv-fallback --no-allow-dv-fallback
+            --dv-convert-p81 --no-dv-convert-p81
+            --video-copy-if-compliant --no-video-copy-if-compliant
+
+            --audio-track --audio-lang-pref
+            --stereo-fallback --no-stereo-fallback --stereo-bitrate
+            --audio-force-codec
+            --audio-lossless-passthrough --no-audio-lossless-passthrough
+
+            --sub-burn-forced --no-sub-burn-forced
+            --sub-export-external --no-sub-export-external
+            --sub-lang-pref --no-sub-sdh --no-subtitles
+            --ocr-lang --no-ocr --ocr-tool
+
+            --skip-video --skip-audio --skip-subs
+
+            --output-ext
+            --keep-chapters --no-keep-chapters
+            --strip-metadata --no-strip-metadata
+            --skip-if-ideal --no-skip-if-ideal
+            --report-json --no-report-json
+            --checksum --no-checksum
+            --no-overwrite
+
+            -k --keep-temp -K --keep-temp-always
+            --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
+            --threads
+        "
+        COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+        return
+    fi
+
+    # ---- Default: complete with media files ----
+    COMPREPLY=( $(compgen -f -X '!*.@(mkv|mp4|m4v|mov|avi|ts|wmv|flv|webm)' -- "$cur") )
+    # Also allow directories for navigation
+    COMPREPLY+=( $(compgen -d -- "$cur") )
+}
+
+complete -o filenames -o bashdefault -F _muxm_completions muxm
+
+# ---- Zsh compatibility ----
+# If running in zsh, enable bash completion emulation
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    autoload -Uz bashcompinit && bashcompinit
+    complete -o filenames -o bashdefault -F _muxm_completions muxm
+fi

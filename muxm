@@ -745,6 +745,15 @@ target directory is not writable. Detects Homebrew prefix automatically.
 .BR \-\-uninstall\-man
 Remove the installed manual page.
 .TP
+.BR \-\-install\-completions
+Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
+\fBsource\fR line to the user's shell RC files
+(\fI~/.bashrc\fR, \fI~/.bash_profile\fR, \fI~/.zshrc\fR).
+.TP
+.BR \-\-uninstall\-completions
+Remove the tab\-completion file from \fI~/.muxm/\fR and clean
+the \fBsource\fR lines from shell RC files.
+.TP
 .BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
 Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
 and exit. Profile\-specific variables are uncommented and set; all other
@@ -941,11 +950,18 @@ pgsrip, etc.) via Homebrew and pipx.
 .TP
 .B muxm \-\-install\-man
 Install this manual page so \fBman muxm\fR works.
+.TP
+.B muxm \-\-install\-completions
+Install bash/zsh tab completion. Adds a source line to your shell RC files.
 .SH FILES
 \fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
 .PP
 Configuration files use shell variable syntax. CLI flags always override
 config files. Profiles override config files but are overridden by CLI flags.
+.PP
+\fI~/.muxm/muxm\-completion.bash\fR
+.PP
+Tab\-completion script installed by \fB\-\-install\-completions\fR.
 .SH DEPENDENCIES
 .TP
 .B Required
@@ -1068,6 +1084,244 @@ for _arg in "$@"; do
   esac
 done
 unset _arg
+
+# ===== Section 5b¾: Completion installer (--install-completions / --uninstall-completions) =====
+# Embeds the full bash/zsh completion script and installs it to ~/.muxm/.
+# Adds a `source` line to the user's shell RC file(s) (~/.bashrc, ~/.bash_profile, ~/.zshrc).
+
+_completions_emit(){
+  cat <<'COMPLETIONS_EOF'
+# =============================================================================
+#  muxm — Bash/Zsh tab completion  (installed by muxm --install-completions)
+# =============================================================================
+
+_muxm_completions() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # ---- Flags that take a specific set of values ----
+    case "$prev" in
+        --profile)
+            COMPREPLY=( $(compgen -W "dv-archival hdr10-hq atv-directplay-hq streaming animation universal" -- "$cur") )
+            return ;;
+        --video-codec)
+            COMPREPLY=( $(compgen -W "libx265 libx264" -- "$cur") )
+            return ;;
+        --output-ext)
+            COMPREPLY=( $(compgen -W "mp4 mkv m4v mov" -- "$cur") )
+            return ;;
+        -p|--preset)
+            COMPREPLY=( $(compgen -W "ultrafast superfast veryfast faster fast medium slow slower veryslow placebo" -- "$cur") )
+            return ;;
+        --ocr-tool)
+            COMPREPLY=( $(compgen -W "pgsrip sub2srt" -- "$cur") )
+            return ;;
+        --ffmpeg-loglevel|--ffprobe-loglevel)
+            COMPREPLY=( $(compgen -W "quiet panic fatal error warning info verbose debug trace" -- "$cur") )
+            return ;;
+        --create-config|--force-create-config)
+            COMPREPLY=( $(compgen -W "system user project" -- "$cur") )
+            return ;;
+
+        # Flags that take a free-form value — offer no completion, fall through to files
+        --crf|--stereo-bitrate|--threads|-l|--level|--x265-params|\
+        --audio-track|--audio-lang-pref|--audio-force-codec|\
+        --sub-lang-pref|--ocr-lang)
+            COMPREPLY=()
+            return ;;
+    esac
+
+    # ---- After --create-config <scope>, offer profile names ----
+    if (( COMP_CWORD >= 3 )); then
+        local pprev="${COMP_WORDS[COMP_CWORD-2]}"
+        if [[ "$pprev" == "--create-config" || "$pprev" == "--force-create-config" ]]; then
+            COMPREPLY=( $(compgen -W "dv-archival hdr10-hq atv-directplay-hq streaming animation universal" -- "$cur") )
+            return
+        fi
+    fi
+
+    # ---- If typing a flag, complete from all known flags ----
+    if [[ "$cur" == -* ]]; then
+        local flags="
+            -h --help -V --version
+            --profile --dry-run --print-effective-config
+            --install-dependencies --install-man --uninstall-man
+            --install-completions --uninstall-completions
+            --create-config --force-create-config
+
+            --crf -p --preset --x265-params -l --level
+            --video-codec --tonemap --no-tonemap
+            --no-conservative-vbv
+            --no-dv --allow-dv-fallback --no-allow-dv-fallback
+            --dv-convert-p81 --no-dv-convert-p81
+            --video-copy-if-compliant --no-video-copy-if-compliant
+
+            --audio-track --audio-lang-pref
+            --stereo-fallback --no-stereo-fallback --stereo-bitrate
+            --audio-force-codec
+            --audio-lossless-passthrough --no-audio-lossless-passthrough
+
+            --sub-burn-forced --no-sub-burn-forced
+            --sub-export-external --no-sub-export-external
+            --sub-lang-pref --no-sub-sdh --no-subtitles
+            --ocr-lang --no-ocr --ocr-tool
+
+            --skip-video --skip-audio --skip-subs
+
+            --output-ext
+            --keep-chapters --no-keep-chapters
+            --strip-metadata --no-strip-metadata
+            --skip-if-ideal --no-skip-if-ideal
+            --report-json --no-report-json
+            --checksum --no-checksum
+            --no-overwrite
+
+            -k --keep-temp -K --keep-temp-always
+            --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
+            --threads
+        "
+        COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+        return
+    fi
+
+    # ---- Default: complete with media files ----
+    COMPREPLY=( $(compgen -f -X '!*.@(mkv|mp4|m4v|mov|avi|ts|wmv|flv|webm)' -- "$cur") )
+    # Also allow directories for navigation
+    COMPREPLY+=( $(compgen -d -- "$cur") )
+}
+
+complete -o filenames -o bashdefault -F _muxm_completions muxm
+
+# ---- Zsh compatibility ----
+# If running in zsh, enable bash completion emulation
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    autoload -Uz bashcompinit && bashcompinit
+    complete -o filenames -o bashdefault -F _muxm_completions muxm
+fi
+COMPLETIONS_EOF
+}
+
+# Portable sed in-place: macOS sed requires '' after -i, GNU sed does not.
+_sed_inplace(){
+  if sed --version 2>/dev/null | grep -q GNU; then
+    sed -i "$@"
+  else
+    sed -i '' "$@"
+  fi
+}
+
+# shellcheck disable=SC2016  # $HOME must expand at shell-startup, not install-time
+_completions_source_line='source "$HOME/.muxm/muxm-completion.bash"'
+_completions_marker='# muxm tab completion'
+
+_install_completions(){
+  local comp_dir="$HOME/.muxm"
+  local comp_file="$comp_dir/muxm-completion.bash"
+
+  say "=== ${APP_NAME} v${VERSION} — Completion Installer ==="
+  echo ""
+
+  # Create directory
+  if [[ ! -d "$comp_dir" ]]; then
+    printf '  📁 Creating %s\n' "$comp_dir"
+    mkdir -p "$comp_dir"
+  fi
+
+  # Write completion script
+  _completions_emit > "$comp_file"
+  chmod +x "$comp_file"
+  printf '  ✅ Wrote %s\n' "$comp_file"
+  echo ""
+
+  # Detect and patch shell RC files
+  local -a rc_files=()
+  # Bash: prefer ~/.bash_profile on macOS (login shell), ~/.bashrc on Linux
+  [[ -f "$HOME/.bash_profile" ]] && rc_files+=("$HOME/.bash_profile")
+  [[ -f "$HOME/.bashrc" ]]       && rc_files+=("$HOME/.bashrc")
+  [[ -f "$HOME/.zshrc" ]]        && rc_files+=("$HOME/.zshrc")
+
+  if [[ ${#rc_files[@]} -eq 0 ]]; then
+    printf '  ⚠️  No shell RC files found (~/.bashrc, ~/.bash_profile, ~/.zshrc).\n'
+    printf '     Add this line manually to your shell config:\n\n'
+    printf '       %s\n' "$_completions_marker"
+    printf '       %s\n\n' "$_completions_source_line"
+  else
+    local patched=0
+    for rc in "${rc_files[@]}"; do
+      local rc_base="${rc##*/}"
+      printf '  %-20s' "$rc_base"
+      if grep -qF 'muxm-completion.bash' "$rc" 2>/dev/null; then
+        printf '✅ already configured\n'
+      else
+        # Ensure file ends with a newline before appending
+        [[ -s "$rc" ]] && [[ "$(tail -c 1 "$rc")" != "" ]] && printf '\n' >> "$rc"
+        printf '\n%s\n%s\n' "$_completions_marker" "$_completions_source_line" >> "$rc"
+        printf '✅ added source line\n'
+        patched=$(( patched + 1 ))
+      fi
+    done
+
+    echo ""
+    if (( patched > 0 )); then
+      printf '  Restart your shell or run:\n'
+      printf '    source %s\n' "$comp_file"
+    else
+      printf '  All shell configs already have muxm completions.\n'
+    fi
+  fi
+
+  exit 0
+}
+
+_uninstall_completions(){
+  local comp_dir="$HOME/.muxm"
+  local comp_file="$comp_dir/muxm-completion.bash"
+
+  say "=== ${APP_NAME} v${VERSION} — Completion Uninstaller ==="
+  echo ""
+
+  # Remove completion file
+  if [[ -f "$comp_file" ]]; then
+    rm -f "$comp_file"
+    printf '  ✅ Removed %s\n' "$comp_file"
+  else
+    printf '  ⚠️  Completion file not found at %s\n' "$comp_file"
+  fi
+
+  # Clean source lines from RC files
+  local -a rc_files=("$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zshrc")
+  for rc in "${rc_files[@]}"; do
+    [[ -f "$rc" ]] || continue
+    local rc_base="${rc##*/}"
+    if grep -qF 'muxm-completion.bash' "$rc" 2>/dev/null; then
+      # Remove the marker comment and source line
+      _sed_inplace '/# muxm tab completion/d' "$rc"
+      _sed_inplace '/muxm-completion\.bash/d' "$rc"
+      printf '  ✅ Cleaned %s\n' "$rc_base"
+    fi
+  done
+
+  # Remove directory if empty
+  if [[ -d "$comp_dir" ]] && [[ -z "$(ls -A "$comp_dir" 2>/dev/null)" ]]; then
+    rmdir "$comp_dir"
+    printf '  ✅ Removed empty %s\n' "$comp_dir"
+  fi
+
+  echo ""
+  printf '  Restart your shell to complete removal.\n'
+  exit 0
+}
+
+# Pre-scan for --install-completions / --uninstall-completions
+for _arg in "$@"; do
+  case "$_arg" in
+    --install-completions)   _install_completions ;;
+    --uninstall-completions) _uninstall_completions ;;
+  esac
+done
+unset _arg
+
 # Invoked via --create-config <scope> [profile]. Generates a .muxmrc file at the
 # appropriate location with the full template and profile-specific variables
 # uncommented. Halts all other operations.
@@ -1825,6 +2079,8 @@ Common options:
   --install-dependencies      Install required tools via Homebrew/pipx
   --install-man               Install the muxm(1) manual page
   --uninstall-man             Remove the installed manual page
+  --install-completions       Install bash/zsh tab completion
+  --uninstall-completions     Remove installed tab completion
   --create-config SCOPE [PROFILE]
                               Generate .muxmrc (system|user|project)
 

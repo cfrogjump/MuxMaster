@@ -7,7 +7,7 @@
 #  Usage:
 #    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
 #
-#  Suites: all, cli, config, profiles, conflicts, dryrun, video, audio, subs,
+#  Suites: all, cli, completions, config, profiles, conflicts, dryrun, video, audio, subs,
 #          output, edge, e2e, hdr, containers, metadata
 #  Default: all
 # =============================================================================
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
     --verbose) VERBOSE=1; shift ;;
     -h|--help)
       echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, config, profiles, conflicts, dryrun, video, hdr,"
+      echo "Suites: all, cli, completions, config, profiles, conflicts, dryrun, video, hdr,"
       echo "        audio, subs, output, containers, metadata, edge, e2e"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -320,6 +320,8 @@ test_cli() {
   assert_contains "--profile" "--help mentions --profile" "$out"
   assert_contains "dv-archival" "--help lists dv-archival" "$out"
   assert_contains "universal" "--help lists universal" "$out"
+  assert_contains "--install-completions" "--help mentions --install-completions" "$out"
+  assert_contains "--uninstall-completions" "--help mentions --uninstall-completions" "$out"
 
   # --version
   out="$(run_muxm --version)"
@@ -1408,11 +1410,88 @@ test_profile_e2e() {
   fi
 }
 
+# === Suite: Completions Installer ===
+test_completions() {
+  section "Completion Installer (--install-completions / --uninstall-completions)"
+
+  # Use an isolated HOME to avoid touching the real user's RC files
+  local fake_home="$TESTDIR/fake_home"
+  mkdir -p "$fake_home"
+
+  # Create fake RC files to patch
+  touch "$fake_home/.bashrc"
+  touch "$fake_home/.zshrc"
+
+  local out comp_file="$fake_home/.muxm/muxm-completion.bash"
+
+  # ---- --install-completions creates the file and patches RC files ----
+  out="$(HOME="$fake_home" "$MUXM" --install-completions 2>&1)" || true
+  assert_contains "Completion Installer" "--install-completions shows banner" "$out"
+
+  if [[ -f "$comp_file" ]]; then
+    pass "--install-completions creates completion file"
+    # Verify it contains the completion function
+    assert_contains "_muxm_completions" "Completion file has _muxm_completions" "$(cat "$comp_file")"
+  else
+    fail "--install-completions did not create $comp_file"
+  fi
+
+  # Verify source line was added to RC files
+  if grep -qF 'muxm-completion.bash' "$fake_home/.bashrc" 2>/dev/null; then
+    pass "--install-completions patches .bashrc"
+  else
+    fail "--install-completions did not patch .bashrc"
+  fi
+
+  if grep -qF 'muxm-completion.bash' "$fake_home/.zshrc" 2>/dev/null; then
+    pass "--install-completions patches .zshrc"
+  else
+    fail "--install-completions did not patch .zshrc"
+  fi
+
+  # ---- Idempotency: running again should NOT duplicate ----
+  out="$(HOME="$fake_home" "$MUXM" --install-completions 2>&1)" || true
+  local count
+  count="$(grep -cF 'muxm-completion.bash' "$fake_home/.bashrc")"
+  if [[ "$count" -eq 1 ]]; then
+    pass "--install-completions is idempotent (no duplicate in .bashrc)"
+  else
+    fail "--install-completions duplicated source line in .bashrc ($count occurrences)"
+  fi
+
+  # ---- --uninstall-completions removes file and cleans RC ----
+  out="$(HOME="$fake_home" "$MUXM" --uninstall-completions 2>&1)" || true
+  assert_contains "Completion Uninstaller" "--uninstall-completions shows banner" "$out"
+
+  if [[ ! -f "$comp_file" ]]; then
+    pass "--uninstall-completions removes completion file"
+  else
+    fail "--uninstall-completions did not remove completion file"
+  fi
+
+  if ! grep -qF 'muxm-completion.bash' "$fake_home/.bashrc" 2>/dev/null; then
+    pass "--uninstall-completions cleans .bashrc"
+  else
+    fail "--uninstall-completions did not clean .bashrc"
+  fi
+
+  if ! grep -qF 'muxm-completion.bash' "$fake_home/.zshrc" 2>/dev/null; then
+    pass "--uninstall-completions cleans .zshrc"
+  else
+    fail "--uninstall-completions did not clean .zshrc"
+  fi
+
+  # ---- --uninstall-completions is safe when nothing is installed ----
+  out="$(HOME="$fake_home" "$MUXM" --uninstall-completions 2>&1)" || true
+  assert_contains "not found" "--uninstall-completions safe when already removed" "$out"
+}
+
 # ---- Run Suites ----
 run_suites() {
   case "$SUITE" in
     all)
       test_cli
+      test_completions
       test_config
       test_profiles
       test_conflicts
@@ -1427,23 +1506,24 @@ run_suites() {
       test_edge
       test_profile_e2e
       ;;
-    cli)        test_cli ;;
-    config)     test_config ;;
-    profiles)   test_profiles ;;
-    conflicts)  test_conflicts ;;
-    dryrun)     test_dryrun ;;
-    video)      test_video ;;
-    hdr)        test_hdr ;;
-    audio)      test_audio ;;
-    subs)       test_subs ;;
-    output)     test_output ;;
-    containers) test_containers ;;
-    metadata)   test_metadata ;;
-    edge)       test_edge ;;
-    e2e)        test_profile_e2e ;;
+    cli)          test_cli ;;
+    completions)  test_completions ;;
+    config)       test_config ;;
+    profiles)     test_profiles ;;
+    conflicts)    test_conflicts ;;
+    dryrun)       test_dryrun ;;
+    video)        test_video ;;
+    hdr)          test_hdr ;;
+    audio)        test_audio ;;
+    subs)         test_subs ;;
+    output)       test_output ;;
+    containers)   test_containers ;;
+    metadata)     test_metadata ;;
+    edge)         test_edge ;;
+    e2e)          test_profile_e2e ;;
     *)
       echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, config, profiles, conflicts, dryrun, video, hdr, audio,"
+      echo "Valid: all, cli, completions, config, profiles, conflicts, dryrun, video, hdr, audio,"
       echo "       subs, output, containers, metadata, edge, e2e"
       exit 1
       ;;
