@@ -1,4 +1,4 @@
-.TH MUXM 1 "2026-02-23" "MuxMaster v0.12.0" "User Commands"
+.TH MUXM 1 "2026-02-25" "MuxMaster v1.0.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -63,6 +63,12 @@ Plan steps without encoding/muxing (creates placeholders only).
 .BR \-\-print\-effective\-config
 Show the resolved configuration after all sources merge, then exit.
 .TP
+.BR \-\-setup
+Run full first\-time setup: installs dependencies, the manual page, and
+tab completion in a single command. Equivalent to running
+\fB\-\-install\-dependencies\fR, \fB\-\-install\-man\fR, and
+\fB\-\-install\-completions\fR in sequence.
+.TP
 .BR \-\-install\-dependencies
 Check and install required/optional tools via Homebrew and pipx.
 .TP
@@ -72,6 +78,15 @@ target directory is not writable. Detects Homebrew prefix automatically.
 .TP
 .BR \-\-uninstall\-man
 Remove the installed manual page.
+.TP
+.BR \-\-install\-completions
+Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
+\fBsource\fR line to the user's shell RC files
+(\fI~/.bashrc\fR, \fI~/.bash_profile\fR, \fI~/.zshrc\fR).
+.TP
+.BR \-\-uninstall\-completions
+Remove the tab\-completion file from \fI~/.muxm/\fR and clean
+the \fBsource\fR lines from shell RC files.
 .TP
 .BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
 Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
@@ -263,12 +278,19 @@ Useful for debugging config precedence.
 Generate a ~/.muxmrc pre\-filled with streaming profile defaults. Edit to
 taste; CLI flags still override everything.
 .TP
+.B muxm \-\-setup
+Full first\-time setup: install dependencies, the manual page, and tab
+completion all at once.
+.TP
 .B muxm \-\-install\-dependencies
 Check for and install all required/optional tools (ffmpeg, dovi_tool,
 pgsrip, etc.) via Homebrew and pipx.
 .TP
 .B muxm \-\-install\-man
 Install this manual page so \fBman muxm\fR works.
+.TP
+.B muxm \-\-install\-completions
+Install bash/zsh tab completion. Adds a source line to your shell RC files.
 .SH FILES
 \fI/etc/.muxmrc\fR, \fI~/.muxmrc\fR, \fI./.muxmrc\fR
 .PP

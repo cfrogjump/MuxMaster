@@ -322,6 +322,7 @@ test_cli() {
   assert_contains "universal" "--help lists universal" "$out"
   assert_contains "--install-completions" "--help mentions --install-completions" "$out"
   assert_contains "--uninstall-completions" "--help mentions --uninstall-completions" "$out"
+  assert_contains "--setup" "--help mentions --setup" "$out"
 
   # --version
   out="$(run_muxm --version)"
@@ -1486,12 +1487,52 @@ test_completions() {
   assert_contains "not found" "--uninstall-completions safe when already removed" "$out"
 }
 
+# ===== --setup (combined installer) ===========================================================
+test_setup() {
+  section "Setup (--setup combined installer)"
+
+  # Create isolated home so --install-man and --install-completions don't touch real system
+  local fake_home
+  fake_home="$(mktemp -d)"
+  mkdir -p "$fake_home/.bashrc" && rm -rf "$fake_home/.bashrc"  # ensure no dir collision
+  touch "$fake_home/.bashrc"
+  touch "$fake_home/.zshrc"
+
+  # ---- --setup shows the combined banner ----
+  out="$(HOME="$fake_home" "$MUXM" --setup 2>&1)" || true
+  assert_contains "Full Setup" "--setup shows Full Setup banner" "$out"
+
+  # ---- --setup runs all three sub-installers ----
+  assert_contains "Dependency Installer" "--setup runs dependency installer" "$out"
+  assert_contains "Manual Page Installer" "--setup runs man page installer" "$out"
+  assert_contains "Completion Installer" "--setup runs completion installer" "$out"
+
+  # ---- --setup shows the final summary (success or warning depending on env) ----
+  if echo "$out" | grep -qE "Setup complete|reporting errors"; then
+    pass "--setup shows final summary"
+  else
+    fail "--setup did not show final summary"
+  fi
+
+  # ---- --setup actually installs completions ----
+  local comp_file="$fake_home/.muxm/muxm-completion.bash"
+  if [[ -f "$comp_file" ]]; then
+    pass "--setup installs completion file"
+  else
+    fail "--setup did not install completion file"
+  fi
+
+  # ---- Cleanup ----
+  rm -rf "$fake_home"
+}
+
 # ---- Run Suites ----
 run_suites() {
   case "$SUITE" in
     all)
       test_cli
       test_completions
+      test_setup
       test_config
       test_profiles
       test_conflicts
@@ -1508,6 +1549,7 @@ run_suites() {
       ;;
     cli)          test_cli ;;
     completions)  test_completions ;;
+    setup)        test_setup ;;
     config)       test_config ;;
     profiles)     test_profiles ;;
     conflicts)    test_conflicts ;;
@@ -1523,7 +1565,7 @@ run_suites() {
     e2e)          test_profile_e2e ;;
     *)
       echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, completions, config, profiles, conflicts, dryrun, video, hdr, audio,"
+      echo "Valid: all, cli, completions, setup, config, profiles, conflicts, dryrun, video, hdr, audio,"
       echo "       subs, output, containers, metadata, edge, e2e"
       exit 1
       ;;

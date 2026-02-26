@@ -62,6 +62,7 @@ _muxm_completions() {
             --profile --dry-run --print-effective-config
             --install-dependencies --install-man --uninstall-man
             --install-completions --uninstall-completions
+            --setup
             --create-config --force-create-config
 
             --crf -p --preset --x265-params -l --level

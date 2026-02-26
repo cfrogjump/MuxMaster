@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MuxMaster™ Freeware License v0.12.0
+#  MuxMaster™ Freeware License v1.0.0
 #  Copyright © 2025–2026 Jamey Wicklund (theBluWiz)
 #
 #  "Do what you want, just don't pretend I warranty the universe."
@@ -38,7 +38,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="0.12.0"
+readonly VERSION="1.0.0"
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -708,7 +708,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   cat <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-02-23" "MuxMaster v0.12.0" "User Commands"
+.TH MUXM 1 "2026-02-25" "MuxMaster v1.0.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -791,6 +791,12 @@ Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
 .BR \-\-uninstall\-completions
 Remove the tab\-completion file from \fI~/.muxm/\fR and clean
 the \fBsource\fR lines from shell RC files.
+.TP
+.BR \-\-setup
+Run full first\-time setup: installs dependencies via Homebrew/pipx,
+the manual page, and tab completion in a single command. Equivalent to
+running \fB\-\-install\-dependencies\fR, \fB\-\-install\-man\fR, and
+\fB\-\-install\-completions\fR in sequence.
 .TP
 .BR \-\-create\-config " " \fISCOPE\fR " " [\fIPROFILE\fR]
 Generate a \fI.muxmrc\fR config file at the location specified by \fISCOPE\fR
@@ -981,6 +987,10 @@ Useful for debugging config precedence.
 .B muxm \-\-create\-config user streaming
 Generate a ~/.muxmrc pre\-filled with streaming profile defaults. Edit to
 taste; CLI flags still override everything.
+.TP
+.B muxm \-\-setup
+Full first\-time setup: install all dependencies, the manual page, and
+tab completion in one command.
 .TP
 .B muxm \-\-install\-dependencies
 Check for and install all required/optional tools (ffmpeg, dovi_tool,
@@ -1188,6 +1198,7 @@ _muxm_completions() {
             --profile --dry-run --print-effective-config
             --install-dependencies --install-man --uninstall-man
             --install-completions --uninstall-completions
+            --setup
             --create-config --force-create-config
 
             --crf -p --preset --x265-params -l --level
@@ -1360,6 +1371,74 @@ for _arg in "$@"; do
     --install-completions)   _install_completions ;;
     --uninstall-completions) _uninstall_completions ;;
   esac
+done
+unset _arg
+
+# ===== Section 9b: Full setup (--setup) =======================================================
+# Combines --install-dependencies, --install-man, and --install-completions into a single
+# first-time-setup command. Each installer runs in a subshell so its internal exit calls
+# don't short-circuit the overall flow.
+
+_setup_all(){
+  say "=== ${APP_NAME} v${VERSION} — Full Setup ==="
+  echo ""
+  say "Running all installers: dependencies, manual page, tab completion."
+  echo ""
+
+  local -i failures=0
+
+  # ---- 1. Dependencies ----
+  say "━━━ Step 1/3: Dependencies ━━━"
+  echo ""
+  if ( _dep_install_dependencies ); then
+    : # success
+  else
+    (( failures++ )) || true
+  fi
+  echo ""
+
+  # ---- 2. Manual page ----
+  say "━━━ Step 2/3: Manual Page ━━━"
+  echo ""
+  if ( _install_man ); then
+    : # success
+  else
+    (( failures++ )) || true
+  fi
+  echo ""
+
+  # ---- 3. Tab completion ----
+  say "━━━ Step 3/3: Tab Completion ━━━"
+  echo ""
+  if ( _install_completions ); then
+    : # success
+  else
+    (( failures++ )) || true
+  fi
+  echo ""
+
+  # ---- Summary ----
+  say "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if (( failures == 0 )); then
+    say "✅ Setup complete — ${APP_NAME} v${VERSION} is ready."
+    echo ""
+    printf '  Verify with:\n'
+    printf '    man %s            # manual page\n' "$CLI_NAME"
+    printf '    %s --version      # version check\n' "$CLI_NAME"
+    printf '    %s <Tab><Tab>     # tab completion (open a new shell first)\n' "$CLI_NAME"
+    exit 0
+  else
+    warn "Setup finished with $failures step(s) reporting errors. Check output above."
+    exit 1
+  fi
+}
+
+# Pre-scan for --setup
+for _arg in "$@"; do
+  if [[ "$_arg" == "--setup" ]]; then
+    _setup_all
+    # _setup_all always exits; this line is unreachable
+  fi
 done
 unset _arg
 
@@ -2116,12 +2195,13 @@ Common options:
   --uninstall-man             Remove the installed manual page
   --install-completions       Install bash/zsh tab completion
   --uninstall-completions     Remove installed tab completion
+  --setup                     Run full first-time setup (all of the above)
   --create-config SCOPE [PROFILE]
                               Generate .muxmrc (system|user|project)
 
 See muxm(1) for the full option reference, profiles, and examples.
-  Install:  muxm --install-man
-  Then:     man muxm
+  First run: muxm --setup
+  Then:      man muxm
 EOF
 }
 
