@@ -1,5 +1,7 @@
 # ![muxm](./assets/muxm_header_small.png) MuxMaster
 
+![Version](https://img.shields.io/badge/version-0.12.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-freeware-green)
+
 **MuxMaster** (`muxm`) — a single-command video repacking and encoding utility that handles Dolby Vision, HDR10, audio track selection, subtitle processing, and container muxing so you don't have to. Pick a profile, point it at a file, and get a properly encoded output without memorizing ffmpeg flags.
 
 ```bash
@@ -35,6 +37,8 @@ You can solve all of this with raw ffmpeg, but the command will be 15+ flags lon
 **Tdarr** solves the batch-processing and automation problem well, especially at library scale. But it requires a server, a database, a web UI, and Node.js — it's infrastructure. If you want to process a single file, or a handful of files, with precise control over DV handling, audio track selection, and subtitle policy, Tdarr's plugin system means writing JavaScript to configure what `muxm` handles with a single `--profile` flag. Tdarr is a media library manager; MuxMaster is a per-file encoding tool that aims to make every decision correctly so you don't have to inspect the output.
 
 MuxMaster sits in the gap between "I know ffmpeg well enough to do this manually" and "I need a server-based automation platform." It's a single Bash script with no runtime dependencies beyond ffmpeg and jq, it understands Dolby Vision at the RPU level, and its profile system encodes the tribal knowledge of what actually works on real hardware into repeatable, overridable presets.
+
+Configuration is where the design philosophy comes together. Most CLI tools expect you to read the source code to learn which variables exist, then hand-build a dotfile from scratch. `muxm --create-config` generates a complete, commented config file pre-seeded with a real profile's values — you start from a working baseline and customize, not from a blank page. Configs cascade through three tiers (system, user, project) so an encoding team can lock organization defaults in `/etc/.muxmrc` while individuals override their preferred CRF or audio settings in `~/.muxmrc` and specific project directories can pin a streaming profile. And `--print-effective-config` shows you the fully resolved result of all those layers *before* you commit to an encode, so you always know exactly what's about to happen.
 
 ---
 
@@ -226,7 +230,9 @@ Run `muxm --help` for the full flag reference.
 
 ## ⚙️ Configuration <a id="configuration"></a>
 
-`muxm` reads configuration from multiple levels, applied in this order (lowest → highest precedence):
+`muxm` has a layered configuration system designed so you set your preferences once and override only when you need to.
+
+Settings are resolved through multiple levels, applied in this order (lowest → highest precedence):
 
 ```
 Hardcoded defaults
@@ -266,14 +272,18 @@ The generated file contains the complete config template. Variables set by the c
 
 Profile defaults to `atv-directplay-hq` if omitted. Use `--force-create-config` to overwrite an existing file.
 
+**Example workflow:** You generate a user config seeded with the `streaming` profile (`muxm --create-config user streaming`). Now every encode defaults to HEVC CRF 20 with E-AC-3 audio — no flags needed. Later you create a project config in your anime directory seeded with `animation` (`muxm --create-config project animation`). Files encoded from that directory automatically get animation-tuned settings. And when you need a one-off override, `muxm --crf 14` on the command line wins over everything without touching any config file.
+
 ### Verifying Effective Configuration
+
+When configs cascade through multiple layers, it's easy to lose track of what's actually active. `--print-effective-config` resolves every layer and shows you the final result before anything is encoded:
 
 ```bash
 # See what the resolved config looks like after all sources merge
 muxm --profile hdr10-hq --crf 20 --print-effective-config
 ```
 
-This shows every variable grouped by section, the active profile name, and whether the profile came from a config file or the CLI.
+Every variable is displayed grouped by section, with the active profile name and the source of each override (CLI, config file, or profile default). No more guessing what a run will do.
 
 ---
 
@@ -291,14 +301,6 @@ Beyond profiles and the core encoding pipeline, `muxm` ships with a set of opera
 
 - **Checksum Verification** – Optionally writes a SHA-256 checksum file for the output to verify integrity after transfer or archival.
 
-- **Error Recovery & Cleanup** – If any pipeline stage fails, `muxm` logs the failure with context, cleans up incomplete temp files from the working directory, and exits with a descriptive error code.
-
-- **Color Space Matching** – For non-DV encodes, `muxm` reads the source color primaries, transfer characteristics, and matrix coefficients, then sets matching x265 parameters and pixel format automatically.
-
-- **Tone-Mapping** – Converts HDR10 or HLG content to SDR using a zscale + hable filter chain when the profile targets H.264 or SDR output.
-
-- **PGS Subtitle OCR** – When the output container can't carry PGS bitmap subtitles (MP4, MOV), `muxm` attempts OCR via `pgsrip` or `sub2srt` to produce SRT equivalents.
-
 - **Man Page** – `muxm --install-man` installs a full `muxm(1)` manual page with complete flag reference, profile documentation, and examples accessible via `man muxm`.
 
 ---
@@ -312,8 +314,9 @@ Full license text available in [LICENSE.md](./LICENSE.md)
 
 ## 🤝 Contributing <a id="contributing"></a>
 
-Contributions are welcome for bug reports, feature requests, and documentation improvements.
-Please note that all code changes must be approved by the maintainer and comply with the license.
+Bug reports, feature requests, and documentation improvements are welcome — please open an issue on GitHub first to discuss the change before submitting a pull request.
+
+All code contributions must be approved by the maintainer. By submitting a pull request, you agree that your contribution is licensed under the same terms as the project (see [LICENSE.md](./LICENSE.md)) and that the maintainer retains the right to include it in both the freeware and commercially licensed distributions of MuxMaster. If you have questions about this, open an issue and ask — it's a short conversation, not a legal process.
 
 ## 👤 Author <a id="author"></a>
 
