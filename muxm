@@ -21,10 +21,19 @@
 #     is often missing).
 # =============================================================================
 
-# ===== Section 1: Strict mode & debug =========================================================
+# ===== Section 1: Strict mode & bash version guard =============================================
 set -eEuo pipefail
 if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 [[ "${DEBUG:-0}" == "1" ]] && set -x
+
+# ---- Bash version guard ----
+# Namerefs (local -n), declare -i arrays, and other features require bash 4.3+.
+# macOS ships bash 3.2; users must install a modern bash (e.g., via Homebrew).
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  printf "❌ %s requires bash 4.3+. Found: %s\n" "muxm" "$BASH_VERSION" >&2
+  printf "   macOS: brew install bash (then ensure /opt/homebrew/bin/bash is in PATH)\n" >&2
+  exit 1
+fi
 
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
@@ -185,7 +194,7 @@ note() { printf "ℹ️  %s\n" "$@" >&2; }
 warn() { printf "⚠️  %s\n" "$@" >&2; }
 
 # log() — write ONLY to the log file, not to the terminal.
-# Falls back to say() if LOGFILE isn't set yet (pre–Section 12).
+# Falls back to say() if LOGFILE isn't set yet (pre–Section 17).
 log() {
   if [[ -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
     printf "%s\n" "$@" >> "$LOGFILE"
@@ -195,16 +204,19 @@ log() {
 }
 
 # ---- Terminal FD for interactive UI (spinner / progress bar) ----
-# Saved in Section 12 before the exec > >(tee …) redirect.
+# Saved in Section 17 before the exec > >(tee …) redirect.
 # Falls back to stderr if not yet initialised.
 TERM_FD=""
 # shellcheck disable=SC2059  # Callers pass printf format + args intentionally
 _term_print() { printf -- "$@" >&"${TERM_FD:-2}"; }
 
 # ---- Spinner — indeterminate progress indicator ----
-# Usage: some_command & spinner $! "Doing something…"
+# spinner PID "Message"
+# Display an animated spinner on the terminal while a background process runs.
+# Args: $1 — PID to poll, $2 — status message to display
 # NOTE: spinner NEVER calls wait — it only polls with kill -0.
 #       The caller MUST call wait "$pid" afterward to collect exit status.
+# Globals: TERM_FD (read)
 spinner() {
   local pid=$1 msg=$2 i=0
   local -a sym=( '|' '/' '—' $'\\' )
@@ -232,9 +244,15 @@ run_with_spinner() {
 }
 
 # ---- Progress bar — percentage-based for ffmpeg encodes ----
-# Reads ffmpeg -progress output from a pipe and renders a bar.
+# Reads ffmpeg -progress output from a named pipe and renders a terminal bar.
 # Args: $1 = ffmpeg PID, $2 = progress pipe path, $3 = total duration (seconds),
 #       $4 = label
+# Returns: the exit status of the ffmpeg process.
+#
+# IMPORTANT: This function calls `wait "$pid"` internally. The caller should NOT
+# call wait again. The wait at the end of this function (line ~280) is the
+# authoritative collection of the ffmpeg exit status — it fires after the
+# progress pipe is fully drained or the process has exited.
 ffmpeg_progress_bar() {
   local pid=$1 pipe=$2 total_secs=$3 label=$4
   local pct=0 bar="" elapsed_us=0
@@ -296,8 +314,8 @@ _get_source_duration_secs() {
   local dur=""
 
   # Tier 1: standard stream-level duration (common in MP4, rare in MKV)
-  dur="$(printf '%s\n' "$METADATA_CACHE" | jq -r \
-    '[.streams[] | select(.codec_type=="video")] | .[0].duration // empty' 2>/dev/null | head -n1)"
+  dur="$(_jq_cache -r \
+    '[.streams[] | select(.codec_type=="video")] | .[0].duration // empty' | head -n1)"
   if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "Duration source: stream duration = ${dur}s"
     printf '%.0f\n' "$dur"
@@ -305,8 +323,8 @@ _get_source_duration_secs() {
   fi
 
   # Tier 2: container/format-level duration (most containers)
-  dur="$(printf '%s\n' "$METADATA_CACHE" | jq -r \
-    '.format.duration // empty' 2>/dev/null | head -n1)"
+  dur="$(_jq_cache -r \
+    '.format.duration // empty' | head -n1)"
   if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "Duration source: format duration = ${dur}s"
     printf '%.0f\n' "$dur"
@@ -315,8 +333,8 @@ _get_source_duration_secs() {
 
   # Tier 3: Matroska tags — DURATION as "HH:MM:SS.nnnnnnnnn"
   local tag_dur
-  tag_dur="$(printf '%s\n' "$METADATA_CACHE" | jq -r \
-    '[.streams[] | select(.codec_type=="video")] | .[0].tags.DURATION // empty' 2>/dev/null | head -n1)"
+  tag_dur="$(_jq_cache -r \
+    '[.streams[] | select(.codec_type=="video")] | .[0].tags.DURATION // empty' | head -n1)"
   if [[ "$tag_dur" =~ ^([0-9]+):([0-9]+):([0-9]+)(\.[0-9]+)?$ ]]; then
     local h="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" s="${BASH_REMATCH[3]}"
     dur=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
@@ -331,6 +349,14 @@ _get_source_duration_secs() {
 
 # Lowercase a string (avoids repeated inline tr calls)
 _lower(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# _jq_cache — Run jq against the cached METADATA_CACHE JSON.
+# Absorbs stderr (jq errors) so callers don't need to redirect individually.
+# All jq flags (-r, -e, etc.) and the filter expression are passed through.
+# Usage: _jq_cache -r '.format.duration // empty'
+#        _jq_cache -e '[.streams[] | …] | length > 0'
+# Globals: METADATA_CACHE (read)
+_jq_cache(){ printf '%s\n' "$METADATA_CACHE" | jq "$@" 2>/dev/null; }
 
 die()  {
   local code=1
@@ -438,23 +464,24 @@ _validate_media_file(){
   ffprobe -v error "$file" >/dev/null 2>&1 || die 41 "$label produced corrupt file"
 }
 
+# Check if ffmpeg supports a given muxer (e.g., "vobsub" — missing on macOS Homebrew).
+# Args: $1 — muxer name
+# Returns: 0 if supported, 1 otherwise
 ffmpeg_has_muxer(){
   local mux="$1"
   ffmpeg -hide_banner -muxers 2>/dev/null | awk '{print $1}' | grep -qx "$mux"
 }
 
-# ===== Section 5b: Dependency installer ========================================================
-# Invoked via --install-dependencies. Checks for all tools required by muxm and
-# installs any that are missing via Homebrew and pipx. Exits after completion.
-#
-# Required:     ffmpeg, ffprobe, jq
-# DV pipeline:  dovi_tool, mp4box (gpac)
-# Subtitles:    tesseract, pgsrip (Python, via pipx)
-#
-# Config chain is sourced first (Section 6 below) so the installer sees the
-# user's resolved SUB_OCR_TOOL and other config-file settings.
-
 # ===== Section 6: Config chain: Defaults → /etc → ~ → project =================================
+# Config files are sourced as shell scripts — they can execute arbitrary code.
+# Security note: The project-level ./.muxmrc is sourced from $PWD. A malicious
+# .muxmrc in a directory the user cd's into could execute arbitrary commands.
+# This is the same trust model as .envrc (direnv), Makefile, etc. — standard
+# for developer tooling, but documented here for awareness.
+# See config_profile.md for the full security analysis of .muxmrc.
+# Source a config file if it exists and is readable. Tracks loaded files for diagnostics.
+# Args: $1 — file path
+# Globals: MUXM_CONFIG_LOADED (modified)
 _muxm_try_source(){
   local f="$1"
   [[ -r "$f" ]] || return 0
@@ -465,6 +492,16 @@ _muxm_try_source(){
 _muxm_try_source /etc/.muxmrc
 _muxm_try_source "$HOME/.muxmrc"
 _muxm_try_source "./.muxmrc"
+
+# ===== Section 7: Dependency installer ========================================================
+# Invoked via --install-dependencies. Checks for all tools required by muxm and
+# installs any that are missing via Homebrew and pipx. Exits after completion.
+# Config chain (Section 6) is sourced before this so the installer sees the
+# user's resolved SUB_OCR_TOOL and other config-file settings.
+#
+# Required:     ffmpeg, ffprobe, jq
+# DV pipeline:  dovi_tool, mp4box (gpac)
+# Subtitles:    tesseract, pgsrip (Python, via pipx)
 
 _dep_install_dependencies(){
   say "=== ${APP_NAME} v${VERSION} — Dependency Installer ==="
@@ -654,7 +691,7 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ===== Section 5b½: Man page installer (--install-man / --uninstall-man) =======================
+# ===== Section 8: Man page installer (--install-man / --uninstall-man) =========================
 # Embedded man page content, installed to the system man1 directory.
 # Detects Homebrew prefix on macOS (Apple Silicon vs Intel) and falls back to
 # /usr/local/share/man/man1. Uses sudo if the target directory isn't writable.
@@ -668,6 +705,7 @@ _man_target_dir(){
   fi
 }
 
+# <<< embedded man page >>>
 _man_emit(){
   cat <<'MANPAGE_EOF'
 .TH MUXM 1 "2026-02-23" "MuxMaster v0.12.0" "User Commands"
@@ -1006,6 +1044,7 @@ Audio transcode or copy failure.
 Jamey Wicklund (theBluWiz).
 MANPAGE_EOF
 }
+# <<< end embedded man page >>>
 
 _install_man(){
   local mandir
@@ -1085,10 +1124,11 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ===== Section 5b¾: Completion installer (--install-completions / --uninstall-completions) =====
+# ===== Section 9: Completion installer (--install-completions / --uninstall-completions) ======
 # Embeds the full bash/zsh completion script and installs it to ~/.muxm/.
 # Adds a `source` line to the user's shell RC file(s) (~/.bashrc, ~/.bash_profile, ~/.zshrc).
 
+# <<< embedded completion script >>>
 _completions_emit(){
   cat <<'COMPLETIONS_EOF'
 # =============================================================================
@@ -1201,6 +1241,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
 fi
 COMPLETIONS_EOF
 }
+# <<< end embedded completion script >>>
 
 # Portable sed in-place: macOS sed requires '' after -i, GNU sed does not.
 _sed_inplace(){
@@ -1322,6 +1363,7 @@ for _arg in "$@"; do
 done
 unset _arg
 
+# ===== Section 10: Config generator (--create-config / --force-create-config) =================
 # Invoked via --create-config <scope> [profile]. Generates a .muxmrc file at the
 # appropriate location with the full template and profile-specific variables
 # uncommented. Halts all other operations.
@@ -1330,61 +1372,53 @@ unset _arg
 # Profile:       defaults to atv-directplay-hq if omitted.
 # --force-create-config: overwrite if file already exists.
 
+# <<< embedded config template >>>
 _create_config_emit() {
   local profile="$1"
 
   # Build the set of variables that this profile explicitly sets.
   # These will be emitted uncommented; all others stay commented.
+  #
+  # Shared base: variables set by ALL profiles (DV, container, video, audio, subs, output).
+  # Per-profile deltas add profile-specific variables on top.
   local _active=" "
+  local _base="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
+  _base+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT "
+  _base+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
+  _base+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED "
+  _base+="KEEP_CHAPTERS STRIP_METADATA "
+  _active+="$_base"
+
   case "$profile" in
     dv-archival)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_COPY_IF_COMPLIANT VIDEO_CODEC "
-      _active+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED SUB_EXPORT_EXTERNAL "
-      _active+="KEEP_CHAPTERS STRIP_METADATA SKIP_IF_IDEAL REPORT_JSON "
+      _active+="SKIP_IF_IDEAL REPORT_JSON "
       ;;
     hdr10-hq)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT CRF_VALUE PRESET_VALUE "
+      _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 "
-      _active+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED "
-      _active+="KEEP_CHAPTERS STRIP_METADATA "
       ;;
     atv-directplay-hq)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT CRF_VALUE PRESET_VALUE "
+      _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 "
-      _active+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
       _active+="EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED SUB_EXPORT_EXTERNAL "
-      _active+="KEEP_CHAPTERS STRIP_METADATA SKIP_IF_IDEAL "
+      _active+="SUB_EXPORT_EXTERNAL SKIP_IF_IDEAL "
       ;;
     streaming)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT CRF_VALUE PRESET_VALUE "
+      _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 "
-      _active+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
       _active+="EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED SUB_EXPORT_EXTERNAL "
-      _active+="KEEP_CHAPTERS STRIP_METADATA "
+      _active+="SUB_EXPORT_EXTERNAL "
       ;;
     animation)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT CRF_VALUE PRESET_VALUE "
+      _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT "
-      _active+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS SUB_BURN_FORCED SUB_EXPORT_EXTERNAL "
-      _active+="KEEP_CHAPTERS STRIP_METADATA "
+      _active+="SUB_MAX_TRACKS SUB_EXPORT_EXTERNAL "
       ;;
     universal)
-      _active+="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
-      _active+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT TONEMAP_HDR_TO_SDR CRF_VALUE PRESET_VALUE "
+      _active+="TONEMAP_HDR_TO_SDR CRF_VALUE PRESET_VALUE "
       _active+="FORCE_CHROMA_420 "
-      _active+="AUDIO_FORCE_CODEC AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH MAX_AUDIO_CHANNELS STEREO_BITRATE "
-      _active+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED SUB_EXPORT_EXTERNAL "
-      _active+="KEEP_CHAPTERS STRIP_METADATA "
+      _active+="AUDIO_FORCE_CODEC MAX_AUDIO_CHANNELS "
+      _active+="SUB_EXPORT_EXTERNAL "
       ;;
   esac
 
@@ -1604,7 +1638,7 @@ HEADER
     _detected_ocr_tool="sub2srt"
   elif command -v pgsrip >/dev/null 2>&1; then
     # pgsrip found but tesseract missing — note it but still select it;
-    # the runtime OCR-validation check (Section 8) will warn if tesseract
+    # the runtime OCR-validation check (Section 14) will warn if tesseract
     # is still absent at encode time.
     _detected_ocr_tool="pgsrip"
   fi
@@ -1685,6 +1719,7 @@ HEADER
 
   unset -f _V
 }
+# <<< end embedded config template >>>
 
 _create_config() {
   local scope="$1"
@@ -1763,11 +1798,11 @@ _create_config() {
   exit 0
 }
 
-# Pre-scan for --create-config / --force-create-config is below in Section 6b,
+# Pre-scan for --create-config / --force-create-config is below in Section 11,
 # after profile functions are defined (they're needed by the config generator).
 
 
-# ===== Section 6b: Profile pre-scan & application ==============================================
+# ===== Section 11: Profiles & application =====================================================
 # Two-pass CLI: first extract --profile, apply it, then let full CLI parse override.
 #
 # Precedence for PROFILE_NAME:
@@ -2052,7 +2087,7 @@ unset _cc_force _cc_scope _cc_profile _cc_found _cc_i _cc_args
 
 apply_profile
 
-# ===== Section 7: CLI ==========================================================================
+# ===== Section 12: CLI parsing =================================================================
 USAGE_SHORT="Usage: ${CLI_NAME} [options] <source> [target.${OUTPUT_EXT}]"
 print_usage(){
   cat <<EOF
@@ -2114,6 +2149,8 @@ while [[ $# -gt 0 ]]; do
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
 
+    # TODO: Consider whitelisting loglevel values (quiet|panic|fatal|error|warning|info|verbose|debug|trace)
+    #       to match the completion script. Currently ffmpeg rejects invalid values harmlessly.
     --ffmpeg-loglevel) FFMPEG_LOGLEVEL="${2:-}"; shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
@@ -2190,7 +2227,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ===== Section 7b: Profile + flag conflict warnings ============================================
+# ===== Section 13: Profile + flag conflict warnings ==========================================
 # These are warnings, not errors — the user's explicit CLI flags always win.
 # Conflicts are only checked when a profile is active.
 
@@ -2459,7 +2496,7 @@ EOF
 
 (( PRINT_EFFCONF )) && print_effective_config
 
-# ===== Section 8: Required tools ===============================================================
+# ===== Section 14: Tool validation ============================================================
 need ffmpeg
 need ffprobe
 need jq
@@ -2501,7 +2538,7 @@ if (( SUB_ENABLE_OCR )); then
   fi
 fi
 
-# ===== Section 9: Input validation & security checks ===========================================
+# ===== Section 15: Input validation & security checks =========================================
 SRC="${POSITIONALS[0]:-}"
 OUT="${POSITIONALS[1]:-}"
 (( ${#POSITIONALS[@]} > 2 )) && die 11 "Too many arguments. $USAGE_SHORT"
@@ -2520,6 +2557,8 @@ SRC_ABS="$(realpath_fallback "$SRC")"
 [[ -r "$SRC_ABS" ]] || die 11 "Source file not readable: $SRC_ABS"
 
 # Validate filename doesn't contain control characters (security)
+# This catches newlines, tabs, null bytes, and other chars that could cause
+# field-splitting issues in the printf '%s\n' patterns used throughout.
 if [[ "$SRC_ABS" =~ [[:cntrl:]] ]]; then
   die 11 "Source filename contains control characters - potential security risk"
 fi
@@ -2555,7 +2594,11 @@ if (( ! FFMPEG_OVERWRITE )) && [[ -f "$OUT_ABS" ]]; then
   die 11 "Output file already exists (--no-overwrite): $OUT_ABS"
 fi
 
-# Security: Use unpredictable temp file name
+# Security: Use unpredictable temp file name.
+# NOTE: mktemp creates the file, then we delete it and re-add the extension.
+# There is a theoretical TOCTOU window between rm and ffmpeg's eventual open.
+# This is acceptable because: (a) the window is microseconds, (b) exploitation
+# requires local write access to OUT_DIR, (c) mktemp --suffix is not portable.
 TMP_OUT="$(mktemp "$OUT_DIR/.muxm.output.XXXXXXXX")" || die 11 "Cannot create temp output file"
 rm -f "$TMP_OUT"  # Remove the file, we just wanted the name
 TMP_OUT="${TMP_OUT}.${OUTPUT_EXT}"
@@ -2568,7 +2611,7 @@ case "$OUTPUT_EXT" in
   mkv)     MUX_FORMAT="matroska" ;;
 esac
 
-# ===== Section 10: Build ffmpeg/ffprobe flags ==================================================
+# ===== Section 16: Build ffmpeg/ffprobe flags =================================================
 FFMPEG_FLAGS=()
 FFPROBE_FLAGS=()
 
@@ -2582,13 +2625,23 @@ PROBE_OPTS=(-analyzeduration 100M -probesize 100M)
 FFMPEG_FLAGS+=("${PROBE_OPTS[@]}")
 FFPROBE_FLAGS+=("${PROBE_OPTS[@]}")
 
-# ===== Section 11: Workdir =====================================================================
+# ===== Section 17: Workdir & logging ==========================================================
 WORKDIR="$(
   mktemp -d "${OUT_DIR}/.muxm.tmp.XXXXXXXX"
 )" || die 11 "Cannot create working directory under: $OUT_DIR"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
-# ===== Section 12: Begin logging to file =======================================================
+# ---- Begin logging to file ----
+# Redirect stdout and stderr through tee to capture all output in the log file
+# while still displaying it on the terminal.
+#
+# FD 3 is preserved as a "raw terminal" descriptor BEFORE the redirect. This
+# allows spinner/progress-bar code to write \r-based updates directly to the
+# terminal without polluting the log file with ANSI cursor movements.
+#
+# After this section:
+#   stdout/stderr → tee → log file + terminal
+#   FD 3          → raw terminal (bypasses tee)
 if [[ "${DEBUG:-0}" != "1" ]]; then
   : > "$LOGFILE" 2>/dev/null || true
   # Preserve a raw terminal FD for spinner / progress-bar output.
@@ -2600,7 +2653,7 @@ if [[ "${DEBUG:-0}" != "1" ]]; then
   note "Logging to $(realpath_fallback "$LOGFILE")"
 fi
 
-# ===== Section 13: Traps =======================================================================
+# ===== Section 18: Traps ======================================================================
 trap 'on_error $LINENO "$BASH_COMMAND" "$?"' ERR
 trap 'FAILED=1; EXIT_CODE=130; FAIL_MSG="Interrupted by user (SIGINT)"; _term_print "\n"; exit 130' INT
 trap 'FAILED=1; EXIT_CODE=143; FAIL_MSG="Terminated (SIGTERM)"; exit 143' TERM
@@ -2611,8 +2664,18 @@ _print_completed_steps(){
   for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
 }
 
+# on_exit — EXIT trap handler. Performs all end-of-run cleanup and reporting.
+#
+# Success path: atomically moves temp output to final path, writes checksum,
+#   prints completed steps, cleans up workdir (unless --keep-temp-always).
+# Failure path: prints failure message + completed steps, cleans up temp output,
+#   preserves workdir for debugging (if --keep-temp or --keep-temp-always).
+# Dry-run path: removes temp placeholder, reports completion.
+#
+# Globals read: FAILED, DRY_RUN, TMP_OUT, OUT, CHECKSUM, WORKDIR, DEBUG,
+#               KEEP_TEMP, KEEP_TEMP_ALWAYS, EXIT_CODE, FAIL_MSG, TERM_FD
 on_exit() {
-  # Close the raw-terminal FD if it was opened (Section 12)
+  # Close the raw-terminal FD if it was opened (Section 17)
   [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
 
   local have_result=0
@@ -2664,7 +2727,7 @@ on_exit() {
 }
 trap 'on_exit' EXIT
 
-# ===== Section 14: Disk space preflight ========================================================
+# ===== Section 19: Disk space preflight =======================================================
 disk_free_warn() {
   local avail_kb
   # Use POSIX-compliant df -P for portability
@@ -2675,7 +2738,7 @@ disk_free_warn() {
 }
 disk_free_warn
 
-# ===== Section 15: Metadata caching & ffprobe helpers ==========================================
+# ===== Section 20: Metadata caching & ffprobe helpers =========================================
 # Cache all stream metadata in one call for performance
 cache_stream_metadata() {
   log "→ Caching stream metadata..."
@@ -2683,12 +2746,12 @@ cache_stream_metadata() {
     die 12 "Failed to probe source file metadata - file may be corrupt"
   }
   # Validate JSON integrity before downstream helpers rely on it
-  printf '%s\n' "$METADATA_CACHE" | jq empty 2>/dev/null || {
+  _jq_cache empty || {
     die 12 "ffprobe returned invalid JSON - file may be corrupt or ffprobe version incompatible"
   }
 }
 
-# ===== Section 15b: Report helpers & skip-if-ideal =============================================
+# ===== Section 21: Report helpers & skip-if-ideal =============================================
 
 # Add an entry to the JSON report accumulator.
 # Escapes backslash and double-quote to produce valid JSON.
@@ -2727,27 +2790,38 @@ write_json_report() {
 }
 
 # Check if source already matches profile requirements (skip-if-ideal)
+# Delegates video-stream compliance to _video_is_copy_compliant (DRY), then
+# adds container and audio checks that only the skip-if-ideal path needs.
 check_skip_if_ideal() {
   (( SKIP_IF_IDEAL )) || return 1  # return 1 = don't skip
 
-  local src_codec src_pix src_ext ideal=1
+  local ideal=1 reason=""
 
-  src_codec="$(_lower "$(_probe_field codec_name)")"
-  src_pix="$(_lower "$(_probe_field pix_fmt)")"
-  src_ext="${SRC_ABS##*.}"
-  src_ext="$(_lower "$src_ext")"
-
-  local reason=""
-
-  # Check video codec
-  if [[ "$VIDEO_CODEC" == "libx265" && "$src_codec" != "hevc" ]]; then
-    ideal=0; reason="video codec is $src_codec (need hevc)"
-  elif [[ "$VIDEO_CODEC" == "libx264" && "$src_codec" != "h264" ]]; then
-    ideal=0; reason="video codec is $src_codec (need h264)"
+  # ---- Video compliance (reuse the copy-compliant check) ----
+  # _video_is_copy_compliant checks: codec match, pixel format, tone-map, DV profile.
+  if ! _video_is_copy_compliant; then
+    ideal=0
+    # Generate a descriptive reason for reporting
+    local src_codec src_pix
+    src_codec="$(_lower "$(_probe_field codec_name)")"
+    src_pix="$(_lower "$(_probe_field pix_fmt)")"
+    if [[ "$VIDEO_CODEC" == "libx265" && "$src_codec" != "hevc" ]]; then
+      reason="video codec is $src_codec (need hevc)"
+    elif [[ "$VIDEO_CODEC" == "libx264" && "$src_codec" != "h264" ]]; then
+      reason="video codec is $src_codec (need h264)"
+    elif [[ "$TARGET_PIXFMT" == "yuv420p10le" && "$src_pix" != *"p10"* ]]; then
+      reason="pixel format is $src_pix (need 10-bit for $TARGET_PIXFMT)"
+    elif (( TONEMAP_HDR_TO_SDR )); then
+      reason="tone-mapping required (cannot copy)"
+    else
+      reason="video stream not copy-compliant"
+    fi
   fi
 
-  # Check container
+  # ---- Container check (skip-if-ideal only) ----
   if (( ideal )); then
+    local src_ext
+    src_ext="$(_lower "${SRC_ABS##*.}")"
     case "$OUTPUT_EXT" in
       mp4|m4v)
         if [[ "$src_ext" != "mp4" && "$src_ext" != "m4v" ]]; then
@@ -2762,14 +2836,7 @@ check_skip_if_ideal() {
     esac
   fi
 
-  # Check pixel format for HDR profiles (source must be 10-bit when target expects it)
-  if (( ideal )) && [[ "$VIDEO_CODEC" == "libx265" ]]; then
-    if [[ "$src_pix" != *"p10"* && "$HDR_TARGET_PIXFMT" == "yuv420p10le" ]]; then
-      ideal=0; reason="pixel format is $src_pix (need 10-bit for $HDR_TARGET_PIXFMT)"
-    fi
-  fi
-
-  # Check audio: if lossless passthrough is off, check audio codecs are Direct Play compatible
+  # ---- Audio compliance (skip-if-ideal only) ----
   if (( ideal )) && (( ! AUDIO_LOSSLESS_PASSTHROUGH )); then
     local n_audio a_codec
     n_audio="$(_audio_stream_count)"
@@ -2779,16 +2846,6 @@ check_skip_if_ideal() {
         ideal=0; reason="audio codec is $a_codec (need $AUDIO_FORCE_CODEC)"
       elif ! audio_is_direct_play_copyable "$a_codec"; then
         ideal=0; reason="audio codec $a_codec not Direct Play compatible"
-      fi
-    fi
-  fi
-
-  # Check DV compliance for atv-directplay-hq
-  if (( ideal )) && [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
-    if detect_dv; then
-      # DV present — check if it's Profile 8 (acceptable) or something else
-      if [[ "${DV_SRC_PROFILE:-}" != "8" ]]; then
-        ideal=0; reason="DV present but not Profile 8 (P${DV_SRC_PROFILE:-?}, needs conversion)"
       fi
     fi
   fi
@@ -2814,8 +2871,8 @@ check_skip_if_ideal() {
 _probe_field(){
   local field="$1"
   if [[ -n "${METADATA_CACHE:-}" ]]; then
-    printf '%s\n' "$METADATA_CACHE" | jq -r \
-      "[.streams[] | select(.codec_type==\"video\")] | .[0].$field // empty" 2>/dev/null | head -n1 || true
+    _jq_cache -r \
+      "[.streams[] | select(.codec_type==\"video\")] | .[0].$field // empty" | head -n1 || true
   else
     # Pre-cache fallback (should only occur if called before cache_stream_metadata)
     ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$field" \
@@ -2827,15 +2884,29 @@ _probe_field(){
 # Args: $1 — stream type (e.g., "audio", "video", "subtitle")
 # Globals: METADATA_CACHE (read)
 _has_stream(){
-  printf '%s\n' "$METADATA_CACHE" | jq -e "[.streams[] | select(.codec_type==\"$1\")] | length > 0" >/dev/null 2>&1
+  _jq_cache -e "[.streams[] | select(.codec_type==\"$1\")] | length > 0" >/dev/null
 }
 
-# ===== Section 16: Color space & pixel format decision =========================================
+# ===== Section 22: Color space & pixel format decision ========================================
 declare -i IS_DV=0
 PROFILE_DESC="SDR"
 TARGET_PIXFMT="yuv420p"
 COLOR_ARGS=()
 
+# decide_color_and_pixfmt — Analyze source color metadata and set output targets.
+#
+# Reads color_primaries, color_transfer, color_space, and pix_fmt from the
+# source video stream and determines the output color profile and pixel format.
+#
+# Decision tree:
+#   TONEMAP_HDR_TO_SDR + HDR source → SDR-TONEMAP (force bt709, yuv420p)
+#   arib-std-b67/HLG transfer        → HLG (bt2020, HDR_TARGET_PIXFMT)
+#   bt2020/smpte2084                  → HDR10 (bt2020, HDR_TARGET_PIXFMT)
+#   everything else                   → SDR (bt709, 10-bit if source is 10-bit)
+#
+# Sets globals: PROFILE_DESC, TARGET_PIXFMT, COLOR_ARGS[]
+# Reads globals: METADATA_CACHE, TONEMAP_HDR_TO_SDR, HDR_TARGET_PIXFMT,
+#                FORCE_CHROMA_420, SDR_USE_10BIT_IF_SRC_10BIT
 decide_color_and_pixfmt() {
   local pix prim trc cspace
   pix="$(_probe_field pix_fmt)"
@@ -2898,7 +2969,13 @@ decide_color_and_pixfmt() {
   note "Color profile: $PROFILE_DESC, Target pixel format: $TARGET_PIXFMT"
 }
 
-# ===== Section 17: x265 params & Level/VBV guardrails =========================================
+# ===== Section 23: x265 params & Level/VBV guardrails ========================================
+# Build the final X265_PARAMS string from X265_PARAMS_BASE.
+# Adds or strips HDR-specific x265 parameters based on the detected color profile:
+#   - Non-HDR10: removes :hdr-opt=1
+#   - HDR10: appends hdr10=1, colorprim, transfer, colormatrix, range
+# Sets: X265_PARAMS (global)
+# Reads: X265_PARAMS_BASE, PROFILE_DESC
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
@@ -2933,7 +3010,18 @@ apply_level_vbv() {
   fi
 }
 
-# ===== Section 18: Dolby Vision detection ======================================================
+# ===== Section 24: Dolby Vision detection =====================================================
+# detect_dv — Check if source contains Dolby Vision metadata.
+#
+# Two-pass detection:
+#   1. Stream-level probe: checks codec tags, side data, and FourCC codes
+#      (dvhe, dvh1, com.dolby.vision) in the first video stream.
+#   2. Frame-level probe: reads the first 5 frames looking for DOVI/dolby
+#      metadata in frame side data (catches cases where container metadata
+#      is missing but RPU NAL units are present).
+#
+# Returns: 0 if DV detected, 1 otherwise.
+# Globals: DISABLE_DV (read), FFPROBE_FLAGS (read), SRC_ABS (read)
 detect_dv() {
   (( DISABLE_DV )) && return 1
   
@@ -2965,9 +3053,9 @@ detect_dv_info() {
   # Try JSON metadata cache first (structured side_data_list)
   if [[ -n "${METADATA_CACHE:-}" ]]; then
     local side_data
-    side_data="$(printf '%s\n' "$METADATA_CACHE" | jq -r '
+    side_data="$(_jq_cache -r '
       [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]? |
-      select(.side_data_type == "DOVI configuration record")' 2>/dev/null)" || true
+      select(.side_data_type == "DOVI configuration record")')" || true
 
     if [[ -n "$side_data" ]]; then
       DV_SRC_PROFILE="$(printf '%s\n' "$side_data" | jq -r '.dv_profile // empty' 2>/dev/null)" || true
@@ -3144,8 +3232,8 @@ _check_hdr10_static_metadata() {
 
   # Check JSON metadata cache for mastering display and content light level
   if [[ -n "${METADATA_CACHE:-}" ]]; then
-    side_data="$(printf '%s\n' "$METADATA_CACHE" | jq -r '
-      [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]?.side_data_type // empty' 2>/dev/null)" || true
+    side_data="$(_jq_cache -r '
+      [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]?.side_data_type // empty')" || true
 
     printf '%s\n' "$side_data" | grep -qiE 'mastering.display' && has_mastering=1
     printf '%s\n' "$side_data" | grep -qiE 'content.light.level' && has_cll=1
@@ -3177,7 +3265,7 @@ _check_hdr10_static_metadata() {
   fi
 }
 
-# ===== Section 19: Temp paths ==================================================================
+# ===== Section 25: Temp paths =================================================================
 V_SRC_ES="$WORKDIR/video_src.es"
 RPU_P7="$WORKDIR/rpu_p7.bin"
 RPU_P81="$WORKDIR/rpu_p81.bin"
@@ -3204,9 +3292,14 @@ A_PRIMARY=""
 AAC_STEREO=""
 declare -i HAS_AUDIO=0
 
-# ===== Section 20: Video pipeline ==============================================================
+# ===== Section 26: Video pipeline =============================================================
 
-# Check if source video is compliant for copy (no re-encode needed)
+# Check if source video can be stream-copied (no re-encode) for the target profile.
+# Tests: codec match (hevc/h264), pixel format (10-bit for HDR), tone-map requirement,
+#        DV profile compatibility (atv-directplay-hq requires P8 for copy).
+# Returns: 0 if copy-compliant, 1 if re-encode required.
+# Globals: VIDEO_CODEC, TARGET_PIXFMT, TONEMAP_HDR_TO_SDR, PROFILE_DESC,
+#          IS_DV, DISABLE_DV, PROFILE_NAME, DV_SRC_PROFILE (read)
 _video_is_copy_compliant() {
   local src_codec src_pix
   src_codec="$(_lower "$(_probe_field codec_name)")"
@@ -3244,6 +3337,20 @@ _video_is_copy_compliant() {
   return 0
 }
 
+# run_video_pipeline — Encode or copy the video stream, with DV handling.
+#
+# High-level flow:
+#   1. Check copy-if-compliant → skip encode if source matches target profile
+#   2. Determine intermediate format (raw ES for DV injection, MKV otherwise)
+#   3. Demux raw HEVC ES from source (for DV RPU extraction, if applicable)
+#   4. Encode video with filters (tone-map, forced sub burn-in)
+#   5. Extract DV RPU from source (piped method → file fallback)
+#   6. Convert RPU profile if needed (P7/P5 → P8.1)
+#   7. Inject RPU into encoded video via dovi_tool
+#   8. Pre-wrap DV video into MP4 with dvcC box (mp4box → ffmpeg fallback)
+#
+# Sets: V_BASE, V_MIXED, V_DV_MP4, VIDEO_COPY_FROM_SOURCE, OUTPUT_HAS_DV
+# Dies on: encode failure, DV failure with fallback disabled
 run_video_pipeline() {
   # Check copy-if-compliant first
   if (( VIDEO_COPY_IF_COMPLIANT )); then
@@ -3775,12 +3882,12 @@ run_video_pipeline() {
   mark_done "DV inject (profile-aware)"
 }
 
-# ===== Section 21: Audio selection & pipeline ==================================================
+# ===== Section 27: Audio selection & pipeline =================================================
 # Count audio streams in source file
 # Returns: Integer count (0 if none)
 # Globals: METADATA_CACHE
 _audio_stream_count(){
-  printf '%s\n' "$METADATA_CACHE" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null || echo 0
+  _jq_cache '[.streams[] | select(.codec_type=="audio")] | length' || echo 0
 }
 
 # Get audio field from cached metadata (single jq call)
@@ -3789,8 +3896,8 @@ _audio_stream_count(){
 # Globals: METADATA_CACHE (read)
 _audio_field(){
   local idx="$1" field="$2"
-  printf '%s\n' "$METADATA_CACHE" | jq -r \
-    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].$field // empty" 2>/dev/null | head -n1 || true
+  _jq_cache -r \
+    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].$field // empty" | head -n1 || true
 }
 
 # Get audio tag from cached metadata (single jq call)
@@ -3798,10 +3905,12 @@ _audio_field(){
 # Globals: METADATA_CACHE (read)
 _audio_tag(){
   local idx="$1" tag="$2"
-  printf '%s\n' "$METADATA_CACHE" | jq -r \
-    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].tags.$tag // empty" 2>/dev/null | head -n1 || true
+  _jq_cache -r \
+    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].tags.$tag // empty" | head -n1 || true
 }
 
+# Return language tag for audio stream (lowercased), defaulting to TAG_LANGUAGE_DEFAULT.
+# Args: $1 — audio stream index
 _audio_lang(){
   local lang
   lang="$(_lower "$(_audio_tag "$1" language)")"
@@ -3809,6 +3918,8 @@ _audio_lang(){
   echo "$lang"
 }
 
+# Return channel count for audio stream (0 if unavailable).
+# Args: $1 — audio stream index
 _audio_channels(){
   local ch
   ch="$(_audio_field "$1" channels)"
@@ -3816,6 +3927,8 @@ _audio_channels(){
   echo "$ch"
 }
 
+# Return bit_rate for audio stream in bps (0 if unavailable).
+# Args: $1 — audio stream index
 _audio_bitrate(){
   local br
   br="$(_audio_field "$1" bit_rate)"
@@ -3823,6 +3936,8 @@ _audio_bitrate(){
   echo "$br"
 }
 
+# Return codec_name for audio stream (lowercased, "unknown" if unavailable).
+# Args: $1 — audio stream index
 _audio_codec(){
   local c
   c="$(_lower "$(_audio_field "$1" codec_name)")"
@@ -3830,11 +3945,16 @@ _audio_codec(){
   echo "$c"
 }
 
+# Return title tag for audio stream (empty string if unset).
+# Args: $1 — audio stream index
 _audio_title(){
   _audio_tag "$1" title
 }
 
-# Calculate codec preference rank (lower is better)
+# Return ordinal position of codec in AUDIO_CODEC_PREFERENCE list (0 = best).
+# Returns 99 if codec is not in the list (treated as lowest preference).
+# Args: $1 — codec name (lowercased)
+# Globals: AUDIO_CODEC_PREFERENCE (read)
 _audio_codec_rank(){
   local codec="$1" list="$AUDIO_CODEC_PREFERENCE" item i=0
   IFS=',' read -r -a arr <<<"$list"
@@ -3846,6 +3966,17 @@ _audio_codec_rank(){
     i=$(( i + 1 ))
   done
   echo "99"
+}
+
+# _audio_stream_info — Fetch all scoring-relevant fields for one audio stream
+# in a single jq call (replaces 5 separate jq forks per stream).
+# Returns: codec|channels|language|bit_rate|title  (pipe-delimited)
+# Args: $1 — audio stream index (0-based, relative to audio streams)
+# Globals: METADATA_CACHE (read)
+_audio_stream_info(){
+  local idx="$1"
+  _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
+    \"\(.codec_name // \"unknown\")|\(.channels // 0)|\(.tags.language // \"\")|\(.bit_rate // \"0\")|\(.tags.title // \"\")\"" | head -n1 || echo "unknown|0||0|"
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -3865,13 +3996,19 @@ _audio_codec_rank(){
 # Returns: score|idx|codec|channels|lang|title
 _score_audio_stream(){
   local idx="$1"
-  local codec lang ch br rank score title
-  codec="$(_audio_codec "$idx")"
-  lang="$(_audio_lang "$idx")"
-  ch="$(_audio_channels "$idx")"
-  br="$(_audio_bitrate "$idx")"
+
+  # Single jq call fetches all fields at once
+  local info codec lang ch br title rank score
+  info="$(_audio_stream_info "$idx")"
+  IFS='|' read -r codec ch lang br title <<< "$info"
+
+  codec="$(_lower "$codec")"
+  lang="$(_lower "$lang")"
+  [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+  [[ -z "$ch" || ! "$ch" =~ ^[0-9]+$ ]] && ch=0
+  [[ -z "$br" || ! "$br" =~ ^[0-9]+$ ]] && br=0
+
   rank="$(_audio_codec_rank "$codec")"
-  title="$(_audio_title "$idx")"
 
   score=0
   # Channel count matters most
@@ -3888,7 +4025,7 @@ _score_audio_stream(){
   score=$(( score + inv ))
 
   # Bitrate small tie-breaker (scaled)
-  if [[ "$br" =~ ^[0-9]+$ ]] && (( br > 0 )); then
+  if (( br > 0 )); then
     score=$(( score + (br / 50000) ))
   fi
 
@@ -3896,6 +4033,14 @@ _score_audio_stream(){
 }
 
 # Select best audio track based on scoring algorithm
+# select_best_audio — Pick the best audio track using the scoring algorithm.
+#
+# Respects AUDIO_TRACK_OVERRIDE if set (with bounds validation).
+# Otherwise, scores all audio streams via _score_audio_stream and returns
+# the 0-based audio-relative index of the highest-scoring track.
+#
+# Returns: audio stream index on stdout ("" if no audio streams exist).
+# Globals: AUDIO_TRACK_OVERRIDE (read), METADATA_CACHE (read)
 select_best_audio(){
   local n i best_line best_score=-999999
   n="$(_audio_stream_count)"
@@ -3976,6 +4121,19 @@ audio_transcode_target(){
   fi
 }
 
+# run_audio_pipeline — Select, copy or transcode the best audio track.
+#
+# Decision tree:
+#   1. AUDIO_FORCE_CODEC set   → transcode to that codec (or copy if already matching)
+#   2. AUDIO_LOSSLESS_PASSTHROUGH + lossless codec + container supports it → copy
+#   3. Direct-play-copyable codec (aac, alac, ac3, eac3) → copy
+#   4. Otherwise → transcode to eac3 (surround) or aac (stereo)
+#
+# Optionally creates a stereo AAC fallback track (ADD_STEREO_IF_MULTICH).
+#
+# Sets: A_PRIMARY, AAC_STEREO, HAS_AUDIO, A_PRIMARY_LANG, A_PRIMARY_TITLE,
+#       A_STEREO_LANG
+# Dies on: audio copy/transcode failure (exit 43)
 run_audio_pipeline(){
   # shellcheck disable=SC2034
   local n best idx codec ch lang br title
@@ -3999,16 +4157,17 @@ run_audio_pipeline(){
   log "• Detected audio streams:"
   local i
   for (( i=0; i<n; i++ )); do
-    local c ch_i l t br_i pretty
-    c="$(_audio_codec "$i")"
-    ch_i="$(_audio_channels "$i")"
-    l="$(_audio_lang "$i")"
-    t="$(_audio_title "$i")"
-    br_i="$(_audio_bitrate "$i")"
+    local _ainfo _c _ch_i _l _br_i _t pretty
+    _ainfo="$(_audio_stream_info "$i")"
+    IFS='|' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
+    _c="$(_lower "$_c")"
+    _l="$(_lower "$_l")"
+    [[ -z "$_l" ]] && _l="$TAG_LANGUAGE_DEFAULT"
+    [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
     
-    pretty="#$i: $c ${ch_i}ch [$l]"
-    [[ -n "$t" ]] && pretty="$pretty — $t"
-    [[ "$br_i" =~ ^[0-9]+$ ]] && (( br_i > 0 )) && pretty="$pretty, $((br_i/1000))kbps"
+    pretty="#$i: $_c ${_ch_i}ch [$_l]"
+    [[ -n "$_t" ]] && pretty="$pretty — $_t"
+    (( _br_i > 0 )) && pretty="$pretty, $((_br_i/1000))kbps"
     log "  $pretty"
   done
 
@@ -4161,13 +4320,14 @@ run_audio_pipeline(){
   fi
 }
 
-# ===== Section 22: Subtitle helpers (planner + OCR) ===========================================
+# ===== Section 28: Subtitle helpers (planner + OCR) ==========================================
 # Count subtitle streams in source file
 _sub_count() {
-  printf '%s\n' "$METADATA_CACHE" | jq '[.streams[] | select(.codec_type=="subtitle")] | length' 2>/dev/null || echo 0
+  _jq_cache '[.streams[] | select(.codec_type=="subtitle")] | length' || echo 0
 }
 
-# List all subtitle stream indices
+# Emit integers 0..N-1 (one per line) for iterating all subtitle stream indices.
+# Provides a standard loop target: for i in $(list_sub_indices); do ...
 list_sub_indices(){
   local n i
   n="$(_sub_count)"
@@ -4180,8 +4340,8 @@ list_sub_indices(){
 # Globals: METADATA_CACHE (read)
 _sp_sub_field() {
   local idx="$1" field="$2"
-  printf '%s\n' "$METADATA_CACHE" | jq -r \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].$field // empty" 2>/dev/null | head -n1 || true
+  _jq_cache -r \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].$field // empty" | head -n1 || true
 }
 
 # Get subtitle tag from cached metadata (single jq call)
@@ -4189,8 +4349,8 @@ _sp_sub_field() {
 # Globals: METADATA_CACHE (read)
 _sp_sub_tag() {
   local idx="$1" tag="$2"
-  printf '%s\n' "$METADATA_CACHE" | jq -r \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].tags.$tag // empty" 2>/dev/null | head -n1 || true
+  _jq_cache -r \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].tags.$tag // empty" | head -n1 || true
 }
 
 # Check if subtitle stream has forced disposition (single jq call)
@@ -4199,10 +4359,12 @@ _sp_sub_tag() {
 # Globals: METADATA_CACHE (read)
 _sp_sub_dispo_forced(){
   local idx="$1"
-  printf '%s\n' "$METADATA_CACHE" | jq \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].disposition.forced // 0" 2>/dev/null | head -n1 || echo 0
+  _jq_cache \
+    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].disposition.forced // 0" | head -n1 || echo 0
 }
 
+# Return language tag for subtitle stream (lowercased), defaulting to TAG_LANGUAGE_DEFAULT.
+# Args: $1 — subtitle stream index
 _sp_sub_lang(){
   local lang
   lang="$(_lower "$(_sp_sub_tag "$1" language)")"
@@ -4210,25 +4372,48 @@ _sp_sub_lang(){
   echo "$lang"
 }
 
+# Heuristic: check if a subtitle title string indicates forced/signs content.
+# Matches: "forced", "signs", "foreign" (case-insensitive).
+# Args: $1 — title string to test
+# Returns: 0 if match, 1 otherwise
 _is_forced_title(){
   local t
   t="$(_lower "$1")"
   [[ "$t" =~ forced|signs|foreign ]]
 }
 
+# Heuristic: check if a subtitle title string indicates SDH/HI content.
+# Matches: "sdh", "hi", "hearing", "impaired", "cc", "caption" as whole words.
+# Args: $1 — title string to test
+# Returns: 0 if match, 1 otherwise
 _is_sdh_title(){
   local t
   t="$(_lower "$1")"
   [[ "$t" =~ (^|[^a-z])(sdh|hi)([^a-z]|$)|hearing|impaired|cc|caption ]]
 }
 
-# Describe subtitle stream for user
+# _sub_stream_info — Fetch all scan-relevant fields for one subtitle stream
+# in a single jq call (replaces 3–4 separate jq forks per stream).
+# Returns: codec|language|title|forced  (pipe-delimited)
+# Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
+# Globals: METADATA_CACHE (read)
+_sub_stream_info(){
+  local idx="$1"
+  _jq_cache -r "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx] |
+    \"\(.codec_name // \"?\")|\(.tags.language // \"\")|\(.tags.title // \"\")|\(.disposition.forced // 0)\"" | head -n1 || echo "?|||0"
+}
+
+# Format a subtitle stream as a human-readable one-line summary.
+# Output: "#0: subrip [eng] — English (forced)" (prints to stdout)
+# Args: $1 — subtitle stream index
 describe_sub_stream(){
-  local i="$1" codec lang title forced flags=""
-  codec="$(_lower "$(_sp_sub_field "$i" codec_name)")"
-  lang="$(_sp_sub_lang "$i")"
-  title="$(_sp_sub_tag "$i" title)"
-  forced="$(_sp_sub_dispo_forced "$i")"
+  local i="$1" info codec lang title forced flags=""
+  info="$(_sub_stream_info "$i")"
+  IFS='|' read -r codec lang title forced <<< "$info"
+
+  codec="$(_lower "$codec")"
+  lang="$(_lower "$lang")"
+  [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
   
   (( forced )) && flags=" (forced)"
   if _is_sdh_title "$title"; then
@@ -4239,6 +4424,10 @@ describe_sub_stream(){
   printf "#%s: %s [%s]%s%s\n" "$i" "${codec:-?}" "$lang" "${title:+ — $title}" "$flags"
 }
 
+# Check if codec is text-based (can be stream-copied to MP4 as mov_text or MKV as srt).
+# Text: subrip, srt, ass, ssa, webvtt, vtt, mov_text
+# Bitmap (not text): hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle
+# Args: $1 — codec name
 _is_text_sub_codec(){
   local c="$1"
   case "$c" in
@@ -4247,6 +4436,9 @@ _is_text_sub_codec(){
   esac
 }
 
+# Find the first text-based subtitle in a preferred language for direct stream copy.
+# Returns: relative subtitle index on stdout (empty string if none found).
+# Used as a fast path when no OCR or conversion is needed.
 _pick_direct_text_sub_relidx(){
   local i lang codec
   # shellcheck disable=SC2046  # Intentional word-splitting of integer list
@@ -4441,6 +4633,21 @@ _export_or_embed_sub(){
   fi
 }
 
+# build_subtitle_plan — Scan, categorize, and prepare subtitle tracks.
+#
+# Scans all subtitle streams for language/forced/SDH classification, selects
+# the best candidates (up to SUB_MAX_TRACKS), and prepares them as SRT files
+# via extraction, conversion, or OCR. Routes forced subtitles to either the
+# burn-in path (SRT_FORCED_BURN_PATH) or embed path (SRT_FORCED) based on
+# SUB_BURN_FORCED. Non-forced subtitles are either embedded or exported as
+# external .srt files based on SUB_EXPORT_EXTERNAL.
+#
+# Falls back to direct-mapping a text subtitle from source if no SRTs were
+# prepared and at least one SUB_INCLUDE_* flag is enabled.
+#
+# Sets: SRT_FORCED, SRT_FULL, SRT_SDH, SRT_FORCED_BURN_PATH, SRT_DIRECT_MAP,
+#       DIRECT_SUB_RELIDX, EXTERNAL_SRT_PATHS[], and associated *_LANG/*_TITLE vars
+# Globals: METADATA_CACHE (read), SUB_* config vars (read)
 # Build subtitle processing plan
 build_subtitle_plan(){
   if (( SKIP_SUBS )); then
@@ -4465,14 +4672,17 @@ build_subtitle_plan(){
   local forced_idx="" full_idx="" sdh_idx=""
   local lang title forced is_sdh
 
-  # Find best subtitle candidates
+  # Find best subtitle candidates (single jq call per stream via _sub_stream_info)
   # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
-    lang="$(_sp_sub_lang "$i")"
+    local _sinfo _scodec
+    _sinfo="$(_sub_stream_info "$i")"
+    IFS='|' read -r _scodec lang title forced <<< "$_sinfo"
+    lang="$(_lower "$lang")"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
     [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
 
-    title="$(_sp_sub_tag "$i" title)"
-    forced="$(_sp_sub_dispo_forced "$i")"
     if _is_sdh_title "$title"; then is_sdh=1; else is_sdh=0; fi
 
     # Categorize subtitle
@@ -4557,10 +4767,25 @@ build_subtitle_plan(){
   fi
 }
 
-# ===== Section 23: Final mux ===================================================================
+# ===== Section 29: Final mux ==================================================================
 # Assemble all prepared streams (video, primary audio, stereo fallback, subtitles)
 # into the target container format. Handles stream mapping, codec assignment,
 # chapter/metadata policy, and validates the muxed output.
+# mux_final — Assemble all prepared streams into the final output container.
+#
+# Combines video (from source copy, DV pre-wrap MP4, or encoded ES/MKV),
+# primary audio, optional stereo fallback, and subtitle tracks into a single
+# MP4/MOV/MKV file. Handles:
+#   - Stream mapping with correct input indices
+#   - Codec assignment (copy for A/V, mov_text/srt for subs)
+#   - Language/title/disposition metadata tagging per stream
+#   - DV container signaling (-strict unofficial, -tag:v dvh1)
+#   - Chapter and metadata stripping policies
+#   - MP4 faststart optimization
+#   - Post-mux validation via ffprobe
+#
+# Dies on: missing video stream, ffmpeg mux failure, corrupt output.
+# Globals: numerous — see individual stream sections below.
 mux_final() {
   log "→ Muxing final ${OUTPUT_EXT^^} with ffmpeg → $TMP_OUT"
 
@@ -4774,7 +4999,7 @@ mux_final() {
   mark_done "Mux final ${OUTPUT_EXT}"
 }
 
-# ===== Section 24: Main =========================================================================
+# ===== Section 30: Main =======================================================================
 main() {
   say "=== ${APP_NAME} v${VERSION} — CLI: ${CLI_NAME}"
   say "=== Input      : $SRC_ABS"
@@ -4904,31 +5129,36 @@ main() {
     local verify_json
     verify_json="$(ffprobe -v error -show_streams -of json "$TMP_OUT" 2>/dev/null)" || true
     if [[ -n "${verify_json:-}" ]]; then
-      local v_codec v_res v_fps s_count
-      v_codec="$(printf '%s\n' "$verify_json" | jq -r '[.streams[] | select(.codec_type=="video")][0] | "\(.codec_name // "?") \(.profile // "")" ' 2>/dev/null | sed 's/ $//')"
-      v_res="$(printf '%s\n' "$verify_json" | jq -r '[.streams[] | select(.codec_type=="video")][0] | "\(.width)x\(.height)"' 2>/dev/null)"
-      v_fps="$(printf '%s\n' "$verify_json" | jq -r '[.streams[] | select(.codec_type=="video")][0] | .r_frame_rate' 2>/dev/null)"
+      # Batch: fetch all video summary fields in a single jq call
+      local v_codec v_res v_fps s_count _v_summary
+      _v_summary="$(printf '%s\n' "$verify_json" | jq -r '
+        ([.streams[] | select(.codec_type=="video")][0] |
+          "\(.codec_name // "?") \(.profile // "")"
+          + "|" + "\(.width)x\(.height)"
+          + "|" + (.r_frame_rate // "?"))
+        + "|" + ([.streams[] | select(.codec_type=="subtitle")] | length | tostring)' 2>/dev/null)"
+      IFS='|' read -r v_codec v_res v_fps s_count <<< "$_v_summary"
+      v_codec="${v_codec% }"
       # Convert fractional fps like 24000/1001 to decimal
       if [[ "$v_fps" == */* ]]; then
         v_fps="$(echo "scale=3; $v_fps" | bc 2>/dev/null | sed 's/0*$//' | sed 's/\.$//')"
       fi
-      s_count="$(printf '%s\n' "$verify_json" | jq '[.streams[] | select(.codec_type=="subtitle")] | length' 2>/dev/null)"
 
       say "  Video : ${v_codec:-?} ${v_res:-?} @ ${v_fps:-?} fps"
 
       # Audio: rich per-track metadata (codec, channels, language, bitrate, title)
+      # Single jq call extracts all fields per track as pipe-delimited lines.
       local a_track_count
       a_track_count="$(printf '%s\n' "$verify_json" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null)"
       if [[ "${a_track_count:-0}" != "0" ]]; then
         local a_idx=0
         while (( a_idx < a_track_count )); do
-          local a_codec a_ch a_lang a_br a_title a_layout a_line a_ch_label
-          a_codec="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].codec_name // \"?\"" 2>/dev/null)"
-          a_ch="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].channels // 0" 2>/dev/null)"
-          a_lang="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].tags.language // \"und\"" 2>/dev/null)"
-          a_br="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].bit_rate // empty" 2>/dev/null)"
-          a_title="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].tags.title // empty" 2>/dev/null)"
-          a_layout="$(printf '%s\n' "$verify_json" | jq -r "[.streams[] | select(.codec_type==\"audio\")][$a_idx].channel_layout // empty" 2>/dev/null)"
+          local a_codec a_ch a_lang a_br a_title a_layout a_line a_ch_label _vinfo
+          # Batch: fetch all audio fields in one jq call per track
+          _vinfo="$(printf '%s\n' "$verify_json" | jq -r "
+            [.streams[] | select(.codec_type==\"audio\")][$a_idx] |
+            \"\(.codec_name // \"?\")|\(.channels // 0)|\(.tags.language // \"und\")|\(.bit_rate // \"\")|\(.tags.title // \"\")|\(.channel_layout // \"\")\"" 2>/dev/null)"
+          IFS='|' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_vinfo"
 
           # Descriptive channel label
           case "${a_ch:-0}" in
