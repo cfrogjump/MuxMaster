@@ -1,6 +1,6 @@
 # ![muxm](./assets/muxm_header_small.png) MuxMaster
 
-![Version](https://img.shields.io/badge/version-0.12.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-freeware-green)
+![Version](https://img.shields.io/badge/version-1.0.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-freeware-green)
 
 **MuxMaster** (`muxm`) — a single-command video repacking and encoding utility that handles Dolby Vision, HDR10, audio track selection, subtitle processing, and container muxing so you don't have to. Pick a profile, point it at a file, and get a properly encoded output without memorizing ffmpeg flags.
 
