@@ -630,6 +630,52 @@ EOF
   out="$(cd "$cfg_var_dir" && "$MUXM" --print-effective-config 2>&1)" || true
   assert_contains "CRF_VALUE                 = 14" "Config file CRF_VALUE override" "$out"
   assert_contains "PRESET_VALUE              = slower" "Config file PRESET_VALUE override" "$out"
+
+  # ---- Phase 5: Multi-layer config precedence (R39–R42) ----
+  # Tests the full three-layer stack: user (~/.muxmrc) + project (./.muxmrc) + CLI.
+  # Previous tests only cover single-layer project config or CLI overrides independently.
+
+  local layer_home="$TESTDIR/config_layer_home"
+  local layer_proj="$TESTDIR/config_layer_project"
+  mkdir -p "$layer_home" "$layer_proj"
+
+  # User-level config: CRF=22, PRESET=slow
+  cat > "$layer_home/.muxmrc" <<'USEREOF'
+CRF_VALUE=22
+PRESET_VALUE="slow"
+USEREOF
+
+  # Project-level config: CRF=18 (overrides user), no PRESET (inherits user)
+  cat > "$layer_proj/.muxmrc" <<'PROJEOF'
+CRF_VALUE=18
+PROJEOF
+
+  # R39: Project config overrides user config for CRF; user PRESET preserved
+  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --print-effective-config 2>&1)" || true
+  assert_contains "CRF_VALUE                 = 18" "Config layering: project CRF overrides user CRF" "$out"
+  assert_contains "PRESET_VALUE              = slow" "Config layering: user PRESET preserved when project doesn't set it" "$out"
+
+  # R40: CLI overrides project config
+  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --crf 25 --print-effective-config 2>&1)" || true
+  assert_contains "CRF_VALUE                 = 25" "Config layering: CLI --crf overrides project CRF" "$out"
+
+  # R41: Full stack — CLI wins over both user and project for CRF;
+  #      user PRESET still preserved (not overridden by project or CLI)
+  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --crf 30 --print-effective-config 2>&1)" || true
+  assert_contains "CRF_VALUE                 = 30" "Config layering: CLI wins full stack (user+project+CLI)" "$out"
+  assert_contains "PRESET_VALUE              = slow" "Config layering: user PRESET survives full stack" "$out"
+
+  # R42: Profile in user config, overridden by CLI --profile
+  cat > "$layer_home/.muxmrc" <<'PROFEOF'
+PROFILE_NAME="animation"
+PROFEOF
+  # Without CLI override — user profile should be active
+  out="$(cd "$TESTDIR" && HOME="$layer_home" "$MUXM" --print-effective-config 2>&1)" || true
+  assert_contains "animation" "Config layering: user config PROFILE_NAME loaded" "$out"
+
+  # With CLI override — CLI profile wins
+  out="$(cd "$TESTDIR" && HOME="$layer_home" "$MUXM" --profile streaming --print-effective-config 2>&1)" || true
+  assert_contains "streaming" "Config layering: CLI --profile overrides user config PROFILE_NAME" "$out"
 }
 
 # === Suite: Profile Variable Assignment ===
