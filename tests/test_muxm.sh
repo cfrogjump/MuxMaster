@@ -23,6 +23,9 @@ FAIL=0
 SKIP=0
 ERRORS=()
 
+# muxm exits 11 for validation/usage errors (bad flags, missing files, invalid values, etc.)
+readonly EXIT_VALIDATION=11
+
 # ---- Colors ----
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
@@ -49,9 +52,13 @@ fail() { FAIL=$((FAIL + 1)); ERRORS+=("$*"); printf "%b  ❌ FAIL: %s%b\n" "$RED
 skip() { SKIP=$((SKIP + 1)); printf "%b  ⏭  SKIP: %s%b\n" "$YELLOW" "$*" "$NC"; }
 section() { printf "\n%b━━━ %s ━━━%b\n" "$BOLD" "$*" "$NC"; }
 
-# Run muxm from TESTDIR to avoid picking up .muxmrc from the user's PWD
+# Run muxm from TESTDIR to avoid picking up .muxmrc from the user's PWD.
+# The trailing `|| true` prevents set -e from aborting when muxm returns non-zero
+# (which is expected in many test cases).
 run_muxm() { (cd "$TESTDIR" && "$MUXM" "$@" 2>&1) || true; }
-# Assert exit code
+# Assert exit code.
+# The `&& code=$? || code=$?` idiom captures the exit code regardless of success
+# or failure without triggering set -e.  $? is 0 on the && branch, non-zero on ||.
 assert_exit() {
   local expected="$1" label="$2"
   shift 2
@@ -86,22 +93,95 @@ assert_no_file() {
   fi
 }
 
-# Probe a video field from output file (returns value via stdout)
+# Probe a video field from output file (returns value via stdout).
+# head -1: ffprobe may return multiple lines for multi-segment files.
+# tr -d ',': ffprobe's csv output can include trailing commas in multi-value fields.
 probe_video() {
   local file="$1" field="$2"
   ffprobe -v error -select_streams v:0 -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
 }
 
-# Probe an audio field from output file
+# Probe an audio field from output file (stream index defaults to a:0).
+# Same head -1 | tr -d ',' rationale as probe_video above.
 probe_audio() {
   local file="$1" field="$2" idx="${3:-0}"
   ffprobe -v error -select_streams "a:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
 }
 
 # Count streams of a given type
+# Note: tr -d ' ' strips padding from BSD wc (macOS compat)
 count_streams() {
   local file="$1" type="$2"
   ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Run muxm and assert the output file exists and is non-empty.
+# Returns 0 on success so callers can gate further assertions:
+#   if assert_encode "label" "$outfile" [muxm flags...] "$source"; then
+#     assert_probe "codec" "$outfile" codec_name hevc
+#   fi
+# The SOURCE file must be the last muxm flag (positional arg convention).
+assert_encode() {
+  local label="$1" outfile="$2"
+  shift 2
+  run_muxm "$@" "$outfile"
+  if [[ -f "$outfile" && -s "$outfile" ]]; then
+    pass "$label"
+    return 0
+  else
+    fail "$label: no output"
+    return 1
+  fi
+}
+
+# Assert a video stream field matches an expected value.
+# Uses probe_video (stream v:0) under the hood.
+# Usage: assert_probe "label" FILE FIELD EXPECTED
+assert_probe() {
+  local label="$1" file="$2" field="$3" expected="$4"
+  local actual
+  actual="$(probe_video "$file" "$field")"
+  if [[ "$actual" == "$expected" ]]; then
+    pass "$label"
+  else
+    fail "$label — expected '$expected', got '$actual'"
+  fi
+}
+
+# Assert a stream count for a given type falls within [MIN, MAX].
+# If MAX is omitted it defaults to 999 (i.e. "at least MIN").
+# Usage: assert_stream_count "label" FILE TYPE MIN [MAX]
+assert_stream_count() {
+  local label="$1" file="$2" type="$3" min="$4" max="${5:-999}"
+  local count
+  count="$(count_streams "$file" "$type")"
+  if [[ "$count" -ge "$min" && "$count" -le "$max" ]]; then
+    pass "$label ($count streams)"
+  else
+    fail "$label — expected $min–$max streams, got $count"
+  fi
+}
+
+# Generate a synthetic 2-second test clip with one lavfi video and one lavfi audio input.
+# Handles the common ffmpeg boilerplate; callers supply only the varying parts.
+# Usage: gen_media OUTFILE COLOR [FREQ] [extra ffmpeg flags...]
+#   OUTFILE  — output path
+#   COLOR    — lavfi color name (blue, red, green, …)
+#   FREQ     — sine frequency in Hz (default 440); must be a bare integer
+# All remaining args are forwarded to ffmpeg between the inputs and the output path.
+gen_media() {
+  local outfile="$1" color="$2"
+  shift 2
+  local freq=440
+  # If next arg is a bare integer, treat it as the sine frequency
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    freq="$1"
+    shift
+  fi
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=${color}:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=${freq}:duration=2" \
+    "$@" "$outfile"
 }
 
 # ---- Preflight ----
@@ -134,57 +214,50 @@ preflight() {
 }
 
 # ---- Generate Synthetic Test Media ----
+# Builds short 2-second clips with various codec/audio/subtitle combinations.
+# Simple fixtures use gen_media(); complex multi-input fixtures use raw ffmpeg.
 generate_test_media() {
   section "Generating Synthetic Test Media"
 
-  # 1) Basic SDR H.264 with stereo AAC and SRT subtitle (2 seconds)
-  log "Creating basic_sdr.mkv (H.264 + AAC stereo + SRT sub)"
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" \
-    -f lavfi -i "sine=frequency=440:duration=2" \
-    -c:v libx264 -preset ultrafast -crf 28 \
-    -c:a aac -b:a 128k -ac 2 \
-    -metadata:s:a:0 language=eng \
-    "$TESTDIR/basic_sdr.mkv"
-  # Add SRT subtitle
+  # 1) Basic SDR H.264 with stereo AAC and SRT subtitle
+  #    Merged into a single ffmpeg call (no intermediate basic_sdr.mkv needed).
+  log "Creating basic_sdr_subs.mkv (H.264 + AAC stereo + SRT sub)"
   cat > "$TESTDIR/test.srt" <<'SRT'
 1
 00:00:00,000 --> 00:00:02,000
 Test subtitle line
 SRT
   ffmpeg -hide_banner -loglevel error -y \
-    -i "$TESTDIR/basic_sdr.mkv" \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
     -i "$TESTDIR/test.srt" \
-    -c copy -c:s srt \
-    -metadata:s:s:0 language=eng \
-    -metadata:s:s:0 title="English" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
     "$TESTDIR/basic_sdr_subs.mkv"
   pass "basic_sdr_subs.mkv created"
 
   # 2) HEVC 10-bit SDR with 5.1 AC3 audio (simulated)
   log "Creating hevc_sdr_51.mkv (HEVC + AC3 5.1)"
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=red:s=320x240:r=24:d=2" \
-    -f lavfi -i "sine=frequency=440:duration=2" \
+  gen_media "$TESTDIR/hevc_sdr_51.mkv" red \
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a ac3 -b:a 384k -ac 6 \
-    -metadata:s:a:0 language=eng \
-    "$TESTDIR/hevc_sdr_51.mkv"
+    -metadata:s:a:0 language=eng
   pass "hevc_sdr_51.mkv created"
 
   # 3) HEVC 10-bit with HDR10-like metadata tags (not real HDR, but tagged)
   log "Creating hevc_hdr10_tagged.mkv (HEVC 10-bit with HDR-like tags)"
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=green:s=320x240:r=24:d=2" \
-    -f lavfi -i "sine=frequency=880:duration=2" \
+  gen_media "$TESTDIR/hevc_hdr10_tagged.mkv" green 880 \
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" \
     -c:a eac3 -b:a 448k -ac 6 \
-    -metadata:s:a:0 language=eng \
-    "$TESTDIR/hevc_hdr10_tagged.mkv"
+    -metadata:s:a:0 language=eng
   pass "hevc_hdr10_tagged.mkv created"
 
   # 4) Multi-audio file (stereo AAC + 5.1 EAC3 + stereo commentary)
+  #    3 audio inputs require explicit maps — raw ffmpeg.
   log "Creating multi_audio.mkv (3 audio tracks)"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "color=c=yellow:s=320x240:r=24:d=2" \
@@ -203,6 +276,7 @@ SRT
   pass "multi_audio.mkv created"
 
   # 5) Multi-subtitle file (forced + full + SDH)
+  #    3 SRT file inputs require explicit maps — raw ffmpeg.
   log "Creating multi_subs.mkv (3 subtitle tracks)"
   cat > "$TESTDIR/forced.srt" <<'SRT'
 1
@@ -237,7 +311,7 @@ SRT
     "$TESTDIR/multi_subs.mkv"
   pass "multi_subs.mkv created"
 
-  # 6) File with chapters
+  # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
   cat > "$TESTDIR/chapters.txt" <<'CHAP'
 ;FFMETADATA1
@@ -266,16 +340,14 @@ CHAP
 
   # 7) Already-compliant MP4 (for skip-if-ideal tests)
   log "Creating compliant.mp4 (HEVC 10-bit + EAC3 in MP4)"
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
-    -f lavfi -i "sine=frequency=440:duration=2" \
+  gen_media "$TESTDIR/compliant.mp4" white \
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -tag:v hvc1 \
     -c:a eac3 -b:a 448k -ac 6 \
-    -metadata:s:a:0 language=eng \
-    "$TESTDIR/compliant.mp4"
+    -metadata:s:a:0 language=eng
   pass "compliant.mp4 created"
 
   # 8) Multi-language audio file (English + Spanish)
+  #    2 audio inputs require explicit maps — raw ffmpeg.
   log "Creating multi_lang_audio.mkv (eng + spa audio)"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "color=c=cyan:s=320x240:r=24:d=2" \
@@ -291,6 +363,7 @@ CHAP
   pass "multi_lang_audio.mkv created"
 
   # 8b) Commentary detection fixture: two 5.1 EAC3 English tracks, one is "Director's Commentary"
+  #     2 audio inputs require explicit maps — raw ffmpeg.
   log "Creating multi_audio_commentary.mkv (feature + commentary)"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "color=c=magenta:s=320x240:r=24:d=2" \
@@ -307,16 +380,13 @@ CHAP
 
   # 9) File with rich metadata (encoder, title, etc.) for strip-metadata tests
   log "Creating rich_metadata.mkv (with extra metadata tags)"
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=gray:s=320x240:r=24:d=2" \
-    -f lavfi -i "sine=frequency=440:duration=2" \
+  gen_media "$TESTDIR/rich_metadata.mkv" gray \
     -c:v libx264 -preset ultrafast -crf 28 \
     -c:a aac -b:a 128k -ac 2 \
     -metadata title="Test Movie Title" \
     -metadata comment="This is a test comment" \
     -metadata encoder="TestEncoder v1.0" \
-    -metadata:s:a:0 language=eng \
-    "$TESTDIR/rich_metadata.mkv"
+    -metadata:s:a:0 language=eng
   pass "rich_metadata.mkv created"
 
   log "All synthetic test media ready in $TESTDIR"
@@ -325,6 +395,9 @@ CHAP
 # ---- Test Suites ----
 
 # === Suite: CLI parsing & help ===
+# Validates --help, --version, no-args usage, and that invalid inputs (bad profile,
+# bad preset, bad codec, bad extension, missing file, too many args, source=output)
+# all produce the correct exit code and error messages.
 test_cli() {
   section "CLI Parsing & Help"
 
@@ -348,22 +421,22 @@ test_cli() {
   assert_exit 0 "No arguments shows usage"
 
   # Invalid profile
-  assert_exit 11 "Invalid profile exits 11" --profile fake "$TESTDIR/basic_sdr_subs.mkv"
+  assert_exit $EXIT_VALIDATION "Invalid profile exits $EXIT_VALIDATION" --profile fake "$TESTDIR/basic_sdr_subs.mkv"
 
   # Invalid preset
-  assert_exit 11 "Invalid preset exits 11" --preset fake "$TESTDIR/basic_sdr_subs.mkv"
+  assert_exit $EXIT_VALIDATION "Invalid preset exits $EXIT_VALIDATION" --preset fake "$TESTDIR/basic_sdr_subs.mkv"
 
   # Invalid video codec
-  assert_exit 11 "Invalid video codec exits 11" --video-codec vp9 "$TESTDIR/basic_sdr_subs.mkv"
+  assert_exit $EXIT_VALIDATION "Invalid video codec exits $EXIT_VALIDATION" --video-codec vp9 "$TESTDIR/basic_sdr_subs.mkv"
 
   # Invalid output extension
-  assert_exit 11 "Invalid output extension exits 11" --output-ext webm "$TESTDIR/basic_sdr_subs.mkv"
+  assert_exit $EXIT_VALIDATION "Invalid output extension exits $EXIT_VALIDATION" --output-ext webm "$TESTDIR/basic_sdr_subs.mkv"
 
   # Missing source file
-  assert_exit 11 "Missing source file exits 11" /nonexistent/file.mkv
+  assert_exit $EXIT_VALIDATION "Missing source file exits $EXIT_VALIDATION" /nonexistent/file.mkv
 
   # Too many positional args
-  assert_exit 11 "Too many args exits 11" a.mkv b.mp4 c.mp4
+  assert_exit $EXIT_VALIDATION "Too many args exits $EXIT_VALIDATION" a.mkv b.mp4 c.mp4
 
   # Source = output prevention
   out="$(cd "$TESTDIR" && "$MUXM" --output-ext mkv "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
@@ -384,6 +457,9 @@ test_cli() {
 }
 
 # === Suite: Config Precedence ===
+# Validates layered configuration: --print-effective-config output, CLI flags overriding
+# profile defaults, project-level .muxmrc loading, --create-config / --force-create-config
+# file generation, and per-variable overrides from config files.
 test_config() {
   section "Configuration Precedence"
 
@@ -474,19 +550,20 @@ EOF
 }
 
 # === Suite: Profile Variable Assignment ===
+# Validates that each built-in profile sets the expected configuration variables
+# (codec, CRF, container, feature flags) via --print-effective-config.
 test_profiles() {
   section "Profile Variable Assignment"
 
   local profiles=("dv-archival" "hdr10-hq" "atv-directplay-hq" "streaming" "animation" "universal")
+  local out
 
   for p in "${profiles[@]}"; do
-    local out
     out="$(run_muxm --profile "$p" --print-effective-config)"
     assert_contains "$p" "Profile $p shows in effective config" "$out"
   done
 
   # dv-archival specifics
-  local out
   out="$(run_muxm --profile dv-archival --print-effective-config)"
   assert_contains "VIDEO_COPY_IF_COMPLIANT   = 1" "dv-archival: video copy enabled" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1" "dv-archival: skip-if-ideal on" "$out"
@@ -527,6 +604,9 @@ test_profiles() {
 }
 
 # === Suite: Conflict Warnings ===
+# Validates that muxm emits ⚠ warnings when CLI flags contradict a profile's intent
+# (e.g., --no-dv with dv-archival, --tonemap with hdr10-hq). All checks use
+# --print-effective-config and look for the ⚠ character in output.
 test_conflicts() {
   section "Conflict Warnings"
 
@@ -610,6 +690,8 @@ test_conflicts() {
 }
 
 # === Suite: Dry-Run Mode ===
+# Validates that --dry-run announces itself, does not create output files, and works
+# correctly in combination with profiles, --skip-audio, --skip-subs, and HDR sources.
 test_dryrun() {
   section "Dry-Run Mode"
 
@@ -638,118 +720,77 @@ test_dryrun() {
 }
 
 # === Suite: Video Pipeline (real encodes) ===
+# Validates core video encoding: default HEVC, explicit libx264, MKV container,
+# custom x265 params, thread count, and copy-if-compliant passthrough.
 test_video() {
   section "Video Pipeline (Real Encodes)"
 
+  local outfile src="$TESTDIR/basic_sdr_subs.mkv"
+
   # Basic SDR encode → MP4
-  local outfile="$TESTDIR/vid_test1.mp4"
+  outfile="$TESTDIR/vid_test1.mp4"
   log "Encoding basic SDR to MP4..."
-  run_muxm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "Basic SDR encode produces output"
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "Output video codec is HEVC"
-    else
-      fail "Expected HEVC, got: $vcodec"
-    fi
-  else
-    fail "Basic SDR encode produced no output"
+  if assert_encode "Basic SDR encode produces output" "$outfile" \
+       --crf 28 --preset ultrafast "$src"; then
+    assert_probe "Output video codec is HEVC" "$outfile" codec_name hevc
   fi
 
   # libx264 encode
   outfile="$TESTDIR/vid_test_x264.mp4"
   log "Encoding with libx264..."
-  run_muxm --video-codec libx264 --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "libx264 encode produces output"
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "h264" ]]; then
-      pass "Output video codec is H.264"
-    else
-      fail "Expected h264, got: $vcodec"
-    fi
-  else
-    fail "libx264 encode produced no output"
+  if assert_encode "libx264 encode produces output" "$outfile" \
+       --video-codec libx264 --crf 28 --preset ultrafast "$src"; then
+    assert_probe "Output video codec is H.264" "$outfile" codec_name h264
   fi
 
   # MKV output
   outfile="$TESTDIR/vid_test_mkv.mkv"
   log "Encoding to MKV container..."
-  run_muxm --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "MKV output produced"
+  if assert_encode "MKV output produced" "$outfile" \
+       --output-ext mkv --crf 28 --preset ultrafast "$src"; then
     local fmt
     fmt="$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$outfile" 2>/dev/null)"
     assert_contains "matroska" "Output is Matroska" "$fmt"
-  else
-    fail "MKV output not produced"
   fi
 
   # --x265-params custom parameter (#21)
   outfile="$TESTDIR/vid_x265_params.mp4"
   log "Encoding with --x265-params..."
-  run_muxm --crf 28 --preset ultrafast --x265-params "aq-mode=3" \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--x265-params: encode succeeded"
-  else
-    fail "--x265-params: no output"
-  fi
+  assert_encode "--x265-params: encode succeeded" "$outfile" \
+    --crf 28 --preset ultrafast --x265-params "aq-mode=3" "$src"
 
   # --threads (#22)
   outfile="$TESTDIR/vid_threads.mp4"
   log "Encoding with --threads 2..."
-  run_muxm --crf 28 --preset ultrafast --threads 2 \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--threads 2: encode succeeded"
-  else
-    fail "--threads 2: no output"
-  fi
+  assert_encode "--threads 2: encode succeeded" "$outfile" \
+    --crf 28 --preset ultrafast --threads 2 "$src"
 
   # --video-copy-if-compliant with HEVC source (#19)
   outfile="$TESTDIR/vid_copy_compliant.mp4"
   log "Testing --video-copy-if-compliant with HEVC source..."
-  run_muxm --video-copy-if-compliant --preset ultrafast \
-    "$TESTDIR/hevc_sdr_51.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--video-copy-if-compliant: output produced"
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "--video-copy-if-compliant: HEVC preserved"
-    else
-      fail "--video-copy-if-compliant: expected hevc, got $vcodec"
-    fi
-  else
-    fail "--video-copy-if-compliant: no output"
+  if assert_encode "--video-copy-if-compliant: output produced" "$outfile" \
+       --video-copy-if-compliant --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv"; then
+    assert_probe "--video-copy-if-compliant: HEVC preserved" "$outfile" codec_name hevc
   fi
 }
 
 # === Suite: HDR Pipeline ===
+# Validates HDR10 encoding preserves color metadata (BT.2020 primaries, SMPTE 2084 transfer).
+# HDR metadata checks are soft (log, not fail) because ffprobe output varies across versions.
 test_hdr() {
   section "HDR Pipeline"
 
   # Encode HDR10-tagged source (uses previously orphaned fixture #1)
   local outfile="$TESTDIR/hdr_encode.mkv"
   log "Encoding hevc_hdr10_tagged.mkv (HDR10 source)..."
-  run_muxm --output-ext mkv --crf 28 --preset ultrafast \
-    "$TESTDIR/hevc_hdr10_tagged.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "HDR10 encode: output produced"
-    local vcodec cp tf
-    vcodec="$(probe_video "$outfile" codec_name)"
+  if assert_encode "HDR10 encode: output produced" "$outfile" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/hevc_hdr10_tagged.mkv"; then
+    assert_probe "HDR10 encode: HEVC codec" "$outfile" codec_name hevc
+
+    # Check HDR metadata preserved (soft — ffprobe reporting varies by version)
+    local cp tf
     cp="$(probe_video "$outfile" color_primaries)"
     tf="$(probe_video "$outfile" color_transfer)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "HDR10 encode: HEVC codec"
-    else
-      fail "HDR10 encode: expected hevc, got $vcodec"
-    fi
-    # Check HDR metadata preserved
     if [[ "$cp" == "bt2020" ]] || [[ "$cp" == *"2020"* ]]; then
       pass "HDR10 encode: BT.2020 color primaries preserved"
     else
@@ -760,8 +801,6 @@ test_hdr() {
     else
       log "HDR10 encode: color_transfer='$tf' (expected smpte2084, may vary)"
     fi
-  else
-    fail "HDR10 encode: no output"
   fi
 
   # --no-tonemap config flag
@@ -771,111 +810,81 @@ test_hdr() {
 }
 
 # === Suite: Audio Pipeline ===
+# Validates audio track selection (scoring algorithm, language preference, manual override),
+# stereo fallback generation, codec forcing, lossless passthrough, and commentary deprioritization.
 test_audio() {
   section "Audio Pipeline"
 
-  # Basic encode — check audio present
-  local outfile="$TESTDIR/audio_test1.mp4"
-  log "Testing audio pipeline..."
-  run_muxm --crf 28 --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local acount
-    acount="$(count_streams "$outfile" a)"
-    if [[ "$acount" -ge 1 ]]; then
-      pass "Audio track present in output ($acount tracks)"
-    else
-      fail "No audio tracks in output"
-    fi
+  local outfile out acount ch acodec alang
 
-    # Check if stereo fallback was added
+  # Basic encode — check audio present + stereo fallback
+  outfile="$TESTDIR/audio_test1.mp4"
+  log "Testing audio pipeline..."
+  if assert_encode "Audio test encode" "$outfile" \
+       --crf 28 --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv"; then
+    assert_stream_count "Audio track present in output" "$outfile" a 1
+    # Soft check: stereo fallback may add a second track
+    acount="$(count_streams "$outfile" a)"
     if [[ "$acount" -ge 2 ]]; then
       pass "Stereo fallback track added"
     else
       log "Only 1 audio track (stereo fallback may not have been needed)"
     fi
-  else
-    fail "Audio test encode produced no output"
   fi
 
   # --no-stereo-fallback
   outfile="$TESTDIR/audio_no_stereo.mp4"
   log "Testing --no-stereo-fallback..."
-  run_muxm --crf 28 --preset ultrafast --no-stereo-fallback \
-    "$TESTDIR/hevc_sdr_51.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local acount
+  if assert_encode "--no-stereo-fallback encode" "$outfile" \
+       --crf 28 --preset ultrafast --no-stereo-fallback "$TESTDIR/hevc_sdr_51.mkv"; then
     acount="$(count_streams "$outfile" a)"
     if [[ "$acount" -eq 1 ]]; then
       pass "--no-stereo-fallback: single audio track"
     else
       log "--no-stereo-fallback: $acount tracks (may vary by source)"
     fi
-  else
-    fail "--no-stereo-fallback encode produced no output"
   fi
 
   # --skip-audio
-  local out
   out="$(run_muxm --dry-run --skip-audio "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "Audio processing disabled" "--skip-audio announced" "$out"
 
   # --- Multi-audio track auto-selection (uses previously orphaned fixture #2) ---
   outfile="$TESTDIR/audio_multi_auto.mp4"
   log "Testing multi-audio auto-selection..."
-  run_muxm --crf 28 --preset ultrafast \
-    "$TESTDIR/multi_audio.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "Multi-audio encode: output produced"
-    local acount
-    acount="$(count_streams "$outfile" a)"
-    if [[ "$acount" -ge 1 ]]; then
-      pass "Multi-audio: audio tracks present ($acount)"
-      # The 5.1 EAC3 should be preferred by the scoring algorithm
-      local ch
-      ch="$(probe_audio "$outfile" channels 0)"
-      if [[ "$ch" -ge 6 ]]; then
-        pass "Multi-audio: primary track is surround (${ch}ch)"
-      else
-        log "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
-      fi
+  if assert_encode "Multi-audio encode: output produced" "$outfile" \
+       --crf 28 --preset ultrafast "$TESTDIR/multi_audio.mkv"; then
+    assert_stream_count "Multi-audio: audio tracks present" "$outfile" a 1
+    # The 5.1 EAC3 should be preferred by the scoring algorithm
+    ch="$(probe_audio "$outfile" channels 0)"
+    if [[ "$ch" -ge 6 ]]; then
+      pass "Multi-audio: primary track is surround (${ch}ch)"
     else
-      fail "Multi-audio: no audio in output"
+      log "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
     fi
-  else
-    fail "Multi-audio encode: no output"
   fi
 
   # --audio-track override (#3, #7)
   outfile="$TESTDIR/audio_track_override.mp4"
   log "Testing --audio-track 0 override..."
-  run_muxm --audio-track 0 --no-stereo-fallback --crf 28 --preset ultrafast \
-    "$TESTDIR/multi_audio.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--audio-track 0: output produced"
-    local acount
-    acount="$(count_streams "$outfile" a)"
-    if [[ "$acount" -ge 1 ]]; then
-      # Track 0 is stereo AAC, so output should have ≤2ch
-      local ch
-      ch="$(probe_audio "$outfile" channels 0)"
-      if [[ "$ch" -le 2 ]]; then
-        pass "--audio-track 0: stereo track selected (${ch}ch)"
-      else
-        log "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
-      fi
+  if assert_encode "--audio-track 0: output produced" "$outfile" \
+       --audio-track 0 --no-stereo-fallback --crf 28 --preset ultrafast \
+       "$TESTDIR/multi_audio.mkv"; then
+    # Track 0 is stereo AAC, so output should have ≤2ch
+    ch="$(probe_audio "$outfile" channels 0)"
+    if [[ "$ch" -le 2 ]]; then
+      pass "--audio-track 0: stereo track selected (${ch}ch)"
+    else
+      log "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
     fi
-  else
-    fail "--audio-track 0: no output"
   fi
 
   # --audio-lang-pref (#8)
   outfile="$TESTDIR/audio_lang_spa.mp4"
   log "Testing --audio-lang-pref spa..."
-  run_muxm --audio-lang-pref spa --no-stereo-fallback --crf 28 --preset ultrafast \
-    "$TESTDIR/multi_lang_audio.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--audio-lang-pref spa: output produced"
-    local alang
+  if assert_encode "--audio-lang-pref spa: output produced" "$outfile" \
+       --audio-lang-pref spa --no-stereo-fallback --crf 28 --preset ultrafast \
+       "$TESTDIR/multi_lang_audio.mkv"; then
     alang="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=language -of csv=p=0 \
       "$outfile" 2>/dev/null | head -1)"
     if [[ "$alang" == "spa" ]]; then
@@ -883,26 +892,20 @@ test_audio() {
     else
       fail "--audio-lang-pref spa: expected spa, got lang='$alang'"
     fi
-  else
-    fail "--audio-lang-pref spa: no output"
   fi
 
   # --audio-force-codec aac (#9)
   outfile="$TESTDIR/audio_force_aac.mp4"
   log "Testing --audio-force-codec aac..."
-  run_muxm --audio-force-codec aac --no-stereo-fallback --crf 28 --preset ultrafast \
-    "$TESTDIR/hevc_sdr_51.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--audio-force-codec aac: output produced"
-    local acodec
+  if assert_encode "--audio-force-codec aac: output produced" "$outfile" \
+       --audio-force-codec aac --no-stereo-fallback --crf 28 --preset ultrafast \
+       "$TESTDIR/hevc_sdr_51.mkv"; then
     acodec="$(probe_audio "$outfile" codec_name 0)"
     if [[ "$acodec" == "aac" ]]; then
       pass "--audio-force-codec aac: audio is AAC"
     else
       log "--audio-force-codec aac: got codec='$acodec'"
     fi
-  else
-    fail "--audio-force-codec aac: no output"
   fi
 
   # --stereo-bitrate via effective config (#11)
@@ -917,6 +920,7 @@ test_audio() {
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 0" "--no-audio-lossless-passthrough: flag cleared" "$out"
 
   # --- Commentary track detection ---
+  # Needs captured output to verify muxm's selection log, so uses run_muxm directly.
   outfile="$TESTDIR/audio_commentary_detect.mp4"
   log "Testing commentary track deprioritization..."
   local commentary_out
@@ -938,45 +942,30 @@ test_audio() {
 }
 
 # === Suite: Subtitle Pipeline ===
+# Validates subtitle inclusion, exclusion, language preference, SDH filtering,
+# external export, and OCR configuration.
 test_subs() {
   section "Subtitle Pipeline"
 
+  local outfile out
+
   # Basic encode with subs
-  local outfile="$TESTDIR/subs_test1.mkv"
+  outfile="$TESTDIR/subs_test1.mkv"
   log "Testing subtitle inclusion in MKV..."
-  run_muxm --output-ext mkv --crf 28 --preset ultrafast \
-    "$TESTDIR/multi_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local scount
-    scount="$(count_streams "$outfile" s)"
-    if [[ "$scount" -ge 1 ]]; then
-      pass "Subtitles present in MKV output ($scount tracks)"
-    else
-      fail "No subtitle tracks in MKV output"
-    fi
-  else
-    fail "Subtitle test encode produced no output"
+  if assert_encode "Subtitle test encode" "$outfile" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/multi_subs.mkv"; then
+    assert_stream_count "Subtitles present in MKV output" "$outfile" s 1
   fi
 
   # --no-subtitles
   outfile="$TESTDIR/subs_none.mkv"
   log "Testing --no-subtitles..."
-  run_muxm --output-ext mkv --crf 28 --preset ultrafast --no-subtitles \
-    "$TESTDIR/multi_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local scount
-    scount="$(count_streams "$outfile" s)"
-    if [[ "$scount" -eq 0 ]]; then
-      pass "--no-subtitles: no subtitle tracks"
-    else
-      fail "--no-subtitles: expected 0 tracks, got $scount"
-    fi
-  else
-    fail "--no-subtitles encode produced no output"
+  if assert_encode "--no-subtitles encode" "$outfile" \
+       --output-ext mkv --crf 28 --preset ultrafast --no-subtitles "$TESTDIR/multi_subs.mkv"; then
+    assert_stream_count "--no-subtitles: no subtitle tracks" "$outfile" s 0 0
   fi
 
   # --skip-subs
-  local out
   out="$(run_muxm --dry-run --skip-subs "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "Subtitle processing disabled" "--skip-subs announced" "$out"
 
@@ -991,10 +980,8 @@ test_subs() {
   # --sub-export-external (#13)
   outfile="$TESTDIR/subs_export.mp4"
   log "Testing --sub-export-external..."
-  run_muxm --sub-export-external --crf 28 --preset ultrafast \
-    "$TESTDIR/multi_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--sub-export-external: output produced"
+  if assert_encode "--sub-export-external: output produced" "$outfile" \
+       --sub-export-external --crf 28 --preset ultrafast "$TESTDIR/multi_subs.mkv"; then
     # Check for .srt sidecar file(s)
     local srt_count
     srt_count="$(find "$TESTDIR" -name "subs_export*.srt" 2>/dev/null | wc -l | tr -d ' ')"
@@ -1003,8 +990,6 @@ test_subs() {
     else
       log "--sub-export-external: no .srt sidecar found (may depend on subtitle type)"
     fi
-  else
-    fail "--sub-export-external: no output"
   fi
 
   # --no-ocr via effective config (#17)
@@ -1017,65 +1002,57 @@ test_subs() {
 }
 
 # === Suite: Output Features ===
+# Validates chapter preservation/stripping, checksum generation, JSON report output,
+# skip-if-ideal compliance detection, and temp directory retention.
 test_output() {
   section "Output Features"
 
+  local outfile chap_count
+
   # Chapters preserved
-  local outfile="$TESTDIR/out_chapters.mp4"
+  outfile="$TESTDIR/out_chapters.mp4"
   log "Testing chapter preservation..."
-  run_muxm --keep-chapters --crf 28 --preset ultrafast \
-    "$TESTDIR/with_chapters.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local chap_count
+  if assert_encode "Chapter preservation encode" "$outfile" \
+       --keep-chapters --crf 28 --preset ultrafast "$TESTDIR/with_chapters.mkv"; then
     chap_count="$(ffprobe -v error -show_chapters -of json "$outfile" 2>/dev/null | jq '.chapters | length' 2>/dev/null)" || chap_count=0
     if [[ "$chap_count" -ge 1 ]]; then
       pass "Chapters preserved in output ($chap_count chapters)"
     else
       log "Chapter count: $chap_count (may not persist in short clips)"
     fi
-  else
-    fail "Chapter test encode produced no output"
   fi
 
   # Chapters stripped
   outfile="$TESTDIR/out_no_chapters.mp4"
   log "Testing chapter stripping..."
-  run_muxm --no-keep-chapters --crf 28 --preset ultrafast \
-    "$TESTDIR/with_chapters.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local chap_count
+  if assert_encode "Chapter strip encode" "$outfile" \
+       --no-keep-chapters --crf 28 --preset ultrafast "$TESTDIR/with_chapters.mkv"; then
     chap_count="$(ffprobe -v error -show_chapters -of json "$outfile" 2>/dev/null | jq '.chapters | length' 2>/dev/null)" || chap_count=0
     if [[ "$chap_count" -eq 0 ]]; then
       pass "--no-keep-chapters: chapters stripped"
     else
       fail "--no-keep-chapters: expected 0 chapters, got $chap_count"
     fi
-  else
-    fail "Chapter strip test produced no output"
   fi
 
   # Checksum
   outfile="$TESTDIR/out_checksum.mp4"
   log "Testing --checksum..."
-  run_muxm --checksum --crf 28 --preset ultrafast \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" ]]; then
+  if assert_encode "Checksum test encode" "$outfile" \
+       --checksum --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
     local sha_file="${outfile}.sha256"
     if [[ -f "$sha_file" ]]; then
       pass "--checksum: SHA-256 file created"
     else
       log "--checksum: SHA-256 sidecar not found at $sha_file (check naming convention)"
     fi
-  else
-    fail "Checksum test encode produced no output"
   fi
 
   # JSON report + content validation (#52)
   outfile="$TESTDIR/out_report.mp4"
   log "Testing --report-json..."
-  run_muxm --report-json --crf 28 --preset ultrafast \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" ]]; then
+  if assert_encode "JSON report test encode" "$outfile" \
+       --report-json --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
     local json_file="${outfile%.mp4}.report.json"
     if [[ -f "$json_file" ]]; then
       pass "--report-json: JSON report created"
@@ -1101,8 +1078,6 @@ test_output() {
     else
       log "--report-json: report file not found at $json_file"
     fi
-  else
-    fail "JSON report test encode produced no output"
   fi
 
   # --skip-if-ideal with compliant source (#26, #51)
@@ -1154,58 +1129,52 @@ test_output() {
 }
 
 # === Suite: Container Formats ===
+# Validates that MOV and M4V output extensions produce files in the correct container family.
 test_containers() {
   section "Container Formats"
 
+  local outfile fmt
+
   # MOV output (#23)
-  local outfile="$TESTDIR/container_mov.mov"
+  outfile="$TESTDIR/container_mov.mov"
   log "Testing --output-ext mov..."
-  run_muxm --output-ext mov --crf 28 --preset ultrafast \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--output-ext mov: output produced"
-    local fmt
+  if assert_encode "--output-ext mov: output produced" "$outfile" \
+       --output-ext mov --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
     fmt="$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$outfile" 2>/dev/null)"
     if echo "$fmt" | grep -qiE "mov|mp4"; then
       pass "--output-ext mov: container is MOV/MP4 family"
     else
       fail "--output-ext mov: unexpected format=$fmt"
     fi
-  else
-    fail "--output-ext mov: no output"
   fi
 
   # M4V output (#24)
   outfile="$TESTDIR/container_m4v.m4v"
   log "Testing --output-ext m4v..."
-  run_muxm --output-ext m4v --crf 28 --preset ultrafast \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--output-ext m4v: output produced"
-    local fmt
+  if assert_encode "--output-ext m4v: output produced" "$outfile" \
+       --output-ext m4v --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
     fmt="$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$outfile" 2>/dev/null)"
     if echo "$fmt" | grep -qiE "mov|mp4|m4v"; then
       pass "--output-ext m4v: container is MP4 family"
     else
       fail "--output-ext m4v: unexpected format=$fmt"
     fi
-  else
-    fail "--output-ext m4v: no output"
   fi
 }
 
 # === Suite: Metadata Tests ===
+# Validates --strip-metadata removes format-level tags, metadata preservation without the flag,
+# and acceptance of --ffmpeg-loglevel and --no-hide-banner.
 test_metadata() {
   section "Metadata & Strip Verification"
 
+  local outfile out title comment
+
   # --strip-metadata encode test (#25, #53)
-  local outfile="$TESTDIR/meta_stripped.mp4"
+  outfile="$TESTDIR/meta_stripped.mp4"
   log "Testing --strip-metadata with real encode..."
-  run_muxm --strip-metadata --crf 28 --preset ultrafast \
-    "$TESTDIR/rich_metadata.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--strip-metadata: output produced"
-    local title comment
+  if assert_encode "--strip-metadata: output produced" "$outfile" \
+       --strip-metadata --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
     title="$(ffprobe -v error -show_entries format_tags=title -of csv=p=0 "$outfile" 2>/dev/null | head -1)"
     comment="$(ffprobe -v error -show_entries format_tags=comment -of csv=p=0 "$outfile" 2>/dev/null | head -1)"
     if [[ -z "$title" && -z "$comment" ]]; then
@@ -1216,29 +1185,22 @@ test_metadata() {
     else
       log "--strip-metadata: title='$title', comment='$comment' (stripping may be partial)"
     fi
-  else
-    fail "--strip-metadata: no output"
   fi
 
   # Without --strip-metadata, metadata should be preserved
   outfile="$TESTDIR/meta_preserved.mp4"
   log "Testing metadata preservation (no --strip-metadata)..."
-  run_muxm --crf 28 --preset ultrafast \
-    "$TESTDIR/rich_metadata.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    local title
+  if assert_encode "Metadata preservation encode" "$outfile" \
+       --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
     title="$(ffprobe -v error -show_entries format_tags=title -of csv=p=0 "$outfile" 2>/dev/null | head -1)"
     if [[ -n "$title" ]]; then
       pass "Metadata preserved: title='$title'"
     else
       log "Metadata preservation: title not found (may vary by pipeline)"
     fi
-  else
-    fail "Metadata preservation: no output"
   fi
 
   # --ffmpeg-loglevel (#30)
-  local out
   out="$(run_muxm --ffmpeg-loglevel warning --print-effective-config 2>&1)" || true
   if [[ -n "$out" ]]; then
     pass "--ffmpeg-loglevel: accepted without error"
@@ -1252,6 +1214,9 @@ test_metadata() {
 }
 
 # === Suite: Edge Cases & Security ===
+# Validates defensive behavior: empty files rejected, filenames with spaces handled,
+# shell injection attempts blocked (--output-ext, --ocr-tool), non-readable source
+# and non-writable output directory detected.
 test_edge() {
   section "Edge Cases & Security"
 
@@ -1304,149 +1269,72 @@ test_edge() {
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
+# Validates that each built-in profile produces a correctly encoded output file
+# with the expected container, codec, and stream layout.
 test_profile_e2e() {
   section "Profile End-to-End Encodes"
 
-  # streaming profile
-  local outfile="$TESTDIR/e2e_streaming.mp4"
-  log "Full encode: streaming profile..."
-  run_muxm --profile streaming --preset ultrafast --crf 28 \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "streaming profile: output produced"
-    local ext="${outfile##*.}"
-    if [[ "$ext" == "mp4" ]]; then
-      pass "streaming: correct extension (.mp4)"
-    else
-      fail "streaming: wrong ext .$ext"
-    fi
-  else
-    fail "streaming profile: no output"
-  fi
+  # Table: profile | source | output | ext | codec | extra_muxm_flags
+  # codec="-" means skip codec assertion; empty extra_flags means --preset ultrafast only.
+  local -a E2E_PROFILES=(
+    "streaming|basic_sdr_subs.mkv|e2e_streaming.mp4|mp4|-|--crf 28"
+    "animation|multi_subs.mkv|e2e_animation.mkv|mkv|-|--crf 28"
+    "universal|basic_sdr_subs.mkv|e2e_universal.mp4|mp4|h264|--crf 28"
+    "dv-archival|hevc_sdr_51.mkv|e2e_dv_archival.mkv|mkv|hevc|"
+    "hdr10-hq|hevc_hdr10_tagged.mkv|e2e_hdr10_hq.mkv|mkv|hevc|--crf 28"
+    "atv-directplay-hq|basic_sdr_subs.mkv|e2e_atv_directplay.mp4|mp4|hevc|--crf 28"
+  )
 
-  # animation profile
-  outfile="$TESTDIR/e2e_animation.mkv"
-  log "Full encode: animation profile..."
-  run_muxm --profile animation --preset ultrafast --crf 28 \
-    "$TESTDIR/multi_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "animation profile: output produced"
-  else
-    fail "animation profile: no output"
-  fi
+  local profile source output ext codec extra_flags
+  local outfile actual_ext pix_fmt
+  for entry in "${E2E_PROFILES[@]}"; do
+    IFS='|' read -r profile source output ext codec extra_flags <<< "$entry"
+    outfile="$TESTDIR/$output"
 
-  # universal profile
-  outfile="$TESTDIR/e2e_universal.mp4"
-  log "Full encode: universal profile..."
-  run_muxm --profile universal --preset ultrafast --crf 28 \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "universal profile: output produced"
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "h264" ]]; then
-      pass "universal: H.264 codec"
-    else
-      fail "universal: expected h264, got $vcodec"
+    log "Full encode: $profile profile..."
+    # Build muxm flag array: --profile NAME --preset ultrafast [extra flags] SOURCE
+    local -a flags=(--profile "$profile" --preset ultrafast)
+    if [[ -n "$extra_flags" ]]; then
+      local -a extra_arr
+      read -ra extra_arr <<< "$extra_flags"
+      flags+=("${extra_arr[@]}")
     fi
-  else
-    fail "universal profile: no output"
-  fi
 
-  # dv-archival profile (#4)
-  outfile="$TESTDIR/e2e_dv_archival.mkv"
-  log "Full encode: dv-archival profile..."
-  run_muxm --profile dv-archival --preset ultrafast \
-    "$TESTDIR/hevc_sdr_51.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "dv-archival profile: output produced"
-    local ext="${outfile##*.}"
-    if [[ "$ext" == "mkv" ]]; then
-      pass "dv-archival: correct extension (.mkv)"
-    else
-      fail "dv-archival: wrong ext .$ext"
-    fi
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "dv-archival: HEVC preserved"
-    else
-      fail "dv-archival: expected hevc, got $vcodec"
-    fi
-    local acount
-    acount="$(count_streams "$outfile" a)"
-    if [[ "$acount" -ge 1 ]]; then
-      pass "dv-archival: audio present ($acount tracks)"
-    else
-      fail "dv-archival: no audio tracks"
-    fi
-  else
-    fail "dv-archival profile: no output"
-  fi
+    if assert_encode "$profile profile: output produced" "$outfile" \
+         "${flags[@]}" "$TESTDIR/$source"; then
+      # Extension check
+      actual_ext="${outfile##*.}"
+      if [[ "$actual_ext" == "$ext" ]]; then
+        pass "$profile: correct extension (.$ext)"
+      else
+        fail "$profile: expected .$ext, got .$actual_ext"
+      fi
 
-  # hdr10-hq profile (#5)
-  outfile="$TESTDIR/e2e_hdr10_hq.mkv"
-  log "Full encode: hdr10-hq profile..."
-  run_muxm --profile hdr10-hq --preset ultrafast --crf 28 \
-    "$TESTDIR/hevc_hdr10_tagged.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "hdr10-hq profile: output produced"
-    local ext="${outfile##*.}"
-    if [[ "$ext" == "mkv" ]]; then
-      pass "hdr10-hq: correct extension (.mkv)"
-    else
-      fail "hdr10-hq: wrong ext .$ext"
-    fi
-    local vcodec pix_fmt
-    vcodec="$(probe_video "$outfile" codec_name)"
-    pix_fmt="$(probe_video "$outfile" pix_fmt)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "hdr10-hq: HEVC codec"
-    else
-      fail "hdr10-hq: expected hevc, got $vcodec"
-    fi
-    if echo "$pix_fmt" | grep -q "10"; then
-      pass "hdr10-hq: 10-bit pixel format ($pix_fmt)"
-    else
-      log "hdr10-hq: pix_fmt=$pix_fmt (expected 10-bit)"
-    fi
-  else
-    fail "hdr10-hq profile: no output"
-  fi
+      # Codec check (skip if "-")
+      [[ "$codec" != "-" ]] && assert_probe "$profile: $codec codec" "$outfile" codec_name "$codec"
 
-  # atv-directplay-hq profile (#6)
-  outfile="$TESTDIR/e2e_atv_directplay.mp4"
-  log "Full encode: atv-directplay-hq profile..."
-  run_muxm --profile atv-directplay-hq --preset ultrafast --crf 28 \
-    "$TESTDIR/basic_sdr_subs.mkv" "$outfile"
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "atv-directplay-hq profile: output produced"
-    local ext="${outfile##*.}"
-    if [[ "$ext" == "mp4" ]]; then
-      pass "atv-directplay: correct extension (.mp4)"
-    else
-      fail "atv-directplay: wrong ext .$ext"
+      # Profile-specific extra checks
+      case "$profile" in
+        dv-archival|atv-directplay-hq)
+          assert_stream_count "$profile: audio present" "$outfile" a 1
+          ;;
+        hdr10-hq)
+          pix_fmt="$(probe_video "$outfile" pix_fmt)"
+          if echo "$pix_fmt" | grep -q "10"; then
+            pass "hdr10-hq: 10-bit pixel format ($pix_fmt)"
+          else
+            log "hdr10-hq: pix_fmt=$pix_fmt (expected 10-bit)"
+          fi
+          ;;
+      esac
     fi
-    local vcodec
-    vcodec="$(probe_video "$outfile" codec_name)"
-    if [[ "$vcodec" == "hevc" ]]; then
-      pass "atv-directplay: HEVC codec"
-    else
-      fail "atv-directplay: expected hevc, got $vcodec"
-    fi
-    local acount
-    acount="$(count_streams "$outfile" a)"
-    if [[ "$acount" -ge 1 ]]; then
-      pass "atv-directplay: audio present ($acount tracks)"
-    else
-      fail "atv-directplay: no audio tracks"
-    fi
-  else
-    fail "atv-directplay-hq profile: no output"
-  fi
+  done
 }
 
 # === Suite: Completions Installer ===
+# Validates --install-completions creates the completion file and patches .bashrc/.zshrc,
+# is idempotent (no duplicate source lines), and --uninstall-completions cleans up.
+# Uses an isolated $HOME to avoid touching real RC files.
 test_completions() {
   section "Completion Installer (--install-completions / --uninstall-completions)"
 
@@ -1523,13 +1411,15 @@ test_completions() {
 }
 
 # ===== --setup (combined installer) ===========================================================
+# Validates --setup runs all three sub-installers (dependencies, man page, completions),
+# shows the combined banner and final summary, and actually installs the completion file.
 test_setup() {
   section "Setup (--setup combined installer)"
 
   # Create isolated home so --install-man and --install-completions don't touch real system
   local fake_home
   fake_home="$(mktemp -d)"
-  mkdir -p "$fake_home/.bashrc" && rm -rf "$fake_home/.bashrc"  # ensure no dir collision
+  rm -f "$fake_home/.bashrc"   # ensure clean state (no stale file)
   touch "$fake_home/.bashrc"
   touch "$fake_home/.zshrc"
 
@@ -1639,6 +1529,11 @@ summary() {
 }
 
 # ---- Main ----
+# Execution flow:
+#   1. preflight          — verify required tools exist, create temp directory
+#   2. generate_test_media — build synthetic 2-sec clips (no real media needed)
+#   3. run_suites         — execute the selected test suite(s)
+#   4. summary            — report pass/fail/skip counts, list failures, set exit code
 preflight
 generate_test_media
 run_suites
