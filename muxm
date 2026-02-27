@@ -49,12 +49,6 @@ FAILED=0
 FAIL_MSG=""
 EXIT_CODE=1
 PRINT_EFFCONF=0
-# TODO(future): Config file rotation — write-back of resolved config to disk
-# shellcheck disable=SC2034  # Reserved for future use
-CONFIG_WRITE_ROTATE=0
-# shellcheck disable=SC2034  # Reserved for future use
-CONFIG_WRITE_PATH=""
-PROFILE_NAME=""
 
 # Metadata cache for performance optimization
 METADATA_CACHE=""
@@ -111,9 +105,6 @@ declare -i MAX_AUDIO_CHANNELS=8
 declare -i ADD_STEREO_IF_MULTICH=1
 EAC3_BITRATE_5_1="640k"
 EAC3_BITRATE_7_1="768k"
-# TODO(future): Parallel audio transcode when multiple outputs needed
-# shellcheck disable=SC2034  # Reserved for future use
-declare -i PARALLEL_AUDIO=0
 
 # ---- Subtitles
 SUB_LANG_PREF="eng"
@@ -128,13 +119,8 @@ SUB_OCR_LANG="eng"
 
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
-# TODO(future): MP4 interleave duration for streaming optimization
-# shellcheck disable=SC2034  # Reserved for future use
-declare -i MP4_INTERLEAVE_MS=500
 TAG_LANGUAGE_DEFAULT="und"
-# TODO(future): Include descriptive titles in audio stream metadata tags
-# shellcheck disable=SC2034  # Reserved for future use
-declare -i INCLUDE_AUDIO_TITLES=1
+declare -i INCLUDE_AUDIO_TITLES=1  # Generate descriptive titles for audio streams (e.g., "5.1 Surround (E-AC-3)")
 
 # ---- Operational defaults
 declare -i CHECKSUM=0
@@ -473,6 +459,15 @@ ffmpeg_has_muxer(){
   ffmpeg -hide_banner -muxers 2>/dev/null | awk '{print $1}' | grep -qx "$mux"
 }
 
+# Validate ffmpeg/ffprobe log level values.
+# Used by config-file validation (Section 6) and CLI parsing (Section 12).
+is_valid_loglevel(){
+  case "$1" in
+    quiet|panic|fatal|error|warning|info|verbose|debug|trace) return 0;;
+    *) return 1;;
+  esac
+}
+
 # ===== Section 6: Config chain: Defaults → /etc → ~ → project =================================
 # Config files are sourced as shell scripts — they can execute arbitrary code.
 # Security note: The project-level ./.muxmrc is sourced from $PWD. A malicious
@@ -500,6 +495,12 @@ if [[ -n "${AUDIO_SCORE_LANG_BONUS_ENG:-}" ]]; then
   # shellcheck disable=SC2016
   printf '⚠️  Deprecated: AUDIO_SCORE_LANG_BONUS_ENG → rename to AUDIO_SCORE_LANG_BONUS in your .muxmrc\n' >&2
 fi
+
+# Validate loglevel values from config files (catch typos early, before ffmpeg sees them)
+[[ -n "$FFMPEG_LOGLEVEL" ]] && ! is_valid_loglevel "$FFMPEG_LOGLEVEL" && \
+  die 11 "Invalid FFMPEG_LOGLEVEL=\"$FFMPEG_LOGLEVEL\" in config. Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+[[ -n "$FFPROBE_LOGLEVEL" ]] && ! is_valid_loglevel "$FFPROBE_LOGLEVEL" && \
+  die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config. Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
 
 # ===== Section 7: Dependency installer ========================================================
 # Invoked via --install-dependencies. Checks for all tools required by muxm and
@@ -1313,6 +1314,7 @@ _muxm_completions() {
             --stereo-fallback --no-stereo-fallback --stereo-bitrate
             --audio-force-codec
             --audio-lossless-passthrough --no-audio-lossless-passthrough
+            --audio-titles --no-audio-titles
 
             --sub-burn-forced --no-sub-burn-forced
             --sub-export-external --no-sub-export-external
@@ -1796,10 +1798,6 @@ HEADER
   echo "# Allow lossless audio codecs (TrueHD, DTS-HD MA, FLAC) to pass through"
   echo "#   1 = copy lossless  |  0 = transcode to lossy"
   _V AUDIO_LOSSLESS_PASSTHROUGH
-  echo ""
-  echo "# Run stereo and primary audio jobs in parallel"
-  printf '#PARALLEL_AUDIO=0\n'
-  echo ""
 
   echo ""
   echo "# ========================="
@@ -1879,6 +1877,9 @@ HEADER
   echo ""
   echo "# Strip non-essential metadata from output"
   _V STRIP_METADATA
+  echo ""
+  echo "# Generate descriptive titles for audio streams (e.g., \"5.1 Surround (E-AC-3)\")"
+  _V INCLUDE_AUDIO_TITLES
   echo ""
 
   echo ""
@@ -2349,12 +2350,16 @@ while [[ $# -gt 0 ]]; do
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
 
-    # TODO: Consider whitelisting loglevel values (quiet|panic|fatal|error|warning|info|verbose|debug|trace)
-    #       to match the completion script. Currently ffmpeg rejects invalid values harmlessly.
-    --ffmpeg-loglevel) FFMPEG_LOGLEVEL="${2:-}"; shift 2 ;;
+    --ffmpeg-loglevel)
+      FFMPEG_LOGLEVEL="${2:-}"
+      is_valid_loglevel "$FFMPEG_LOGLEVEL" || die 11 "Invalid --ffmpeg-loglevel: \"$FFMPEG_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+      shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
-    --ffprobe-loglevel) FFPROBE_LOGLEVEL="${2:-}"; shift 2 ;;
+    --ffprobe-loglevel)
+      FFPROBE_LOGLEVEL="${2:-}"
+      is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+      shift 2 ;;
     --threads) THREADS="${2:-}"; shift 2 ;;
 
     --crf) CRF_VALUE="${2:-}"; shift 2 ;;
@@ -2392,6 +2397,8 @@ while [[ $# -gt 0 ]]; do
     --audio-force-codec) AUDIO_FORCE_CODEC="${2:-}"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
     --no-audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=0; shift ;;
+    --audio-titles) INCLUDE_AUDIO_TITLES=1; shift ;;
+    --no-audio-titles) INCLUDE_AUDIO_TITLES=0; shift ;;
 
     --no-subtitles) SUB_INCLUDE_FORCED=0; SUB_INCLUDE_FULL=0; SUB_INCLUDE_SDH=0; shift ;;
     --sub-lang-pref) SUB_LANG_PREF="${2:-}"; shift 2 ;;
@@ -2684,6 +2691,7 @@ Effective config (post config-files + profile + CLI):
 
   [Output / Muxing]
   OUTPUT_EXT                = $OUTPUT_EXT
+  INCLUDE_AUDIO_TITLES      = $INCLUDE_AUDIO_TITLES
   KEEP_CHAPTERS             = $KEEP_CHAPTERS
   STRIP_METADATA            = $STRIP_METADATA
 
@@ -4155,6 +4163,38 @@ _audio_title(){
   _audio_tag "$1" title
 }
 
+# Build a human-readable audio stream title from codec and channel count.
+# Args: $1 — codec name, $2 — channel count
+# Output: e.g., "5.1 Surround (E-AC-3)" or "Stereo (AAC)"
+_audio_descriptive_title() {
+  local codec="$1" ch="${2:-0}"
+
+  local ch_label
+  case "$ch" in
+    1) ch_label="Mono" ;;
+    2) ch_label="Stereo" ;;
+    6) ch_label="5.1 Surround" ;;
+    8) ch_label="7.1 Surround" ;;
+    *) ch_label="${ch}ch" ;;
+  esac
+
+  local codec_display
+  case "$(_lower "$codec")" in
+    eac3)      codec_display="E-AC-3" ;;
+    ac3)       codec_display="AC-3" ;;
+    aac)       codec_display="AAC" ;;
+    truehd)    codec_display="TrueHD" ;;
+    dts)       codec_display="DTS" ;;
+    flac)      codec_display="FLAC" ;;
+    alac)      codec_display="ALAC" ;;
+    opus)      codec_display="Opus" ;;
+    pcm_*)     codec_display="PCM" ;;
+    *)         codec_display="$(_lower "$codec")" ;;
+  esac
+
+  echo "${ch_label} (${codec_display})"
+}
+
 # Return ordinal position of codec in AUDIO_CODEC_PREFERENCE list (0 = best).
 # Returns 10 for unlisted codecs — low preference but not a hard penalty.
 # This avoids crushing valid but uncommon codecs (e.g., Opus, FLAC) with
@@ -4442,7 +4482,6 @@ run_audio_pipeline(){
   # Persist audio metadata for mux_final tagging
   A_PRIMARY_LANG="$lang"
   A_PRIMARY_TITLE="${title:-}"
-  # shellcheck disable=SC2034
   A_PRIMARY_CHANNELS="$ch"
   A_STEREO_LANG="$lang"
 
@@ -4508,6 +4547,14 @@ run_audio_pipeline(){
     note "Transcoding audio: $codec → $tgt_codec (channels=${effective_ch}ch, bitrate=$tgt_br)"
     report_add "audio_action" "transcode $codec → $tgt_codec"
   fi
+
+  # Update metadata to reflect the final output codec and channel count
+  if (( do_copy )); then
+    A_PRIMARY_CODEC="$codec"
+  else
+    A_PRIMARY_CODEC="$tgt_codec"
+  fi
+  A_PRIMARY_CHANNELS="$effective_ch"
 
   if (( do_copy )); then
     ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" -c copy "$A_PRIMARY" 2>"$WORKDIR/audio_primary.err" &
@@ -4867,8 +4914,8 @@ SRT_SDH_TITLE=""
 # Audio metadata for mux tagging (populated by run_audio_pipeline)
 A_PRIMARY_LANG=""
 A_PRIMARY_TITLE=""
-# shellcheck disable=SC2034  # Set for symmetry; reserved for future mux tagging
 A_PRIMARY_CHANNELS=""
+A_PRIMARY_CODEC=""
 A_STEREO_LANG=""
 
 # Process a prepared subtitle: either export as external SRT or embed.
@@ -5198,7 +5245,11 @@ mux_final() {
   local -i out_a_idx=0
   if [[ -n "$a_primary_idx" ]]; then
     [[ -n "${A_PRIMARY_LANG:-}" ]]  && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_PRIMARY_LANG" )
-    if [[ -n "${A_PRIMARY_TITLE:-}" ]]; then
+    if (( INCLUDE_AUDIO_TITLES )) && [[ -n "${A_PRIMARY_CODEC:-}" ]]; then
+      local _desc_title
+      _desc_title="$(_audio_descriptive_title "$A_PRIMARY_CODEC" "${A_PRIMARY_CHANNELS:-0}")"
+      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_desc_title" )
+    elif [[ -n "${A_PRIMARY_TITLE:-}" ]]; then
       ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$A_PRIMARY_TITLE" )
     fi
     ff_codec+=( "-disposition:a:${out_a_idx}" default )
@@ -5206,7 +5257,11 @@ mux_final() {
   fi
   if [[ -n "$a_stereo_idx" ]]; then
     [[ -n "${A_STEREO_LANG:-}" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_STEREO_LANG" )
-    ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=Stereo" )
+    if (( INCLUDE_AUDIO_TITLES )); then
+      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$(_audio_descriptive_title aac 2)" )
+    else
+      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=Stereo" )
+    fi
     ff_codec+=( "-disposition:a:${out_a_idx}" 0 )
     out_a_idx=$(( out_a_idx + 1 ))
   fi
