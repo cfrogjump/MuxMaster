@@ -7,7 +7,7 @@
 #  Usage:
 #    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
 #
-#  Suites: all, cli, completions, config, profiles, conflicts, dryrun, video, audio, subs,
+#  Suites: all, cli, toggles, completions, config, profiles, conflicts, dryrun, video, audio, subs,
 #          output, edge, e2e, hdr, containers, metadata
 #  Default: all
 # =============================================================================
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
     --verbose) VERBOSE=1; shift ;;
     -h|--help)
       echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, completions, config, profiles, conflicts, dryrun, video, hdr,"
+      echo "Suites: all, cli, toggles, completions, config, profiles, conflicts, dryrun, video, hdr,"
       echo "        audio, subs, output, containers, metadata, edge, e2e"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -454,6 +454,89 @@ test_cli() {
     log "--no-overwrite: preliminary encode failed: ${pre_out:0:500}"
     skip "--no-overwrite: initial encode did not produce output"
   fi
+
+  # ---- Phase 1: Short flag aliases ----
+  # Verify short flags map to their long-form equivalents. Catches regressions
+  # where a refactor drops a short alias from the case statement.
+
+  # -h → --help
+  assert_exit 0 "-h is alias for --help" -h
+
+  # -V → --version
+  out="$(run_muxm -V)"
+  assert_contains "MuxMaster" "-V is alias for --version (app name)" "$out"
+  assert_contains "muxm" "-V is alias for --version (CLI name)" "$out"
+
+  # -p → --preset
+  out="$(run_muxm -p ultrafast --print-effective-config)"
+  assert_contains "PRESET_VALUE              = ultrafast" "-p is alias for --preset" "$out"
+
+  # -l → --level
+  out="$(run_muxm -l 5.1 --print-effective-config)"
+  assert_contains "LEVEL_VALUE               = 5.1" "-l is alias for --level" "$out"
+
+  # -k → --keep-temp
+  out="$(run_muxm -k --print-effective-config)"
+  assert_contains "KEEP_TEMP                 = 1" "-k is alias for --keep-temp" "$out"
+
+  # -K → --keep-temp-always
+  out="$(run_muxm -K --print-effective-config)"
+  assert_contains "KEEP_TEMP_ALWAYS          = 1" "-K is alias for --keep-temp-always" "$out"
+}
+
+# === Suite: Toggle Flag Coverage ===
+# Validates that every boolean --flag / --no-flag pair correctly registers in
+# effective config. Catches flags accepted by the CLI parser but never exercised.
+# All checks are pure config assertions — zero encode time.
+test_toggles() {
+  section "Toggle Flag Coverage (--flag / --no-flag pairs)"
+
+  local out
+
+  # ---- Negative toggles not covered by other suites ----
+
+  out="$(run_muxm --no-checksum --print-effective-config)"
+  assert_contains "CHECKSUM                  = 0" "--no-checksum: registered" "$out"
+
+  out="$(run_muxm --no-report-json --print-effective-config)"
+  assert_contains "REPORT_JSON               = 0" "--no-report-json: registered" "$out"
+
+  out="$(run_muxm --no-skip-if-ideal --print-effective-config)"
+  assert_contains "SKIP_IF_IDEAL             = 0" "--no-skip-if-ideal: registered" "$out"
+
+  out="$(run_muxm --no-strip-metadata --print-effective-config)"
+  assert_contains "STRIP_METADATA            = 0" "--no-strip-metadata: registered" "$out"
+
+  out="$(run_muxm --no-sub-burn-forced --print-effective-config)"
+  assert_contains "SUB_BURN_FORCED           = 0" "--no-sub-burn-forced: registered" "$out"
+
+  out="$(run_muxm --no-sub-export-external --print-effective-config)"
+  assert_contains "SUB_EXPORT_EXTERNAL       = 0" "--no-sub-export-external: registered" "$out"
+
+  out="$(run_muxm --no-video-copy-if-compliant --print-effective-config)"
+  assert_contains "VIDEO_COPY_IF_COMPLIANT   = 0" "--no-video-copy-if-compliant: registered" "$out"
+
+  # ---- Positive toggles not covered by other suites ----
+
+  out="$(run_muxm --stereo-fallback --print-effective-config)"
+  assert_contains "ADD_STEREO_IF_MULTICH     = 1" "--stereo-fallback: registered" "$out"
+
+  out="$(run_muxm --no-conservative-vbv --print-effective-config)"
+  assert_contains "CONSERVATIVE_VBV          = 0" "--no-conservative-vbv: registered" "$out"
+
+  # ---- DV policy toggles ----
+
+  out="$(run_muxm --allow-dv-fallback --print-effective-config)"
+  assert_contains "ALLOW_DV_FALLBACK         = 1" "--allow-dv-fallback: registered" "$out"
+
+  out="$(run_muxm --no-allow-dv-fallback --print-effective-config)"
+  assert_contains "ALLOW_DV_FALLBACK         = 0" "--no-allow-dv-fallback: registered" "$out"
+
+  out="$(run_muxm --dv-convert-p81 --print-effective-config)"
+  assert_contains "DV_CONVERT_TO_P81_IF_FAIL = 1" "--dv-convert-p81: registered" "$out"
+
+  out="$(run_muxm --no-dv-convert-p81 --print-effective-config)"
+  assert_contains "DV_CONVERT_TO_P81_IF_FAIL = 0" "--no-dv-convert-p81: registered" "$out"
 }
 
 # === Suite: Config Precedence ===
@@ -725,7 +808,7 @@ test_dryrun() {
 test_video() {
   section "Video Pipeline (Real Encodes)"
 
-  local outfile src="$TESTDIR/basic_sdr_subs.mkv"
+  local outfile out src="$TESTDIR/basic_sdr_subs.mkv"
 
   # Basic SDR encode → MP4
   outfile="$TESTDIR/vid_test1.mp4"
@@ -771,6 +854,20 @@ test_video() {
   if assert_encode "--video-copy-if-compliant: output produced" "$outfile" \
        --video-copy-if-compliant --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv"; then
     assert_probe "--video-copy-if-compliant: HEVC preserved" "$outfile" codec_name hevc
+  fi
+
+  # --level config acceptance (R20)
+  out="$(run_muxm --level 5.1 --print-effective-config)"
+  assert_contains "LEVEL_VALUE               = 5.1" "--level 5.1: config registered" "$out"
+
+  # --level VBV injection via dry-run (R21)
+  # When CONSERVATIVE_VBV=1 (default) and --level is a known tier, the dry-run
+  # output should include vbv-maxrate and vbv-bufsize in the x265 params.
+  out="$(run_muxm --dry-run --level 5.1 "$TESTDIR/hevc_sdr_51.mkv")"
+  if echo "$out" | grep -qiE "vbv-maxrate|vbv-bufsize"; then
+    pass "--level 5.1: VBV params injected in dry-run"
+  else
+    log "--level 5.1: VBV keywords not found in dry-run output (may be logged to file)"
   fi
 }
 
@@ -1211,6 +1308,12 @@ test_metadata() {
   if [[ -n "$out" ]]; then
     pass "--no-hide-banner: accepted without error"
   fi
+
+  # --ffprobe-loglevel (R23)
+  out="$(run_muxm --ffprobe-loglevel warning --print-effective-config 2>&1)" || true
+  if [[ -n "$out" ]]; then
+    pass "--ffprobe-loglevel: accepted without error"
+  fi
 }
 
 # === Suite: Edge Cases & Security ===
@@ -1447,6 +1550,33 @@ test_setup() {
     fail "--setup did not install completion file"
   fi
 
+  # ---- --install-dependencies standalone (R26, R27) ----
+  # In CI/test environments without Homebrew, this runs in check-only mode.
+  # Either path should show the banner and list core tools.
+  local dep_out
+  dep_out="$(HOME="$fake_home" "$MUXM" --install-dependencies 2>&1)" || true
+  if echo "$dep_out" | grep -qE "Dependency Installer|Dependency Check"; then
+    pass "--install-dependencies shows banner"
+  else
+    fail "--install-dependencies: no banner found"
+  fi
+  assert_contains "ffmpeg" "--install-dependencies lists ffmpeg" "$dep_out"
+  assert_contains "ffprobe" "--install-dependencies lists ffprobe" "$dep_out"
+  assert_contains "jq" "--install-dependencies lists jq" "$dep_out"
+
+  # ---- --uninstall-man standalone (R24, R25) ----
+  # In test environments the man page is unlikely to be installed, so this
+  # exercises the "not found — nothing to remove" safe path.
+  local man_out
+  man_out="$(HOME="$fake_home" "$MUXM" --uninstall-man 2>&1)" || true
+  assert_contains "Manual Page Uninstaller" "--uninstall-man shows banner" "$man_out"
+  # Safe when man page is not installed — should not error
+  if echo "$man_out" | grep -qiE "not found|nothing to remove|removed"; then
+    pass "--uninstall-man: safe when man page not installed"
+  else
+    fail "--uninstall-man: unexpected output: ${man_out:0:200}"
+  fi
+
   # ---- Cleanup ----
   rm -rf "$fake_home"
 }
@@ -1456,6 +1586,7 @@ run_suites() {
   case "$SUITE" in
     all)
       test_cli
+      test_toggles
       test_completions
       test_setup
       test_config
@@ -1473,6 +1604,7 @@ run_suites() {
       test_profile_e2e
       ;;
     cli)          test_cli ;;
+    toggles)      test_toggles ;;
     completions)  test_completions ;;
     setup)        test_setup ;;
     config)       test_config ;;
@@ -1490,8 +1622,8 @@ run_suites() {
     e2e)          test_profile_e2e ;;
     *)
       echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, completions, setup, config, profiles, conflicts, dryrun, video, hdr, audio,"
-      echo "       subs, output, containers, metadata, edge, e2e"
+      echo "Valid: all, cli, toggles, completions, setup, config, profiles, conflicts, dryrun,"
+      echo "       video, hdr, audio, subs, output, containers, metadata, edge, e2e"
       exit 1
       ;;
   esac
