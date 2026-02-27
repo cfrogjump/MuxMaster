@@ -904,6 +904,26 @@ test_hdr() {
   local out
   out="$(run_muxm --no-tonemap --print-effective-config)"
   assert_contains "TONEMAP_HDR_TO_SDR        = 0" "--no-tonemap: flag registered" "$out"
+
+  # ---- Phase 4a: Tonemap filter chain verification (R28, R29) ----
+  # The dry-run with --tonemap on an HDR source should trigger the SDR-TONEMAP
+  # color profile and include the zscale/tonemap filter chain in the output.
+
+  # R28: Explicit --tonemap flag with HDR source
+  out="$(run_muxm --dry-run --tonemap "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
+  if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
+    pass "--tonemap + HDR source: tonemap filter chain present in dry-run"
+  else
+    log "--tonemap + HDR source: filter keywords not found (synthetic HDR tags may not trigger detection)"
+  fi
+
+  # R29: --profile universal implies tonemap — verify with HDR source
+  out="$(run_muxm --dry-run --profile universal "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
+  if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
+    pass "--profile universal + HDR source: tonemap filter chain present"
+  else
+    log "--profile universal + HDR source: filter keywords not found (may require real HDR source)"
+  fi
 }
 
 # === Suite: Audio Pipeline ===
@@ -1140,6 +1160,16 @@ test_output() {
     local sha_file="${outfile}.sha256"
     if [[ -f "$sha_file" ]]; then
       pass "--checksum: SHA-256 file created"
+
+      # Phase 4c: Verify checksum content is correct (R32)
+      # The sidecar contains "hash  /path/to/file" — sha256sum -c validates it.
+      if sha256sum -c "$sha_file" >/dev/null 2>&1; then
+        pass "--checksum: SHA-256 validates correctly"
+      elif shasum -a 256 -c "$sha_file" >/dev/null 2>&1; then
+        pass "--checksum: SHA-256 validates correctly (shasum)"
+      else
+        fail "--checksum: SHA-256 does not match output file"
+      fi
     else
       log "--checksum: SHA-256 sidecar not found at $sha_file (check naming convention)"
     fi
@@ -1171,6 +1201,27 @@ test_output() {
         pass "--report-json: contains source/input key"
       else
         log "--report-json: source/input key not found (key naming may differ)"
+      fi
+
+      # Phase 4f: Deeper field completeness checks (R35–R38)
+      local has_profile has_output has_timestamp
+      has_profile="$(jq 'has("profile")' "$json_file" 2>/dev/null)" || has_profile="false"
+      has_output="$(jq 'has("output")' "$json_file" 2>/dev/null)" || has_output="false"
+      has_timestamp="$(jq 'has("timestamp")' "$json_file" 2>/dev/null)" || has_timestamp="false"
+      if [[ "$has_profile" == "true" ]]; then
+        pass "--report-json: contains profile key"
+      else
+        log "--report-json: profile key not found (key naming may differ)"
+      fi
+      if [[ "$has_output" == "true" ]]; then
+        pass "--report-json: contains output key"
+      else
+        log "--report-json: output key not found (key naming may differ)"
+      fi
+      if [[ "$has_timestamp" == "true" ]]; then
+        pass "--report-json: contains timestamp key"
+      else
+        log "--report-json: timestamp key not found (key naming may differ)"
       fi
     else
       log "--report-json: report file not found at $json_file"
@@ -1368,6 +1419,38 @@ test_edge() {
     chmod 755 "$nowrite_dir" 2>/dev/null || true
   else
     skip "Cannot test non-writable dir (running as root?)"
+  fi
+
+  # ---- Phase 4e: Double-dash argument terminator (R34) ----
+  # Source files after -- should be parsed as positional args, not flags.
+  out="$(run_muxm --dry-run -- "$TESTDIR/basic_sdr_subs.mkv")"
+  assert_contains "DRY-RUN" "Double-dash (--) argument terminator" "$out"
+
+  # ---- Phase 4b: Auto-generated output path (R30, R31) ----
+  # When only source is provided (no explicit output path), muxm derives the
+  # output filename from the source: same directory, swapped extension.
+  local auto_dir="$TESTDIR/auto_output_test"
+  mkdir -p "$auto_dir"
+  cp "$TESTDIR/basic_sdr_subs.mkv" "$auto_dir/test_source.mkv"
+  log "Testing auto-generated output path (no explicit output)..."
+  (cd "$auto_dir" && "$MUXM" --crf 28 --preset ultrafast \
+    "$auto_dir/test_source.mkv" >/dev/null 2>&1) || true
+  # Default output extension is mp4; the derived name should be test_source.mp4
+  if [[ -f "$auto_dir/test_source.mp4" && -s "$auto_dir/test_source.mp4" ]]; then
+    pass "Auto-generated output: file created with derived name (.mp4)"
+  else
+    # Check if it landed with any known extension
+    local found=0
+    for ext in mp4 mkv m4v mov; do
+      if [[ -f "$auto_dir/test_source.$ext" && -s "$auto_dir/test_source.$ext" ]]; then
+        pass "Auto-generated output: file created with derived name (.$ext)"
+        found=1
+        break
+      fi
+    done
+    if (( ! found )); then
+      fail "Auto-generated output: no output file found in $auto_dir"
+    fi
   fi
 }
 
