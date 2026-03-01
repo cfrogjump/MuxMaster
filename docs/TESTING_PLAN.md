@@ -488,14 +488,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y ffmpeg jq bc
-      - name: Run fast tests
-        run: ./test_muxm.sh --muxm ./muxm --suite cli
-      - name: Run config tests
-        run: ./test_muxm.sh --muxm ./muxm --suite config
-      - name: Run profile tests
-        run: ./test_muxm.sh --muxm ./muxm --suite profiles
-      - name: Run full e2e
-        run: ./test_muxm.sh --muxm ./muxm --suite e2e
+      - name: Run all tests
+        run: ./test_muxm.sh --muxm ./muxm --suite all
       - name: Locale regression (LANG=C)
         run: LANG=C LC_ALL=C ./test_muxm.sh --muxm ./muxm --suite all
 ```

@@ -19,7 +19,7 @@ Initial public release.
 - **`hdr10-hq`** — High-quality HDR10 encoding. HEVC CRF 17, strip DV, lossless audio + stereo fallback, MKV
 - **`atv-directplay-hq`** — Apple TV 4K Direct Play via Plex. MP4, HEVC Main10, DV Profile 8.1 auto-conversion, E-AC-3 + AAC stereo, forced subtitle burn-in
 - **`streaming`** — Modern HEVC streaming for Plex/Jellyfin/Emby. CRF 20, E-AC-3 448k, AAC stereo, MP4
-- **`animation`** — Anime and cartoon optimized. CRF 16, 10-bit even for SDR, low psy-rd/psy-rdoq, lossless audio, ASS/SSA subtitle preservation, MKV
+- **`animation`** — Anime and cartoon optimized. CRF 16, keeps 10-bit for SDR sources (anti-banding), low psy-rd/psy-rdoq, lossless audio, ASS/SSA subtitle preservation, MKV
 - **`universal`** — Maximum compatibility. H.264 SDR with HDR tone-mapping, AAC stereo, burned forced subs, external SRT export, MP4
 
 ### Video
@@ -70,4 +70,4 @@ Initial public release.
 - `--create-config` / `--force-create-config` for generating pre-seeded `.muxmrc` files
 - Conflict warnings for contradictory profile + flag combinations
 - Spinner and progress bar for long-running operations
-- Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~160 assertions
+- Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions

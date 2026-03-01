@@ -1,4 +1,4 @@
-.TH MUXM 1 "2026-04-01" "MuxMaster v1.0.0" "User Commands"
+.TH MUXM 1 "2026-03-02" "MuxMaster v1.0.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -52,7 +52,7 @@ Modern HEVC streaming. CRF 20, preset medium, E\-AC\-3 448k, AAC stereo.
 MP4. Targets Plex/Jellyfin on Shield, Fire TV, Roku, smart TVs, web.
 .TP
 .B animation
-Anime/cartoon optimized. HEVC CRF 16, 10\-bit (even SDR),
+Anime/cartoon optimized. HEVC CRF 16, 10\-bit for SDR sources (anti\-banding),
 animation\-tuned x265 (low psy\-rd, adjusted deblock, extra b\-frames),
 lossless audio, preserve all subs (ASS/SSA). MKV.
 .TP
@@ -222,7 +222,7 @@ Exclude SDH/HI subtitle tracks.
 Disable PGS\(->SRT OCR.
 .TP
 .BR \-\-ocr\-tool " " \fITOOL\fR
-OCR backend: sub2srt or pgsrip.
+OCR backend: pgsrip or sub2srt.
 .TP
 .BR \-\-ocr\-lang " " \fILANG\fR
 OCR language (default: eng).
@@ -457,7 +457,7 @@ automatically disabled if missing.
 \fBMP4Box\fR (gpac) \(em DV container\-level signaling verification.
 Detected at runtime as \fBmp4box\fR or \fBMP4Box\fR.
 .br
-\fBsub2srt\fR or \fBpgsrip\fR \(em PGS bitmap subtitle OCR to SRT.
+\fBpgsrip\fR or \fBsub2srt\fR \(em PGS bitmap subtitle OCR to SRT.
 Configurable via \fB\-\-ocr\-tool\fR.
 .PP
 Run \fBmuxm \-\-install\-dependencies\fR to check for and install all
@@ -506,7 +506,7 @@ Terminated by signal (SIGTERM).
 .BR MP4Box (1)
 .SH BUGS
 Report bugs at
-.UR https://github.com/theBluWiz/muxm/issues
+.UR https://github.com/TheBluWiz/muxm/issues
 .UE .
 .SH COPYRIGHT
 Copyright \(co 2025\(en2026 Jamey Wicklund (theBluWiz).
