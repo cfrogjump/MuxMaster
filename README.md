@@ -29,7 +29,7 @@ muxm --profile atv-directplay-hq movie.mkv
 
 ## 💡 Why MuxMaster? <a id="why"></a>
 
-Getting a Blu-ray rip to play correctly on an Apple TV, a Roku, or through Plex without transcoding is a surprisingly deep problem. The video might be Dolby Vision Profile 7 that needs conversion to Profile 8.1. The audio might be TrueHD, which your player can't direct-play, so you need E-AC-3 — but you also want a stereo AAC fallback for when you're watching on a phone. The forced subtitles need to be burned in because MP4 containers don't handle PGS bitmaps. And the color space metadata needs to survive the whole process.
+Getting a Blu-ray rip to direct-play correctly on an Apple TV, a Roku, or through Plex — without the server transcoding on the fly — is a surprisingly deep problem. The video might be Dolby Vision Profile 7 that needs conversion to Profile 8.1. The audio might be TrueHD, which your player can't direct-play, so you need E-AC-3 — but you also want a stereo AAC fallback for when you're watching on a phone. The forced subtitles need to be burned in because MP4 containers don't handle PGS bitmaps. And the color space metadata needs to survive the whole process.
 
 You can solve all of this with raw ffmpeg, but the command will be 15+ flags long, different for every source file, and you'll need to inspect the source with ffprobe first to decide what half of those flags should be. Every new file is a new puzzle.
 
@@ -177,6 +177,7 @@ sudo cp muxm /usr/local/bin/muxm
 - **bc** – arithmetic evaluation for frame-rate and bitrate calculations
 
 **Optional (auto-disabled if missing):**
+- **ffmpeg with libass** (`ffmpeg-full` on Homebrew) – required for subtitle burn-in (`--sub-burn-forced`); the standard `ffmpeg` package works for all other features
 - **dovi_tool** – Dolby Vision RPU extraction/injection; DV handling is automatically disabled if missing
 - **MP4Box** (gpac) – DV container-level signaling verification
 - **sub2srt** or **pgsrip** – PGS bitmap subtitle OCR to SRT (configurable via `--ocr-tool`)
