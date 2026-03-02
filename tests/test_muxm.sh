@@ -53,9 +53,11 @@ skip() { SKIP=$((SKIP + 1)); printf "%b  ⏭  SKIP: %s%b\n" "$YELLOW" "$*" "$NC"
 section() { printf "\n%b━━━ %s ━━━%b\n" "$BOLD" "$*" "$NC"; }
 
 # Run muxm from TESTDIR to avoid picking up .muxmrc from the user's PWD.
+# -K (--keep-temp-always) preserves workdirs for post-mortem debugging
+# (encode.err, muxm.*.log).  They live under $TESTDIR and are cleaned with it.
 # The trailing `|| true` prevents set -e from aborting when muxm returns non-zero
 # (which is expected in many test cases).
-run_muxm() { (cd "$TESTDIR" && "$MUXM" "$@" 2>&1) || true; }
+run_muxm() { (cd "$TESTDIR" && "$MUXM" -K "$@" 2>&1) || true; }
 # Assert exit code.
 # The `&& code=$? || code=$?` idiom captures the exit code regardless of success
 # or failure without triggering set -e.  $? is 0 on the && branch, non-zero on ||.
