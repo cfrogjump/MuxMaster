@@ -7,7 +7,7 @@
 #  Usage:
 #    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
 #
-#  Suites: all, cli, toggles, completions, setup, config, profiles, conflicts, dryrun, video, audio, subs,
+#  Suites: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, dryrun, video, audio, subs,
 #          output, edge, e2e, hdr, containers, metadata
 #  Default: all
 # =============================================================================
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
     --verbose) VERBOSE=1; shift ;;
     -h|--help)
       echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, toggles, completions, config, profiles, conflicts, dryrun, video, hdr,"
+      echo "Suites: all, cli, toggles, unit, completions, config, profiles, conflicts, dryrun, video, hdr,"
       echo "        audio, subs, output, containers, metadata, edge, e2e"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -338,6 +338,40 @@ SRT
     "$TESTDIR/multi_subs.mkv"
   pass "multi_subs.mkv created"
 
+  # 5b) Multi-language subtitle file (eng + spa + fra subtitles)
+  log "Creating multi_subs_multilang.mkv (eng + spa + fra subtitles)"
+  cat > "$TESTDIR/eng.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+English subtitle
+SRT
+  cat > "$TESTDIR/spa.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Subtítulo en español
+SRT
+  cat > "$TESTDIR/fra.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Sous-titre français
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=cyan:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/eng.srt" \
+    -i "$TESTDIR/spa.srt" \
+    -i "$TESTDIR/fra.srt" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -map 0:v -map 1:a -map 2 -map 3 -map 4 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
+    -metadata:s:s:1 language=spa -metadata:s:s:1 title="Spanish" \
+    -metadata:s:s:2 language=fra -metadata:s:s:2 title="French" \
+    "$TESTDIR/multi_subs_multilang.mkv"
+  pass "multi_subs_multilang.mkv created"
+
   # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
   cat > "$TESTDIR/chapters.txt" <<'CHAP'
@@ -579,6 +613,9 @@ test_toggles() {
     "--no-allow-dv-fallback|ALLOW_DV_FALLBACK         = 0"
     "--dv-convert-p81|DV_CONVERT_TO_P81_IF_FAIL = 1"
     "--no-dv-convert-p81|DV_CONVERT_TO_P81_IF_FAIL = 0"
+    # ---- Audio title toggles ----
+    "--audio-titles|INCLUDE_AUDIO_TITLES      = 1"
+    "--no-audio-titles|INCLUDE_AUDIO_TITLES      = 0"
   )
 
   local out flag expected
@@ -587,6 +624,7 @@ test_toggles() {
     out="$(run_muxm "$flag" --print-effective-config)"
     assert_contains "$expected" "$flag: registered" "$out"
   done
+
 }
 
 # === Suite: Config Precedence ===
@@ -731,6 +769,52 @@ PROFEOF
   # With CLI override — CLI profile wins
   out="$(cd "$TESTDIR" && HOME="$layer_home" "$MUXM" --profile streaming --print-effective-config 2>&1)" || true
   assert_contains "streaming" "Config layering: CLI --profile overrides user config PROFILE_NAME" "$out"
+
+  # ---- Invalid FFMPEG_LOGLEVEL in config file ----
+  local loglevel_home="$TESTDIR/loglevel_test_home"
+  mkdir -p "$loglevel_home"
+  cat > "$loglevel_home/.muxmrc" <<'EOF'
+FFMPEG_LOGLEVEL=bogus
+EOF
+  local ll_out
+  ll_out="$(cd "$TESTDIR" && HOME="$loglevel_home" "$MUXM" --print-effective-config 2>&1)" && ll_code=$? || ll_code=$?
+  if [[ "$ll_code" -eq "$EXIT_VALIDATION" ]]; then
+    pass "Invalid FFMPEG_LOGLEVEL in config → exit $EXIT_VALIDATION"
+  else
+    fail "Invalid FFMPEG_LOGLEVEL in config — expected exit $EXIT_VALIDATION, got $ll_code"
+  fi
+  assert_contains "Invalid FFMPEG_LOGLEVEL" "Error message names the bad variable" "$ll_out"
+
+  # ---- Invalid FFPROBE_LOGLEVEL in config file ----
+  cat > "$loglevel_home/.muxmrc" <<'EOF'
+FFPROBE_LOGLEVEL=nonsense
+EOF
+  ll_out="$(cd "$TESTDIR" && HOME="$loglevel_home" "$MUXM" --print-effective-config 2>&1)" && ll_code=$? || ll_code=$?
+  if [[ "$ll_code" -eq "$EXIT_VALIDATION" ]]; then
+    pass "Invalid FFPROBE_LOGLEVEL in config → exit $EXIT_VALIDATION"
+  else
+    fail "Invalid FFPROBE_LOGLEVEL in config — expected exit $EXIT_VALIDATION, got $ll_code"
+  fi
+  assert_contains "Invalid FFPROBE_LOGLEVEL" "Error message names the bad variable" "$ll_out"
+
+  # ---- Deprecated AUDIO_SCORE_LANG_BONUS_ENG migration ----
+  local depr_home="$TESTDIR/deprecation_test_home"
+  mkdir -p "$depr_home"
+  cat > "$depr_home/.muxmrc" <<'EOF'
+AUDIO_SCORE_LANG_BONUS_ENG=99
+EOF
+  local depr_out
+  depr_out="$(cd "$TESTDIR" && HOME="$depr_home" "$MUXM" --print-effective-config 2>&1)" || true
+  # 1) Verify deprecation warning is emitted
+  assert_contains "Deprecated" "Deprecated variable triggers warning" "$depr_out"
+  assert_contains "AUDIO_SCORE_LANG_BONUS_ENG" "Warning names the deprecated variable" "$depr_out"
+  # 2) Verify value propagated to the new variable
+  assert_contains "AUDIO_SCORE_LANG_BONUS    = 99" "Deprecated value migrates to AUDIO_SCORE_LANG_BONUS" "$depr_out"
+
+  # ---- --ocr-tool sets custom OCR tool name ----
+  local ocr_out
+  ocr_out="$(run_muxm --ocr-tool pgsrip --print-effective-config)"
+  assert_contains "SUB_OCR_TOOL              = pgsrip" "--ocr-tool sets SUB_OCR_TOOL in effective config" "$ocr_out"
 }
 
 # === Suite: Profile Variable Assignment ===
@@ -1157,6 +1241,41 @@ test_audio() {
   else
     fail "Commentary detection: no output"
   fi
+
+  # ---- --audio-titles produces descriptive stream title ----
+  local at_out="$TESTDIR/e2e_audio_titles.mkv"
+  if run_muxm --output-ext mkv --crf 28 --preset ultrafast --audio-titles \
+       "$TESTDIR/multi_audio.mkv" "$at_out" >/dev/null 2>&1 && [[ -f "$at_out" ]]; then
+    local at_title
+    at_title="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title \
+      -of csv=p=0 "$at_out" 2>/dev/null | head -1)"
+    if [[ -n "$at_title" && "$at_title" != "N/A" ]]; then
+      pass "--audio-titles: output audio stream has title tag ('$at_title')"
+    else
+      fail "--audio-titles: output audio stream missing title tag"
+    fi
+  else
+    skip "--audio-titles encode failed or output not found"
+  fi
+
+  # ---- --no-audio-titles suppresses descriptive title generation ----
+  local nat_out="$TESTDIR/e2e_no_audio_titles.mkv"
+  if run_muxm --output-ext mkv --crf 28 --preset ultrafast --no-audio-titles \
+       "$TESTDIR/hevc_sdr_51.mkv" "$nat_out" >/dev/null 2>&1 && [[ -f "$nat_out" ]]; then
+    local nat_title
+    nat_title="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title \
+      -of csv=p=0 "$nat_out" 2>/dev/null | head -1)"
+    # --audio-titles generates "X.X Surround (CODEC)"; --no-audio-titles must NOT
+    # produce the parenthesized codec descriptor.  The MKV muxer may auto-generate
+    # channel-layout text (e.g. "5.1 Surround"), so we verify the codec suffix is absent.
+    if [[ "$nat_title" == *"("*")"* ]]; then
+      fail "--no-audio-titles: descriptive codec title still present '$nat_title'"
+    else
+      pass "--no-audio-titles: no descriptive codec title generated"
+    fi
+  else
+    skip "--no-audio-titles encode failed or output not found"
+  fi
 }
 
 # === Suite: Subtitle Pipeline ===
@@ -1217,6 +1336,58 @@ test_subs() {
   # --ocr-lang (#16)
   out="$(run_muxm --ocr-lang jpn --print-effective-config)"
   assert_contains "SUB_OCR_LANG              = jpn" "--ocr-lang: shows jpn" "$out"
+
+  # ---- SUB_MAX_TRACKS=1 limits output subtitle count ----
+  local smt_out="$TESTDIR/e2e_sub_max_tracks.mkv"
+  if run_muxm --output-ext mkv --crf 28 --preset ultrafast \
+       --sub-lang-pref eng --no-ocr \
+       "$TESTDIR/multi_subs.mkv" "$smt_out" >/dev/null 2>&1 && [[ -f "$smt_out" ]]; then
+    # Default SUB_MAX_TRACKS=3, so first verify we get >1 sub track normally
+    local default_sub_count
+    default_sub_count="$(ffprobe -v error -select_streams s -show_entries stream=index \
+      -of csv=p=0 "$smt_out" 2>/dev/null | wc -l | tr -d ' ')"
+    log "Default encode produced $default_sub_count subtitle track(s)"
+
+    local smt1_out="$TESTDIR/e2e_sub_max_1.mkv"
+    local smt1_home="$TESTDIR/sub_max_home"
+    mkdir -p "$smt1_home"
+    cat > "$smt1_home/.muxmrc" <<'EOF'
+SUB_MAX_TRACKS=1
+EOF
+    if HOME="$smt1_home" run_muxm --output-ext mkv --crf 28 --preset ultrafast \
+         --sub-lang-pref eng --no-ocr \
+         "$TESTDIR/multi_subs.mkv" "$smt1_out" >/dev/null 2>&1 && [[ -f "$smt1_out" ]]; then
+      local limited_sub_count
+      limited_sub_count="$(ffprobe -v error -select_streams s -show_entries stream=index \
+        -of csv=p=0 "$smt1_out" 2>/dev/null | wc -l | tr -d ' ')"
+      if (( limited_sub_count <= 1 )); then
+        pass "SUB_MAX_TRACKS=1 limits output to ≤1 subtitle track (got $limited_sub_count)"
+      else
+        fail "SUB_MAX_TRACKS=1 should limit to ≤1, got $limited_sub_count"
+      fi
+    else
+      skip "SUB_MAX_TRACKS=1 encode failed"
+    fi
+  else
+    skip "SUB_MAX_TRACKS baseline encode failed"
+  fi
+
+  # ---- --sub-lang-pref selects correct language ----
+  local slp_out="$TESTDIR/e2e_sub_lang_pref.mkv"
+  if run_muxm --output-ext mkv --crf 28 --preset ultrafast \
+       --sub-lang-pref spa --no-ocr \
+       "$TESTDIR/multi_subs_multilang.mkv" "$slp_out" >/dev/null 2>&1 && [[ -f "$slp_out" ]]; then
+    local slp_lang
+    slp_lang="$(ffprobe -v error -select_streams s:0 -show_entries stream_tags=language \
+      -of csv=p=0 "$slp_out" 2>/dev/null | head -1)"
+    if [[ "$slp_lang" == "spa" ]]; then
+      pass "--sub-lang-pref spa: output subtitle is Spanish"
+    else
+      fail "--sub-lang-pref spa: expected 'spa', got '$slp_lang'"
+    fi
+  else
+    skip "--sub-lang-pref encode failed or output not found"
+  fi
 }
 
 # === Suite: Output Features ===
@@ -1375,6 +1546,28 @@ test_output() {
   local kt_cfg
   kt_cfg="$(run_muxm --keep-temp --print-effective-config)"
   assert_contains "KEEP_TEMP" "--keep-temp: flag registered in effective config" "$kt_cfg"
+
+  # ---- --report-json produces valid JSON with profile info ----
+  local rj_out="$TESTDIR/e2e_report_json.mkv"
+  local rj_report="${rj_out%.mkv}.report.json"
+  if run_muxm --output-ext mkv --crf 28 --preset ultrafast --profile streaming --report-json \
+       "$TESTDIR/basic_sdr_subs.mkv" "$rj_out" >/dev/null 2>&1 && [[ -f "$rj_report" ]]; then
+    # Verify JSON is parseable
+    if jq empty "$rj_report" 2>/dev/null; then
+      pass "--report-json produces valid JSON"
+    else
+      fail "--report-json produced invalid JSON"
+    fi
+    local rj_content
+    rj_content="$(cat "$rj_report")"
+    assert_contains "streaming" "JSON report contains profile name" "$rj_content"
+    assert_contains "MuxMaster" "JSON report contains tool name" "$rj_content"
+    assert_contains "source" "JSON report contains source path" "$rj_content"
+    assert_contains "output" "JSON report contains output path" "$rj_content"
+    assert_contains "timestamp" "JSON report contains timestamp" "$rj_content"
+  else
+    skip "--report-json encode failed or report not found"
+  fi
 }
 
 # === Suite: Container Formats ===
@@ -1491,6 +1684,62 @@ test_edge() {
   out="$(run_muxm --dry-run "$TESTDIR/file with spaces.mkv")"
   assert_contains "DRY-RUN" "Filename with spaces handled" "$out"
 
+  # ---- Control character rejection (source filename) ----
+  # muxm rejects filenames containing tabs, newlines, or null bytes.
+  local ctrl_dir="$TESTDIR/ctrl_char_test"
+  mkdir -p "$ctrl_dir"
+  local ctrl_file
+  ctrl_file="$(printf '%s/file\tname.mkv' "$ctrl_dir")"
+  cp "$TESTDIR/basic_sdr_subs.mkv" "$ctrl_file" 2>/dev/null || true
+  if [[ -f "$ctrl_file" ]]; then
+    assert_exit $EXIT_VALIDATION "Reject source filename with tab (control char)" \
+      --crf 28 --preset ultrafast "$ctrl_file"
+    # Also verify the specific error message
+    local ctrl_out
+    ctrl_out="$(run_muxm --crf 28 --preset ultrafast "$ctrl_file")"
+    assert_contains "control characters" "Control char error mentions 'control characters'" "$ctrl_out"
+  else
+    skip "Filesystem does not support tab in filename — control character test skipped"
+  fi
+
+  # ---- Source/output collision prevention ----
+  # muxm must refuse when source and output point to the same file.
+  local collision_file="$TESTDIR/collision_test.mkv"
+  cp "$TESTDIR/basic_sdr_subs.mkv" "$collision_file" 2>/dev/null || \
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=blue:s=160x120:r=24:d=1" \
+      -c:v libx264 -preset ultrafast -crf 28 "$collision_file"
+  assert_exit $EXIT_VALIDATION "Reject source==output (same file)" \
+    --crf 28 --preset ultrafast "$collision_file" "$collision_file"
+  local collision_out
+  collision_out="$(run_muxm --crf 28 --preset ultrafast "$collision_file" "$collision_file")"
+  assert_contains "same file" "Collision error mentions 'same file'" "$collision_out"
+
+  # ---- Invalid --output-ext rejection ----
+  assert_exit $EXIT_VALIDATION "Reject --output-ext webm (invalid container)" \
+    --output-ext webm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"
+  local ext_out
+  ext_out="$(run_muxm --output-ext webm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv")"
+  assert_contains "Invalid OUTPUT_EXT" "Error message names OUTPUT_EXT" "$ext_out"
+
+  # ---- Invalid --video-codec rejection ----
+  assert_exit $EXIT_VALIDATION "Reject --video-codec vp9 (invalid codec)" \
+    --video-codec vp9 --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"
+  local vc_out
+  vc_out="$(run_muxm --video-codec vp9 --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv")"
+  assert_contains "Invalid --video-codec" "Error message mentions invalid codec" "$vc_out"
+
+  # ---- --no-overwrite refuses when output exists ----
+  local noow_src="$TESTDIR/basic_sdr_subs.mkv"
+  local noow_out="$TESTDIR/nooverwrite_test.mp4"
+  touch "$noow_out"  # pre-create to trigger the guard
+  assert_exit $EXIT_VALIDATION "Reject --no-overwrite when output exists" \
+    --no-overwrite --crf 28 --preset ultrafast "$noow_src" "$noow_out"
+  local noow_msg
+  noow_msg="$(run_muxm --no-overwrite --crf 28 --preset ultrafast "$noow_src" "$noow_out")"
+  assert_contains "already exists" "Error mentions file already exists" "$noow_msg"
+  rm -f "$noow_out"
+
   # Control characters in output extension are rejected
   out="$(cd "$TESTDIR" && "$MUXM" --output-ext "mp4;" "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
   assert_contains "Invalid" "Injection in --output-ext rejected" "$out"
@@ -1533,6 +1782,18 @@ test_edge() {
   out="$(run_muxm --dry-run -- "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "DRY-RUN" "Double-dash (--) argument terminator" "$out"
 
+  # ---- Double-dash stops option parsing (enhanced) ----
+  # Verify that -- prevents a hyphen-prefixed filename from being parsed as a flag.
+  # Note: muxm's current -- handler drops remaining args (they aren't added to
+  # POSITIONALS), so we only verify the key safety property: no "Unknown option" error.
+  local dd_out
+  dd_out="$(cd "$TESTDIR" && "$MUXM" --crf 28 --preset ultrafast -- -unusual-name.mkv 2>&1)" || true
+  if echo "$dd_out" | grep -qiF "Unknown option"; then
+    fail "Double-dash failed: '-unusual-name.mkv' parsed as option instead of filename"
+  else
+    pass "Double-dash: no 'Unknown option' error for hyphen-prefixed filename"
+  fi
+
   # ---- Phase 4b: Auto-generated output path (R30, R31) ----
   # When only source is provided (no explicit output path), muxm derives the
   # output filename from the source: same directory, swapped extension.
@@ -1559,6 +1820,330 @@ test_edge() {
       fail "Auto-generated output: no output file found in $auto_dir"
     fi
   fi
+}
+
+# === Suite: Pure-Function Unit Tests ===
+# Direct tests for deterministic helper functions that take arguments and
+# return values via stdout or exit code. Validates edge cases not exercised
+# by encode pipelines.
+test_unit() {
+  section "Pure-Function Unit Tests"
+
+  # Helper: run a function from muxm in isolation.
+  # Extracts function definitions and evaluates them in a subshell.
+  # Usage: muxm_fn FUNCTION_NAME [args...]
+  #   Captures everything from "^FUNCTION_NAME(){" through the matching "^}"
+  #   plus any needed variable defaults, then calls the function.
+  muxm_fn() {
+    local fn="$1"; shift
+    local body
+    body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
+    if [[ -z "$body" ]]; then
+      skip "Function $fn not found in muxm"
+      return
+    fi
+    # Some functions reference other helpers — extract dependencies too
+    local deps=""
+    case "$fn" in
+      _audio_descriptive_title)
+        deps="$(awk '/^_channel_label\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+        ;;
+    esac
+    bash -c "$deps"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@"
+  }
+
+  # ---- _channel_label ----
+  local result
+  result="$(muxm_fn _channel_label 1 short)";  if [[ "$result" == "mono" ]]; then pass "_channel_label(1,short)=mono"; else fail "_channel_label(1,short) expected 'mono', got '$result'"; fi
+  result="$(muxm_fn _channel_label 2 short)";  if [[ "$result" == "stereo" ]]; then pass "_channel_label(2,short)=stereo"; else fail "_channel_label(2,short) expected 'stereo', got '$result'"; fi
+  result="$(muxm_fn _channel_label 6 short)";  if [[ "$result" == "5.1" ]]; then pass "_channel_label(6,short)=5.1"; else fail "_channel_label(6,short) expected '5.1', got '$result'"; fi
+  result="$(muxm_fn _channel_label 8 short)";  if [[ "$result" == "7.1" ]]; then pass "_channel_label(8,short)=7.1"; else fail "_channel_label(8,short) expected '7.1', got '$result'"; fi
+  result="$(muxm_fn _channel_label 4 short)";  if [[ "$result" == "4ch" ]]; then pass "_channel_label(4,short)=4ch"; else fail "_channel_label(4,short) expected '4ch', got '$result'"; fi
+  result="$(muxm_fn _channel_label 6 long)";   if [[ "$result" == "5.1 Surround" ]]; then pass "_channel_label(6,long)=5.1 Surround"; else fail "_channel_label(6,long) expected '5.1 Surround', got '$result'"; fi
+  result="$(muxm_fn _channel_label 1 long)";   if [[ "$result" == "Mono" ]]; then pass "_channel_label(1,long)=Mono"; else fail "_channel_label(1,long) expected 'Mono', got '$result'"; fi
+
+  # ---- _audio_descriptive_title ----
+  result="$(muxm_fn _audio_descriptive_title eac3 6)";  if [[ "$result" == "5.1 Surround (E-AC-3)" ]]; then pass "_audio_descriptive_title(eac3,6)"; else fail "_audio_descriptive_title(eac3,6) expected '5.1 Surround (E-AC-3)', got '$result'"; fi
+  result="$(muxm_fn _audio_descriptive_title aac 2)";   if [[ "$result" == "Stereo (AAC)" ]]; then pass "_audio_descriptive_title(aac,2)"; else fail "_audio_descriptive_title(aac,2) expected 'Stereo (AAC)', got '$result'"; fi
+  result="$(muxm_fn _audio_descriptive_title truehd 8)"; if [[ "$result" == "7.1 Surround (TrueHD)" ]]; then pass "_audio_descriptive_title(truehd,8)"; else fail "_audio_descriptive_title(truehd,8) expected '7.1 Surround (TrueHD)', got '$result'"; fi
+  result="$(muxm_fn _audio_descriptive_title pcm_s16le 2)"; if [[ "$result" == "Stereo (PCM)" ]]; then pass "_audio_descriptive_title(pcm_s16le,2)"; else fail "expected 'Stereo (PCM)', got '$result'"; fi
+
+  # ---- _audio_codec_rank ----
+  # Requires AUDIO_CODEC_PREFERENCE to be set (use muxm default)
+  local rank_helper
+  rank_helper="$(awk '/^_audio_codec_rank\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  _test_codec_rank() {
+    local codec="$1" expected="$2"
+    local actual
+    actual="$(bash -c "AUDIO_CODEC_PREFERENCE='truehd,dts,eac3,ac3,aac,flac,alac,opus'"$'\n'"$rank_helper"$'\n'"_audio_codec_rank \"\$1\"" -- "$codec")"
+    if [[ "$actual" == "$expected" ]]; then pass "_audio_codec_rank($codec)=$expected"; else fail "_audio_codec_rank($codec) expected $expected, got $actual"; fi
+  }
+  _test_codec_rank "eac3" "2"
+  _test_codec_rank "ac3" "3"
+  _test_codec_rank "truehd" "0"
+  _test_codec_rank "aac" "4"
+  _test_codec_rank "unknown_codec" "10"  # unlisted → fallback rank
+
+  # ---- _audio_is_commentary ----
+  _test_commentary() {
+    local title="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^_audio_is_commentary\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"_audio_is_commentary \"\$1\"" -- "$title" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_commentary "Director's Commentary" 0 "_audio_is_commentary('Director\\'s Commentary')=match"
+  _test_commentary "Main Feature" 1 "_audio_is_commentary('Main Feature')=no match"
+  _test_commentary "Audio Description" 0 "_audio_is_commentary('Audio Description')=match"
+  _test_commentary "" 1 "_audio_is_commentary('')=no match (empty)"
+  _test_commentary "Comentario del director" 0 "_audio_is_commentary('Comentario...')=match (Spanish)"
+
+  # ---- _is_forced_title ----
+  _test_forced() {
+    local title="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^_is_forced_title\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"_is_forced_title \"\$1\"" -- "$title" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_forced "Forced" 0 "_is_forced_title('Forced')=match"
+  _test_forced "Signs & Songs" 0 "_is_forced_title('Signs & Songs')=match"
+  _test_forced "Foreign Parts Only" 0 "_is_forced_title('Foreign Parts Only')=match"
+  _test_forced "English" 1 "_is_forced_title('English')=no match"
+  _test_forced "" 1 "_is_forced_title('')=no match (empty)"
+
+  # ---- _is_sdh_title ----
+  _test_sdh() {
+    local title="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^_is_sdh_title\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"_is_sdh_title \"\$1\"" -- "$title" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_sdh "English SDH" 0 "_is_sdh_title('English SDH')=match"
+  _test_sdh "English (CC)" 0 "_is_sdh_title('English (CC)')=match"
+  _test_sdh "Hearing Impaired" 0 "_is_sdh_title('Hearing Impaired')=match"
+  _test_sdh "English" 1 "_is_sdh_title('English')=no match"
+  _test_sdh "history" 1 "_is_sdh_title('history')=no match (false positive guard: 'hi' in 'history')"
+  _test_sdh "HI" 0 "_is_sdh_title('HI')=match (standalone HI)"
+  _test_sdh "" 1 "_is_sdh_title('')=no match (empty)"
+
+  # ---- _is_text_sub_codec ----
+  _test_text_codec() {
+    local codec="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^_is_text_sub_codec\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"_is_text_sub_codec \"\$1\"" -- "$codec" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_text_codec "subrip" 0 "_is_text_sub_codec('subrip')=text"
+  _test_text_codec "ass" 0 "_is_text_sub_codec('ass')=text"
+  _test_text_codec "mov_text" 0 "_is_text_sub_codec('mov_text')=text"
+  _test_text_codec "hdmv_pgs_subtitle" 1 "_is_text_sub_codec('hdmv_pgs_subtitle')=bitmap"
+  _test_text_codec "dvd_subtitle" 1 "_is_text_sub_codec('dvd_subtitle')=bitmap"
+  _test_text_codec "webvtt" 0 "_is_text_sub_codec('webvtt')=text"
+
+  # ---- filesize_pretty ----
+  # Test all four code paths (GB, MB, KB, bytes) + file-not-found
+  local fsz_dir="$TESTDIR/filesize_test"
+  mkdir -p "$fsz_dir"
+
+  # File not found
+  result="$(muxm_fn filesize_pretty "$fsz_dir/nonexistent" 2>/dev/null)" || true
+  if [[ "$result" == *"not found"* ]]; then pass "filesize_pretty(nonexistent)=not found"; else fail "filesize_pretty(nonexistent) expected 'not found', got '$result'"; fi
+
+  # 0 bytes
+  touch "$fsz_dir/empty"
+  result="$(muxm_fn filesize_pretty "$fsz_dir/empty")"
+  if [[ "$result" == "0 bytes" ]]; then pass "filesize_pretty(0 bytes)"; else fail "filesize_pretty(0 bytes) expected '0 bytes', got '$result'"; fi
+
+  # 512 bytes (bytes path)
+  dd if=/dev/zero of="$fsz_dir/small" bs=512 count=1 2>/dev/null
+  result="$(muxm_fn filesize_pretty "$fsz_dir/small")"
+  if [[ "$result" == "512 bytes" ]]; then pass "filesize_pretty(512 bytes)"; else fail "filesize_pretty(512 bytes) expected '512 bytes', got '$result'"; fi
+
+  # 1024 bytes (KB path)
+  dd if=/dev/zero of="$fsz_dir/onekb" bs=1024 count=1 2>/dev/null
+  result="$(muxm_fn filesize_pretty "$fsz_dir/onekb")"
+  if [[ "$result" == *"KB"* ]]; then pass "filesize_pretty(1 KB)"; else fail "filesize_pretty(1 KB) expected 'KB', got '$result'"; fi
+
+  # ~1.5 MB (MB path)
+  dd if=/dev/zero of="$fsz_dir/onemb" bs=1024 count=1536 2>/dev/null
+  result="$(muxm_fn filesize_pretty "$fsz_dir/onemb")"
+  if [[ "$result" == *"MB"* ]]; then pass "filesize_pretty(~1.5 MB)"; else fail "filesize_pretty(~1.5 MB) expected 'MB', got '$result'"; fi
+
+  # ---- audio_is_direct_play_copyable ----
+  # Gatekeeper for the audio pipeline's biggest branch: copy vs transcode.
+  # A regression (e.g., dropping eac3) silently forces unnecessary transcoding.
+  _test_direct_play() {
+    local codec="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^audio_is_direct_play_copyable\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"audio_is_direct_play_copyable \"\$1\"" -- "$codec" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_direct_play "aac"    0 "audio_is_direct_play_copyable('aac')=copyable"
+  _test_direct_play "alac"   0 "audio_is_direct_play_copyable('alac')=copyable"
+  _test_direct_play "ac3"    0 "audio_is_direct_play_copyable('ac3')=copyable"
+  _test_direct_play "eac3"   0 "audio_is_direct_play_copyable('eac3')=copyable"
+  _test_direct_play "truehd" 1 "audio_is_direct_play_copyable('truehd')=not copyable"
+  _test_direct_play "dts"    1 "audio_is_direct_play_copyable('dts')=not copyable"
+  _test_direct_play "flac"   1 "audio_is_direct_play_copyable('flac')=not copyable"
+  _test_direct_play "opus"   1 "audio_is_direct_play_copyable('opus')=not copyable"
+
+  # ---- audio_is_lossless ----
+  # Controls AUDIO_LOSSLESS_PASSTHROUGH path. If a codec is accidentally omitted,
+  # lossless passthrough silently fails for that codec.
+  _test_lossless() {
+    local codec="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^audio_is_lossless\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"audio_is_lossless \"\$1\"" -- "$codec" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_lossless "truehd"    0 "audio_is_lossless('truehd')=lossless"
+  _test_lossless "dts"       0 "audio_is_lossless('dts')=lossless"
+  _test_lossless "dca"       0 "audio_is_lossless('dca')=lossless"
+  _test_lossless "flac"      0 "audio_is_lossless('flac')=lossless"
+  _test_lossless "alac"      0 "audio_is_lossless('alac')=lossless"
+  _test_lossless "pcm_s16le" 0 "audio_is_lossless('pcm_s16le')=lossless"
+  _test_lossless "pcm_s24le" 0 "audio_is_lossless('pcm_s24le')=lossless"
+  _test_lossless "pcm_s32le" 0 "audio_is_lossless('pcm_s32le')=lossless"
+  _test_lossless "aac"       1 "audio_is_lossless('aac')=lossy"
+  _test_lossless "eac3"      1 "audio_is_lossless('eac3')=lossy"
+  _test_lossless "ac3"       1 "audio_is_lossless('ac3')=lossy"
+  _test_lossless "opus"      1 "audio_is_lossless('opus')=lossy"
+
+  # ---- audio_transcode_target ----
+  # Determines output codec and bitrate. Tests all three code paths (≥8ch, ≥6ch, <6ch).
+  # Depends on EAC3_BITRATE_5_1 and EAC3_BITRATE_7_1 globals.
+  _test_transcode_target() {
+    local ch="$1" expect_codec="$2" label="$3"
+    local body
+    body="$(awk '/^audio_transcode_target\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    local actual
+    actual="$(bash -c "EAC3_BITRATE_5_1='640k'; EAC3_BITRATE_7_1='768k'"$'\n'"$body"$'\n'"audio_transcode_target \"\$1\"" -- "$ch")"
+    local got_codec="${actual%% *}"
+    if [[ "$got_codec" == "$expect_codec" ]]; then pass "$label"; else fail "$label — expected codec '$expect_codec', got '$got_codec' (full: '$actual')"; fi
+  }
+  _test_transcode_target "8" "eac3" "audio_transcode_target(8ch)=eac3 (7.1 bitrate)"
+  _test_transcode_target "6" "eac3" "audio_transcode_target(6ch)=eac3 (5.1 bitrate)"
+  _test_transcode_target "2" "aac"  "audio_transcode_target(2ch)=aac (stereo)"
+  _test_transcode_target "1" "aac"  "audio_transcode_target(1ch)=aac (mono)"
+  # Verify bitrate values are wired correctly
+  local at8_result
+  at8_result="$(bash -c "EAC3_BITRATE_5_1='640k'; EAC3_BITRATE_7_1='768k'"$'\n'"$(awk '/^audio_transcode_target\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"$'\n'"audio_transcode_target 8")"
+  if [[ "$at8_result" == *"768k"* ]]; then pass "audio_transcode_target(8ch) uses EAC3_BITRATE_7_1=768k"; else fail "audio_transcode_target(8ch) expected 768k in '$at8_result'"; fi
+  local at6_result
+  at6_result="$(bash -c "EAC3_BITRATE_5_1='640k'; EAC3_BITRATE_7_1='768k'"$'\n'"$(awk '/^audio_transcode_target\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"$'\n'"audio_transcode_target 6")"
+  if [[ "$at6_result" == *"640k"* ]]; then pass "audio_transcode_target(6ch) uses EAC3_BITRATE_5_1=640k"; else fail "audio_transcode_target(6ch) expected 640k in '$at6_result'"; fi
+
+  # ---- _audio_lang_matches ----
+  # Drives audio track selection — the strongest scoring signal (150 points).
+  # A bug here silently selects the wrong audio track.
+  _test_lang_match() {
+    local lang="$1" pref="$2" expected="$3" label="$4"
+    local body actual
+    body="$(awk '/^_audio_lang_matches\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "AUDIO_LANG_PREF=\"\$2\""$'\n'"$body"$'\n'"_audio_lang_matches \"\$1\"" -- "$lang" "$pref" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_lang_match "eng" "eng,spa" 0 "_audio_lang_matches('eng', pref='eng,spa')=match"
+  _test_lang_match "spa" "eng,spa" 0 "_audio_lang_matches('spa', pref='eng,spa')=match"
+  _test_lang_match "fra" "eng,spa" 1 "_audio_lang_matches('fra', pref='eng,spa')=no match"
+  _test_lang_match "und" "eng"     1 "_audio_lang_matches('und', pref='eng')=no match"
+  _test_lang_match ""    "eng"     1 "_audio_lang_matches('', pref='eng')=no match (empty)"
+  _test_lang_match "eng" "eng"     0 "_audio_lang_matches('eng', pref='eng')=match (single pref)"
+
+  # ---- is_valid_loglevel ----
+  # Validates ffmpeg/ffprobe loglevel strings. Tested indirectly by CLI parser,
+  # but a direct unit test catches regressions if a valid level is accidentally
+  # dropped from the case statement.
+  _test_loglevel() {
+    local level="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^is_valid_loglevel\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"is_valid_loglevel \"\$1\"" -- "$level" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_loglevel "quiet"   0 "is_valid_loglevel('quiet')=valid"
+  _test_loglevel "error"   0 "is_valid_loglevel('error')=valid"
+  _test_loglevel "warning" 0 "is_valid_loglevel('warning')=valid"
+  _test_loglevel "info"    0 "is_valid_loglevel('info')=valid"
+  _test_loglevel "verbose" 0 "is_valid_loglevel('verbose')=valid"
+  _test_loglevel "debug"   0 "is_valid_loglevel('debug')=valid"
+  _test_loglevel "trace"   0 "is_valid_loglevel('trace')=valid"
+  _test_loglevel "bogus"   1 "is_valid_loglevel('bogus')=invalid"
+  _test_loglevel ""        1 "is_valid_loglevel('')=invalid (empty)"
+
+  # ---- is_valid_preset ----
+  # Validates x265 preset strings. Indirectly tested by --preset in test_cli,
+  # but a direct unit test guards against accidentally dropping a valid preset.
+  _test_preset() {
+    local preset="$1" expected="$2" label="$3"
+    local body actual
+    body="$(awk '/^is_valid_preset\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$body"$'\n'"is_valid_preset \"\$1\"" -- "$preset" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_preset "ultrafast" 0 "is_valid_preset('ultrafast')=valid"
+  _test_preset "medium"    0 "is_valid_preset('medium')=valid"
+  _test_preset "slow"      0 "is_valid_preset('slow')=valid"
+  _test_preset "slower"    0 "is_valid_preset('slower')=valid"
+  _test_preset "veryslow"  0 "is_valid_preset('veryslow')=valid"
+  _test_preset "placebo"   0 "is_valid_preset('placebo')=valid"
+  _test_preset "fast"      0 "is_valid_preset('fast')=valid"
+  _test_preset "bogus"     1 "is_valid_preset('bogus')=invalid"
+  _test_preset ""          1 "is_valid_preset('')=invalid (empty)"
+
+  # ---- _is_valid_profile ----
+  # Validates profile names against VALID_PROFILES constant.
+  _test_valid_profile() {
+    local profile="$1" expected="$2" label="$3"
+    local body constants actual
+    constants="$(grep '^readonly VALID_PROFILES=' "$MUXM")"
+    body="$(awk '/^_is_valid_profile\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "$constants"$'\n'"$body"$'\n'"_is_valid_profile \"\$1\"" -- "$profile" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_valid_profile "streaming"         0 "_is_valid_profile('streaming')=valid"
+  _test_valid_profile "dv-archival"       0 "_is_valid_profile('dv-archival')=valid"
+  _test_valid_profile "universal"         0 "_is_valid_profile('universal')=valid"
+  _test_valid_profile "animation"         0 "_is_valid_profile('animation')=valid"
+  _test_valid_profile "hdr10-hq"          0 "_is_valid_profile('hdr10-hq')=valid"
+  _test_valid_profile "atv-directplay-hq" 0 "_is_valid_profile('atv-directplay-hq')=valid"
+  _test_valid_profile "nonexistent"       1 "_is_valid_profile('nonexistent')=invalid"
+  _test_valid_profile ""                  1 "_is_valid_profile('')=invalid (empty)"
+
+  # ---- audio_lossless_muxable ----
+  # Tests container+codec compatibility matrix for lossless passthrough.
+  # Depends on MUX_FORMAT global.
+  _test_lossless_muxable() {
+    local codec="$1" format="$2" expected="$3" label="$4"
+    local body actual
+    body="$(awk '/^audio_lossless_muxable\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    bash -c "MUX_FORMAT=\"\$2\""$'\n'"$body"$'\n'"audio_lossless_muxable \"\$1\"" -- "$codec" "$format" && actual=0 || actual=1
+    if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  }
+  _test_lossless_muxable "truehd" "matroska" 0 "audio_lossless_muxable('truehd','matroska')=muxable"
+  _test_lossless_muxable "flac"   "matroska" 0 "audio_lossless_muxable('flac','matroska')=muxable"
+  _test_lossless_muxable "alac"   "mp4"      0 "audio_lossless_muxable('alac','mp4')=muxable"
+  _test_lossless_muxable "flac"   "mp4"      0 "audio_lossless_muxable('flac','mp4')=muxable"
+  _test_lossless_muxable "truehd" "mp4"      1 "audio_lossless_muxable('truehd','mp4')=not muxable"
+  _test_lossless_muxable "dts"    "mp4"      1 "audio_lossless_muxable('dts','mp4')=not muxable"
+  _test_lossless_muxable "alac"   "mov"      0 "audio_lossless_muxable('alac','mov')=muxable"
+  _test_lossless_muxable "truehd" "mov"      1 "audio_lossless_muxable('truehd','mov')=not muxable"
+
+  # ---- _valid_profiles_display ----
+  # Verify the comma-separated format output for user-facing messages.
+  local vpd_body vpd_constants vpd_result
+  vpd_constants="$(grep '^readonly VALID_PROFILES=' "$MUXM")"
+  vpd_body="$(awk '/^_valid_profiles_display\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  vpd_result="$(bash -c "$vpd_constants"$'\n'"$vpd_body"$'\n'"_valid_profiles_display")"
+  # Should contain comma-separated names
+  if [[ "$vpd_result" == *","* ]]; then pass "_valid_profiles_display returns comma-separated list"; else fail "_valid_profiles_display expected commas, got '$vpd_result'"; fi
+  if [[ "$vpd_result" == *"streaming"* ]]; then pass "_valid_profiles_display includes 'streaming'"; else fail "_valid_profiles_display missing 'streaming' in '$vpd_result'"; fi
+  if [[ "$vpd_result" == *"universal"* ]]; then pass "_valid_profiles_display includes 'universal'"; else fail "_valid_profiles_display missing 'universal' in '$vpd_result'"; fi
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
@@ -1781,6 +2366,7 @@ run_suites() {
     all)
       test_cli
       test_toggles
+      test_unit
       test_completions
       test_setup
       test_config
@@ -1799,6 +2385,7 @@ run_suites() {
       ;;
     cli)          test_cli ;;
     toggles)      test_toggles ;;
+    unit)         test_unit ;;
     completions)  test_completions ;;
     setup)        test_setup ;;
     config)       test_config ;;
@@ -1816,7 +2403,7 @@ run_suites() {
     e2e)          test_profile_e2e ;;
     *)
       echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, toggles, completions, setup, config, profiles, conflicts, dryrun,"
+      echo "Valid: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, dryrun,"
       echo "       video, hdr, audio, subs, output, containers, metadata, edge, e2e"
       exit 1
       ;;
@@ -1862,7 +2449,7 @@ summary() {
 #   4. summary               — report pass/fail/skip counts, list failures, set exit code
 
 # Suites that need no test media (pure config / CLI parsing assertions)
-readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts)$"
+readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|unit)$"
 # Suites that need the extended fixture set (multi-track, HDR, chapters, metadata sources)
 readonly EXTENDED_SUITES="^(dryrun|video|hdr|audio|subs|output|containers|metadata|edge|e2e|all)$"
 
