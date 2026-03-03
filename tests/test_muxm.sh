@@ -58,6 +58,11 @@ section() { printf "\n%b━━━ %s ━━━%b\n" "$BOLD" "$*" "$NC"; }
 # The trailing `|| true` prevents set -e from aborting when muxm returns non-zero
 # (which is expected in many test cases).
 run_muxm() { (cd "$TESTDIR" && "$MUXM" -K "$@" 2>&1) || true; }
+# Run muxm from a specific directory with an optional HOME override.
+# Covers cases where tests need a custom PWD (for .muxmrc) or isolated HOME.
+# Usage: run_muxm_in DIR [muxm flags...]
+#   Set MUXM_HOME before calling to override HOME; defaults to real $HOME.
+run_muxm_in() { local dir="$1"; shift; (cd "$dir" && HOME="${MUXM_HOME:-$HOME}" "$MUXM" -K "$@" 2>&1) || true; }
 # Assert exit code.
 # The `&& code=$? || code=$?` idiom captures the exit code regardless of success
 # or failure without triggering set -e.  $? is 0 on the && branch, non-zero on ||.
@@ -500,7 +505,7 @@ test_cli() {
   assert_exit $EXIT_VALIDATION "Too many args exits $EXIT_VALIDATION" a.mkv b.mp4 c.mp4
 
   # Source = output prevention
-  out="$(cd "$TESTDIR" && "$MUXM" --output-ext mkv "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
+  out="$(run_muxm --output-ext mkv "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "same file" "Source=output prevented" "$out"
 
   # --no-overwrite: should refuse when output already exists (#28)
@@ -508,8 +513,8 @@ test_cli() {
   local pre_out
   pre_out="$(run_muxm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$out_exist")"
   if [[ -f "$out_exist" ]]; then
-    out="$(cd "$TESTDIR" && "$MUXM" --no-overwrite --crf 28 --preset ultrafast \
-      "$TESTDIR/basic_sdr_subs.mkv" "$out_exist" 2>&1)" || true
+    out="$(run_muxm --no-overwrite --crf 28 --preset ultrafast \
+      "$TESTDIR/basic_sdr_subs.mkv" "$out_exist")"
     assert_contains "exists" "--no-overwrite refuses existing output" "$out"
   else
     log "--no-overwrite: preliminary encode failed: ${pre_out:0:500}"
@@ -658,16 +663,14 @@ test_config() {
 PROFILE_NAME="animation"
 EOF
   # Verify config file is picked up when running from that directory
-  out="$(cd "$cfg_profile_dir" && HOME="$cfg_profile_home" "$MUXM" --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$cfg_profile_home" run_muxm_in "$cfg_profile_dir" --print-effective-config)"
   assert_contains "animation" "Config file PROFILE_NAME loaded" "$out"
   log "Config file profile override tested via --print-effective-config"
 
   # --create-config (use a clean directory so no pre-existing .muxmrc)
   local cfg_create_dir="$TESTDIR/config_create_test"
   mkdir -p "$cfg_create_dir"
-  pushd "$cfg_create_dir" >/dev/null
-  out="$("$MUXM" --create-config project streaming 2>&1)" || true
-  popd >/dev/null
+  out="$(run_muxm_in "$cfg_create_dir" --create-config project streaming)"
   if [[ -f "$cfg_create_dir/.muxmrc" ]]; then
     pass "--create-config creates .muxmrc"
     # Check contents
@@ -678,11 +681,11 @@ EOF
     assert_contains "CRF_VALUE" "Config contains CRF_VALUE" "$cfg_content"
 
     # --create-config refuses overwrite
-    out="$(cd "$cfg_create_dir" && "$MUXM" --create-config project streaming 2>&1)" || true
+    out="$(run_muxm_in "$cfg_create_dir" --create-config project streaming)"
     assert_contains "already exists" "--create-config refuses overwrite" "$out"
 
     # --force-create-config overwrites
-    out="$(cd "$cfg_create_dir" && "$MUXM" --force-create-config project animation 2>&1)" || true
+    out="$(run_muxm_in "$cfg_create_dir" --force-create-config project animation)"
     cfg_content="$(cat "$cfg_create_dir/.muxmrc")"
     assert_contains "animation" "--force-create-config overwrites with new profile" "$cfg_content"
   else
@@ -698,9 +701,7 @@ EOF
   for p in "${profiles_to_test[@]}"; do
     local cfg_p_dir="$TESTDIR/config_create_$p"
     mkdir -p "$cfg_p_dir"
-    pushd "$cfg_p_dir" >/dev/null
-    out="$("$MUXM" --create-config project "$p" 2>&1)" || true
-    popd >/dev/null
+    out="$(run_muxm_in "$cfg_p_dir" --create-config project "$p")"
     if [[ -f "$cfg_p_dir/.muxmrc" ]]; then
       local content
       content="$(cat "$cfg_p_dir/.muxmrc")"
@@ -720,7 +721,7 @@ EOF
 CRF_VALUE=14
 PRESET_VALUE="slower"
 EOF
-  out="$(cd "$cfg_var_dir" && HOME="$cfg_var_home" "$MUXM" --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$cfg_var_home" run_muxm_in "$cfg_var_dir" --print-effective-config)"
   assert_contains "CRF_VALUE                 = 14" "Config file CRF_VALUE override" "$out"
   assert_contains "PRESET_VALUE              = slower" "Config file PRESET_VALUE override" "$out"
 
@@ -744,17 +745,17 @@ CRF_VALUE=18
 PROJEOF
 
   # R39: Project config overrides user config for CRF; user PRESET preserved
-  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$layer_home" run_muxm_in "$layer_proj" --print-effective-config)"
   assert_contains "CRF_VALUE                 = 18" "Config layering: project CRF overrides user CRF" "$out"
   assert_contains "PRESET_VALUE              = slow" "Config layering: user PRESET preserved when project doesn't set it" "$out"
 
   # R40: CLI overrides project config
-  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --crf 25 --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$layer_home" run_muxm_in "$layer_proj" --crf 25 --print-effective-config)"
   assert_contains "CRF_VALUE                 = 25" "Config layering: CLI --crf overrides project CRF" "$out"
 
   # R41: Full stack — CLI wins over both user and project for CRF;
   #      user PRESET still preserved (not overridden by project or CLI)
-  out="$(cd "$layer_proj" && HOME="$layer_home" "$MUXM" --crf 30 --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$layer_home" run_muxm_in "$layer_proj" --crf 30 --print-effective-config)"
   assert_contains "CRF_VALUE                 = 30" "Config layering: CLI wins full stack (user+project+CLI)" "$out"
   assert_contains "PRESET_VALUE              = slow" "Config layering: user PRESET survives full stack" "$out"
 
@@ -763,11 +764,11 @@ PROJEOF
 PROFILE_NAME="animation"
 PROFEOF
   # Without CLI override — user profile should be active
-  out="$(cd "$TESTDIR" && HOME="$layer_home" "$MUXM" --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$layer_home" run_muxm_in "$TESTDIR" --print-effective-config)"
   assert_contains "animation" "Config layering: user config PROFILE_NAME loaded" "$out"
 
   # With CLI override — CLI profile wins
-  out="$(cd "$TESTDIR" && HOME="$layer_home" "$MUXM" --profile streaming --print-effective-config 2>&1)" || true
+  out="$(MUXM_HOME="$layer_home" run_muxm_in "$TESTDIR" --profile streaming --print-effective-config)"
   assert_contains "streaming" "Config layering: CLI --profile overrides user config PROFILE_NAME" "$out"
 
   # ---- Invalid FFMPEG_LOGLEVEL in config file ----
@@ -776,7 +777,8 @@ PROFEOF
   cat > "$loglevel_home/.muxmrc" <<'EOF'
 FFMPEG_LOGLEVEL=bogus
 EOF
-  local ll_out
+  local ll_out ll_code
+  # Raw capture (not run_muxm_in) — we need the exit code, which || true would swallow.
   ll_out="$(cd "$TESTDIR" && HOME="$loglevel_home" "$MUXM" --print-effective-config 2>&1)" && ll_code=$? || ll_code=$?
   if [[ "$ll_code" -eq "$EXIT_VALIDATION" ]]; then
     pass "Invalid FFMPEG_LOGLEVEL in config → exit $EXIT_VALIDATION"
@@ -789,6 +791,7 @@ EOF
   cat > "$loglevel_home/.muxmrc" <<'EOF'
 FFPROBE_LOGLEVEL=nonsense
 EOF
+  # Raw capture (not run_muxm_in) — we need the exit code, which || true would swallow.
   ll_out="$(cd "$TESTDIR" && HOME="$loglevel_home" "$MUXM" --print-effective-config 2>&1)" && ll_code=$? || ll_code=$?
   if [[ "$ll_code" -eq "$EXIT_VALIDATION" ]]; then
     pass "Invalid FFPROBE_LOGLEVEL in config → exit $EXIT_VALIDATION"
@@ -804,7 +807,7 @@ EOF
 AUDIO_SCORE_LANG_BONUS_ENG=99
 EOF
   local depr_out
-  depr_out="$(cd "$TESTDIR" && HOME="$depr_home" "$MUXM" --print-effective-config 2>&1)" || true
+  depr_out="$(MUXM_HOME="$depr_home" run_muxm_in "$TESTDIR" --print-effective-config)"
   # 1) Verify deprecation warning is emitted
   assert_contains "Deprecated" "Deprecated variable triggers warning" "$depr_out"
   assert_contains "AUDIO_SCORE_LANG_BONUS_ENG" "Warning names the deprecated variable" "$depr_out"
@@ -1052,7 +1055,7 @@ test_video() {
   if echo "$out" | grep -qiE "vbv-maxrate|vbv-bufsize"; then
     pass "--level 5.1: VBV params injected in dry-run"
   else
-    log "--level 5.1: VBV keywords not found in dry-run output (may be logged to file)"
+    skip "--level 5.1: VBV keywords not found in dry-run output (may be logged to file)"
   fi
 }
 
@@ -1076,12 +1079,12 @@ test_hdr() {
     if [[ "$cp" == "bt2020" ]] || [[ "$cp" == *"2020"* ]]; then
       pass "HDR10 encode: BT.2020 color primaries preserved"
     else
-      log "HDR10 encode: color_primaries='$cp' (expected bt2020, may vary by ffmpeg version)"
+      skip "HDR10 encode: BT.2020 primaries (ffprobe reported '$cp', varies by version)"
     fi
     if [[ "$tf" == "smpte2084" ]] || [[ "$tf" == *"2084"* ]]; then
       pass "HDR10 encode: SMPTE 2084 transfer preserved"
     else
-      log "HDR10 encode: color_transfer='$tf' (expected smpte2084, may vary)"
+      skip "HDR10 encode: SMPTE 2084 transfer (ffprobe reported '$tf', varies by version)"
     fi
   fi
 
@@ -1099,7 +1102,7 @@ test_hdr() {
   if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
     pass "--tonemap + HDR source: tonemap filter chain present in dry-run"
   else
-    log "--tonemap + HDR source: filter keywords not found (synthetic HDR tags may not trigger detection)"
+    skip "--tonemap + HDR source: filter keywords not found (synthetic HDR tags may not trigger detection)"
   fi
 
   # R29: --profile universal implies tonemap — verify with HDR source
@@ -1107,7 +1110,7 @@ test_hdr() {
   if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
     pass "--profile universal + HDR source: tonemap filter chain present"
   else
-    log "--profile universal + HDR source: filter keywords not found (may require real HDR source)"
+    skip "--profile universal + HDR source: filter keywords not found (may require real HDR source)"
   fi
 }
 
@@ -1130,7 +1133,7 @@ test_audio() {
     if [[ "$acount" -ge 2 ]]; then
       pass "Stereo fallback track added"
     else
-      log "Only 1 audio track (stereo fallback may not have been needed)"
+      skip "Stereo fallback: only 1 audio track (may not have been needed)"
     fi
   fi
 
@@ -1143,7 +1146,7 @@ test_audio() {
     if [[ "$acount" -eq 1 ]]; then
       pass "--no-stereo-fallback: single audio track"
     else
-      log "--no-stereo-fallback: $acount tracks (may vary by source)"
+      skip "--no-stereo-fallback: $acount tracks (may vary by source)"
     fi
   fi
 
@@ -1162,7 +1165,7 @@ test_audio() {
     if [[ "$ch" -ge 6 ]]; then
       pass "Multi-audio: primary track is surround (${ch}ch)"
     else
-      log "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
+      skip "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
     fi
   fi
 
@@ -1177,7 +1180,7 @@ test_audio() {
     if [[ "$ch" -le 2 ]]; then
       pass "--audio-track 0: stereo track selected (${ch}ch)"
     else
-      log "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
+      skip "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
     fi
   fi
 
@@ -1206,7 +1209,7 @@ test_audio() {
     if [[ "$acodec" == "aac" ]]; then
       pass "--audio-force-codec aac: audio is AAC"
     else
-      log "--audio-force-codec aac: got codec='$acodec'"
+      skip "--audio-force-codec aac: got codec='$acodec' (expected aac)"
     fi
   fi
 
@@ -1325,7 +1328,7 @@ test_subs() {
     if [[ "$srt_count" -ge 1 ]]; then
       pass "--sub-export-external: SRT sidecar(s) created ($srt_count)"
     else
-      log "--sub-export-external: no .srt sidecar found (may depend on subtitle type)"
+      skip "--sub-export-external: no .srt sidecar found (may depend on subtitle type)"
     fi
   fi
 
@@ -1407,7 +1410,7 @@ test_output() {
     if [[ "$chap_count" -ge 1 ]]; then
       pass "Chapters preserved in output ($chap_count chapters)"
     else
-      log "Chapter count: $chap_count (may not persist in short clips)"
+      skip "Chapters preserved: count=$chap_count (may not persist in short clips)"
     fi
   fi
 
@@ -1443,7 +1446,7 @@ test_output() {
         fail "--checksum: SHA-256 does not match output file"
       fi
     else
-      log "--checksum: SHA-256 sidecar not found at $sha_file (check naming convention)"
+      skip "--checksum: SHA-256 sidecar not found at $sha_file (check naming convention)"
     fi
   fi
 
@@ -1467,12 +1470,12 @@ test_output() {
       if [[ "$has_tool" == "true" ]]; then
         pass "--report-json: contains tool/version key"
       else
-        log "--report-json: tool/version key not found (key naming may differ)"
+        skip "--report-json: tool/version key not found (key naming may differ)"
       fi
       if [[ "$has_source" == "true" ]]; then
         pass "--report-json: contains source/input key"
       else
-        log "--report-json: source/input key not found (key naming may differ)"
+        skip "--report-json: source/input key not found (key naming may differ)"
       fi
 
       # Phase 4f: Deeper field completeness checks (R35–R38)
@@ -1483,20 +1486,20 @@ test_output() {
       if [[ "$has_profile" == "true" ]]; then
         pass "--report-json: contains profile key"
       else
-        log "--report-json: profile key not found (key naming may differ)"
+        skip "--report-json: profile key not found (key naming may differ)"
       fi
       if [[ "$has_output" == "true" ]]; then
         pass "--report-json: contains output key"
       else
-        log "--report-json: output key not found (key naming may differ)"
+        skip "--report-json: output key not found (key naming may differ)"
       fi
       if [[ "$has_timestamp" == "true" ]]; then
         pass "--report-json: contains timestamp key"
       else
-        log "--report-json: timestamp key not found (key naming may differ)"
+        skip "--report-json: timestamp key not found (key naming may differ)"
       fi
     else
-      log "--report-json: report file not found at $json_file"
+      skip "--report-json: report file not found at $json_file"
     fi
   fi
 
@@ -1511,7 +1514,7 @@ test_output() {
   elif [[ -f "$outfile" && -s "$outfile" ]]; then
     pass "--skip-if-ideal: produced output (may have encoded if not fully compliant)"
   else
-    log "--skip-if-ideal: output='${skip_out:0:200}' (behavior depends on compliance check)"
+    skip "--skip-if-ideal: inconclusive (behavior depends on compliance check)"
   fi
 
   # --keep-temp-always (#27)
@@ -1623,9 +1626,9 @@ test_metadata() {
       pass "--strip-metadata: title and comment removed"
     elif [[ -z "$title" ]]; then
       pass "--strip-metadata: title removed"
-      log "--strip-metadata: comment='$comment' (may persist in some containers)"
+      skip "--strip-metadata: comment='$comment' (may persist in some containers)"
     else
-      log "--strip-metadata: title='$title', comment='$comment' (stripping may be partial)"
+      skip "--strip-metadata: title='$title', comment='$comment' (stripping may be partial)"
     fi
   fi
 
@@ -1638,7 +1641,7 @@ test_metadata() {
     if [[ -n "$title" ]]; then
       pass "Metadata preserved: title='$title'"
     else
-      log "Metadata preservation: title not found (may vary by pipeline)"
+      skip "Metadata preservation: title not found (may vary by pipeline)"
     fi
   fi
 
@@ -1676,7 +1679,7 @@ test_edge() {
   # Empty file
   touch "$TESTDIR/empty.mkv"
   local out
-  out="$(cd "$TESTDIR" && "$MUXM" "$TESTDIR/empty.mkv" 2>&1)" || true
+  out="$(run_muxm "$TESTDIR/empty.mkv")"
   assert_contains "empty" "Empty file rejected" "$out"
 
   # File with spaces in name
@@ -1741,7 +1744,7 @@ test_edge() {
   rm -f "$noow_out"
 
   # Control characters in output extension are rejected
-  out="$(cd "$TESTDIR" && "$MUXM" --output-ext "mp4;" "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
+  out="$(run_muxm --output-ext "mp4;" "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "Invalid" "Injection in --output-ext rejected" "$out"
 
   # OCR tool injection prevention
@@ -1750,7 +1753,7 @@ test_edge() {
 
   # --skip-video: muxm cannot produce a valid output without a video stream,
   # so this should error or warn. We validate it doesn't silently succeed.
-  out="$(cd "$TESTDIR" && "$MUXM" --skip-video "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
+  out="$(run_muxm --skip-video "$TESTDIR/basic_sdr_subs.mkv")"
   log "--skip-video behavior validated"
 
   # Non-readable source file (#55)
@@ -1758,7 +1761,7 @@ test_edge() {
   cp "$TESTDIR/basic_sdr_subs.mkv" "$unreadable"
   chmod 000 "$unreadable" 2>/dev/null || true
   if [[ ! -r "$unreadable" ]]; then
-    out="$(cd "$TESTDIR" && "$MUXM" "$unreadable" 2>&1)" || true
+    out="$(run_muxm "$unreadable")"
     assert_contains "not readable" "Non-readable source rejected" "$out"
     chmod 644 "$unreadable" 2>/dev/null || true
   else
@@ -1770,7 +1773,7 @@ test_edge() {
   mkdir -p "$nowrite_dir"
   chmod 555 "$nowrite_dir" 2>/dev/null || true
   if [[ ! -w "$nowrite_dir" ]]; then
-    out="$(cd "$TESTDIR" && "$MUXM" "$TESTDIR/basic_sdr_subs.mkv" "$nowrite_dir/out.mp4" 2>&1)" || true
+    out="$(run_muxm "$TESTDIR/basic_sdr_subs.mkv" "$nowrite_dir/out.mp4")"
     assert_contains "not writable" "Non-writable output dir rejected" "$out"
     chmod 755 "$nowrite_dir" 2>/dev/null || true
   else
@@ -1787,7 +1790,7 @@ test_edge() {
   # Note: muxm's current -- handler drops remaining args (they aren't added to
   # POSITIONALS), so we only verify the key safety property: no "Unknown option" error.
   local dd_out
-  dd_out="$(cd "$TESTDIR" && "$MUXM" --crf 28 --preset ultrafast -- -unusual-name.mkv 2>&1)" || true
+  dd_out="$(run_muxm --crf 28 --preset ultrafast -- -unusual-name.mkv)"
   if echo "$dd_out" | grep -qiF "Unknown option"; then
     fail "Double-dash failed: '-unusual-name.mkv' parsed as option instead of filename"
   else
@@ -1801,8 +1804,8 @@ test_edge() {
   mkdir -p "$auto_dir"
   cp "$TESTDIR/basic_sdr_subs.mkv" "$auto_dir/test_source.mkv"
   log "Testing auto-generated output path (no explicit output)..."
-  (cd "$auto_dir" && "$MUXM" --crf 28 --preset ultrafast \
-    "$auto_dir/test_source.mkv" >/dev/null 2>&1) || true
+  run_muxm_in "$auto_dir" --crf 28 --preset ultrafast \
+    "$auto_dir/test_source.mkv" >/dev/null 2>&1
   # Default output extension is mp4; the derived name should be test_source.mp4
   if [[ -f "$auto_dir/test_source.mp4" && -s "$auto_dir/test_source.mp4" ]]; then
     pass "Auto-generated output: file created with derived name (.mp4)"
@@ -1826,6 +1829,13 @@ test_edge() {
 # Direct tests for deterministic helper functions that take arguments and
 # return values via stdout or exit code. Validates edge cases not exercised
 # by encode pipelines.
+#
+# NOTE: Helper functions defined below (_test_codec_rank, _test_commentary,
+# _test_forced, _test_sdh, _test_text_codec, _test_direct_play, _test_lossless,
+# _test_transcode_target, _test_lang_match, _test_loglevel, _test_preset,
+# _test_valid_profile, _test_lossless_muxable, muxm_fn) are defined at global
+# scope because bash has no nested function scoping.  They are only called
+# within test_unit and should not be invoked elsewhere.
 test_unit() {
   section "Pure-Function Unit Tests"
 
@@ -1834,6 +1844,9 @@ test_unit() {
   # Usage: muxm_fn FUNCTION_NAME [args...]
   #   Captures everything from "^FUNCTION_NAME(){" through the matching "^}"
   #   plus any needed variable defaults, then calls the function.
+  # ASSUMES: Functions in muxm are defined as "fname() {" at column 0 with the
+  #   closing "}" also at column 0.  Will break silently if muxm switches to
+  #   "function fname {" style or indents the closing brace.
   muxm_fn() {
     local fn="$1"; shift
     local body
@@ -2302,6 +2315,7 @@ test_setup() {
   touch "$fake_home/.zshrc"
 
   # ---- --setup shows the combined banner ----
+  local out
   out="$(HOME="$fake_home" "$MUXM" --setup 2>&1)" || true
   assert_contains "Full Setup" "--setup shows Full Setup banner" "$out"
 
