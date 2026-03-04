@@ -283,9 +283,14 @@ ffmpeg_progress_bar() {
   # trying to open the FIFO for writing with no reader on the other end.
   if [[ ! -t ${TERM_FD:-2} ]] || (( total_secs <= 0 )); then
     cat "$pipe" >/dev/null 2>&1 &
+    local drain_pid=$!
     spinner "$pid" "$label"
     wait "$pid" 2>/dev/null
-    return $?
+    local rc=$?
+    # Clean up the FIFO drain process (may already be gone if pipe hit EOF)
+    kill "$drain_pid" 2>/dev/null || true
+    wait "$drain_pid" 2>/dev/null || true
+    return $rc
   fi
 
   local -i cols=40
