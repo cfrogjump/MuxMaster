@@ -77,6 +77,7 @@ PRINT_EFFCONF=0
 
 # Metadata cache for performance optimization
 METADATA_CACHE=""
+_CACHED_SRC_DURATION_SECS=""   # Populated on first call to _get_source_duration_secs
 
 # Tracks whether DV actually made it into the output (not just detected in source)
 declare -i OUTPUT_HAS_DV=0
@@ -325,42 +326,54 @@ ffmpeg_progress_bar() {
 # Tier 3 is the most reliable for MKV sources: Matroska stores per-track duration
 # in stream tags even when the standard duration field and Segment Duration are absent.
 #
-# Globals: METADATA_CACHE (read)
+# Result is cached in _CACHED_SRC_DURATION_SECS after the first call — subsequent
+# calls return instantly without jq forks. Source duration doesn't change mid-run.
+#
+# Globals: METADATA_CACHE (read), _CACHED_SRC_DURATION_SECS (read/write)
 _get_source_duration_secs() {
-  local dur=""
+  # Return cached result if available
+  if [[ -n "$_CACHED_SRC_DURATION_SECS" ]]; then
+    echo "$_CACHED_SRC_DURATION_SECS"
+    return
+  fi
+
+  local dur="" result=0
 
   # Tier 1: standard stream-level duration (common in MP4, rare in MKV)
   dur="$(_jq_cache -r \
     '[.streams[] | select(.codec_type=="video")] | .[0].duration // empty' | head -n1)"
   if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "Duration source: stream duration = ${dur}s"
-    printf '%.0f\n' "$dur"
-    return
+    result="$(printf '%.0f' "$dur")"
   fi
 
   # Tier 2: container/format-level duration (most containers)
-  dur="$(_jq_cache -r \
-    '.format.duration // empty' | head -n1)"
-  if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    log "Duration source: format duration = ${dur}s"
-    printf '%.0f\n' "$dur"
-    return
+  if [[ "$result" == "0" ]]; then
+    dur="$(_jq_cache -r \
+      '.format.duration // empty' | head -n1)"
+    if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      log "Duration source: format duration = ${dur}s"
+      result="$(printf '%.0f' "$dur")"
+    fi
   fi
 
   # Tier 3: Matroska tags — DURATION as "HH:MM:SS.nnnnnnnnn"
-  local tag_dur
-  tag_dur="$(_jq_cache -r \
-    '[.streams[] | select(.codec_type=="video")] | .[0].tags.DURATION // empty' | head -n1)"
-  if [[ "$tag_dur" =~ ^([0-9]+):([0-9]+):([0-9]+)(\.[0-9]+)?$ ]]; then
-    local h="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" s="${BASH_REMATCH[3]}"
-    dur=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
-    log "Duration source: Matroska tag DURATION = ${tag_dur} → ${dur}s"
-    echo "$dur"
-    return
+  if [[ "$result" == "0" ]]; then
+    local tag_dur
+    tag_dur="$(_jq_cache -r \
+      '[.streams[] | select(.codec_type=="video")] | .[0].tags.DURATION // empty' | head -n1)"
+    if [[ "$tag_dur" =~ ^([0-9]+):([0-9]+):([0-9]+)(\.[0-9]+)?$ ]]; then
+      local h="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" s="${BASH_REMATCH[3]}"
+      result=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+      log "Duration source: Matroska tag DURATION = ${tag_dur} → ${result}s"
+    fi
   fi
 
-  log "Duration: unable to determine from stream, format, or Matroska tags — progress bar unavailable"
-  echo 0
+  [[ "$result" == "0" ]] && \
+    log "Duration: unable to determine from stream, format, or Matroska tags — progress bar unavailable"
+
+  _CACHED_SRC_DURATION_SECS="$result"
+  echo "$result"
 }
 
 # Lowercase a string. For non-hot-path use where readability is preferred.
