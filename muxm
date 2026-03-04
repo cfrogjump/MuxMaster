@@ -3483,6 +3483,12 @@ build_x265_params() {
 
   # Add HDR10-specific params if HDR10
   if [[ "$PROFILE_DESC" == "HDR10" ]]; then
+    # Strip any instances already present in X265_PARAMS_BASE (some profiles
+    # bake these in) to avoid duplicate keys that confuse x265.
+    local key
+    for key in hdr10 hdr10-opt colorprim transfer colormatrix range; do
+      X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed "s/:${key}=[^:]*//g; s/^${key}=[^:]*://")"
+    done
     X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
   fi
 }
