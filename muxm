@@ -3771,7 +3771,6 @@ _check_hdr10_static_metadata() {
 # ===== Section 25: Temp paths =================================================================
 V_SRC_ES="$WORKDIR/video_src.es"
 RPU_P7="$WORKDIR/rpu_p7.bin"
-RPU_P81="$WORKDIR/rpu_p81.bin"
 RPU_FINAL="$WORKDIR/rpu_final.bin"
 
 # Initial values — run_video_pipeline() reassigns V_BASE and V_MIXED at runtime
@@ -3780,6 +3779,10 @@ RPU_FINAL="$WORKDIR/rpu_final.bin"
 #   Non-DV path: .mkv container (preserves timestamps for matroska final mux)
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
+
+# Intermediate file for P7/P5→P8 conversion: inject raw RPU here first, then
+# dovi_tool convert produces the final V_MIXED from this file.
+V_INJECTED="$WORKDIR/video_injected.hevc"
 
 # Pre-wrapped DV MP4: V_MIXED wrapped into MP4 with proper dvcC/dvvC box via dovi_tool.
 # When available, mux_final uses this instead of the raw V_MIXED ES so that ffmpeg
@@ -4149,21 +4152,25 @@ run_video_pipeline() {
     die 40 "Dolby Vision RPU extraction failed and fallback is disabled"
   fi
 
-  # ---- DV RPU conversion (profile-aware) ----
+  # ---- DV RPU profile analysis (conversion deferred until after injection) ----
   # Decision tree for RPU handling based on source DV profile:
   #
   # ┌─ Source is P8 (any compat_id) → RPU passes through unchanged
   # │   P8.1 (compat_id=1, PQ), P8.2 (compat_id=2, SDR), P8.4 (compat_id=4, HLG)
   # │   are all single-layer and compatible with re-encoded base layer.
-  # ├─ Source is P7 (dual-layer) → needs conversion to P8
+  # ├─ Source is P7 (dual-layer) → inject raw RPU, then convert HEVC to P8
   # │   ├─ EL present → warn about enhancement layer data loss (irreversible)
   # │   ├─ HLG source (compat_id=4) → warn about PQ compat_id mismatch
-  # │   └─ Attempt dovi_tool convert → P8.1 (best-effort)
-  # ├─ Source is P5 (IPT) → attempt conversion to P8.1
+  # │   └─ After injection: dovi_tool convert -d → P8.1 (best-effort)
+  # ├─ Source is P5 (IPT) → inject raw RPU, then convert HEVC to P8.1
   # └─ Unknown profile → attempt passthrough with warning
 
-  # Start with extracted RPU; will be updated if conversion is performed
+  # Start with extracted RPU; used directly for injection in all cases
   cp -f "$RPU_P7" "$RPU_FINAL" 2>/dev/null || true
+
+  # Flag: set to 1 when the injected HEVC needs P7/P5→P8 conversion via
+  # dovi_tool convert after RPU injection.
+  local -i dv_needs_convert=0
 
   if [[ "${DV_SRC_PROFILE:-}" == "8" ]]; then
     # Source is already Profile 8 — RPU is single-layer compatible, no conversion needed.
@@ -4172,9 +4179,12 @@ run_video_pipeline() {
     report_add "dv_rpu_action" "passthrough (already P8, compat_id=${DV_SRC_COMPAT_ID:-?})"
 
   elif [[ "${DV_SRC_PROFILE:-}" == "7" || "${DV_SRC_PROFILE:-}" == "5" ]]; then
-    # Source is dual-layer (P7) or IPT (P5) — needs conversion to single-layer P8
+    # Source is dual-layer (P7) or IPT (P5) — needs conversion to single-layer P8.
+    # Conversion happens AFTER RPU injection: dovi_tool convert now operates on
+    # HEVC elementary streams (not standalone RPU files).
     if (( DV_CONVERT_TO_P81_IF_FAIL )); then
-      note "Source DV is Profile ${DV_SRC_PROFILE} — attempting conversion to Profile 8…"
+      note "Source DV is Profile ${DV_SRC_PROFILE} — will convert to Profile 8 after injection…"
+      dv_needs_convert=1
 
       # Warn about enhancement layer data loss for P7
       if [[ "${DV_SRC_EL_PRESENT:-}" == "1" ]]; then
@@ -4191,22 +4201,6 @@ run_video_pipeline() {
         warn "  The DV RPU will be converted, but the compatibility ID will change from HLG to PQ."
         warn "  Impact: Non-DV players may interpret the base layer as PQ instead of HLG."
         report_add "dv_compat_id_mismatch" "source=4(HLG) → output=1(PQ)"
-      fi
-
-      dovi_tool convert --rpu-in "$RPU_P7" --rpu-out "$RPU_P81" >"$WORKDIR/rpu_convert.log" 2>&1 &
-      local rpu_conv_pid=$!
-      spinner "$rpu_conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)"
-      if wait "$rpu_conv_pid" 2>/dev/null && [[ -s "$RPU_P81" ]]; then
-        cp -f "$RPU_P81" "$RPU_FINAL"
-        note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
-        report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
-      else
-        warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
-        warn "  Using unconverted P${DV_SRC_PROFILE} RPU — this is technically invalid for"
-        warn "  single-layer output. DV playback may be unpredictable or fail."
-        warn "  Reason: Profile ${DV_SRC_PROFILE} RPU references a dual-layer structure that"
-        warn "  doesn't exist in the re-encoded single-layer output."
-        report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
       fi
     else
       warn "Source DV is Profile ${DV_SRC_PROFILE} (dual-layer) but conversion is disabled"
@@ -4237,8 +4231,15 @@ run_video_pipeline() {
     die 40 "DV RPU validation failed and fallback is disabled"
   fi
 
-  # Inject RPU into encoded video
-  dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_FINAL" -o "$V_MIXED" >"$WORKDIR/rpu_inject.log" 2>&1 &
+  # Inject RPU into encoded video.
+  # When P7/P5→P8 conversion is needed, inject into an intermediate file first;
+  # dovi_tool convert will then produce the final V_MIXED from that file.
+  local inject_target="$V_MIXED"
+  if (( dv_needs_convert )); then
+    inject_target="$V_INJECTED"
+  fi
+
+  dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_FINAL" -o "$inject_target" >"$WORKDIR/rpu_inject.log" 2>&1 &
   local inject_pid=$!
   spinner "$inject_pid" "Injecting DV RPU into video"
   if ! wait "$inject_pid" 2>/dev/null; then
@@ -4253,7 +4254,7 @@ run_video_pipeline() {
   fi
 
   # Validate DV-injected output exists and is non-empty
-  if [[ ! -s "$V_MIXED" ]]; then
+  if [[ ! -s "$inject_target" ]]; then
     warn "DV injection produced empty file."
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
@@ -4262,6 +4263,29 @@ run_video_pipeline() {
       return 0
     fi
     die 41 "DV injection produced empty output and fallback is disabled"
+  fi
+
+  # ---- Post-injection DV profile conversion (P7/P5 → P8) ----
+  # dovi_tool convert now operates on HEVC elementary streams (not standalone
+  # RPU files). The -d flag discards the enhancement layer, producing a valid
+  # single-layer Profile 8 output from the dual-layer P7/P5 input.
+  if (( dv_needs_convert )); then
+    dovi_tool convert -i "$V_INJECTED" -o "$V_MIXED" -d >"$WORKDIR/rpu_convert.log" 2>&1 &
+    local conv_pid=$!
+    spinner "$conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)"
+    if wait "$conv_pid" 2>/dev/null && [[ -s "$V_MIXED" ]]; then
+      note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
+      report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
+    else
+      warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
+      warn "  Using unconverted P${DV_SRC_PROFILE} HEVC — this is technically invalid for"
+      warn "  single-layer output. DV playback may be unpredictable or fail."
+      warn "  Reason: Profile ${DV_SRC_PROFILE} RPU references a dual-layer structure that"
+      warn "  doesn't exist in the re-encoded single-layer output."
+      report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
+      # Fall back to the unconverted injected file
+      cp -f "$V_INJECTED" "$V_MIXED"
+    fi
   fi
 
   # Verify RPU frame count matches encoded video frame count.
