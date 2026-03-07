@@ -142,7 +142,7 @@ When you run `muxm`, the script executes a multi-stage pipeline that inspects th
 
 **3. Video Pipeline.** The video stage handles the most complexity. It detects Dolby Vision by probing both stream metadata and frame-level side data, then identifies the DV profile (5, 7, or 8) and compatibility ID. For profiles that preserve DV, it extracts the RPU (Reference Processing Unit) via `dovi_tool`, converts between DV profiles when necessary (e.g., Profile 7 dual-layer → Profile 8.1 single-layer), encodes the base layer with x265, and injects the RPU back into the encoded stream. For non-DV profiles, it detects the source color space (BT.2020 PQ, BT.2020 HLG, or BT.709 SDR), sets the matching x265 color parameters and pixel format, and applies tone-mapping when the profile targets SDR output.
 
-**4. Audio Pipeline.** Audio track selection is language-preference-aware and codec-aware. The pipeline picks the best available track (honoring `--audio-lang-pref`), decides whether to copy it through or transcode it based on the profile's codec requirements, and optionally generates a stereo AAC fallback track from the surround source. Lossless codecs (TrueHD, DTS-HD MA, FLAC) are passed through untouched when the profile and container support it.
+**4. Audio Pipeline.** Audio track selection is language-preference-aware and codec-aware. When multiple tracks exist, `muxm` scores each one based on language match, channel count, surround layout, codec preference, and bitrate — with configurable weights in `.muxmrc` (see `man muxm` for details). The pipeline picks the best available track (honoring `--audio-lang-pref`), decides whether to copy it through or transcode it based on the profile's codec requirements, and optionally generates a stereo AAC fallback track from the surround source. Lossless codecs (TrueHD, DTS-HD MA, FLAC) are passed through untouched when the profile and container support it.
 
 **5. Subtitle Pipeline.** Subtitles are categorized into forced, full, and SDH tracks. PGS bitmap subtitles are OCR'd to SRT (via `pgsrip` or `sub2srt`) when the output container can't carry them natively. Forced subtitles can be burned into the video stream; other tracks can be embedded or exported as external `.srt` files. The pipeline respects language preferences and can exclude SDH tracks.
 
@@ -260,6 +260,7 @@ muxm [options] <source> [target.mp4]
 | `--uninstall-man` | Remove the installed manual page |
 | `--uninstall-completions` | Remove installed tab completion |
 | `--create-config SCOPE [PROFILE]` | Generate a `.muxmrc` config file (`system`, `user`, or `project`) |
+| `--force-create-config SCOPE [PROFILE]` | Same as `--create-config` but overwrites an existing file |
 
 Run `muxm --help` for the full flag reference.
 

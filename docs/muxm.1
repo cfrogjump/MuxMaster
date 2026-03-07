@@ -474,14 +474,21 @@ begins with a hyphen:
 .br
 \fBjq\fR \(em JSON parsing for stream metadata and reporting.
 .br
-\fBbc\fR \(em arithmetic for file\-size display and fractional frame\-rate verification.
+\fBbc\fR \(em arithmetic evaluation for frame\-rate and bitrate calculations.
 .TP
 .B Optional
+\fBffmpeg with libass\fR (\fBffmpeg\-full\fR on Homebrew) \(em required for
+subtitle burn\-in via \fB\-\-sub\-burn\-forced\fR. The standard \fBffmpeg\fR
+package works for all other features.
+.br
 \fBdovi_tool\fR \(em Dolby Vision RPU extraction/injection. DV handling is
 automatically disabled if missing.
 .br
 \fBMP4Box\fR (gpac) \(em DV container\-level signaling verification.
 Detected at runtime as \fBmp4box\fR or \fBMP4Box\fR.
+.br
+\fBtesseract\fR \(em OCR engine required by \fBpgsrip\fR for PGS bitmap
+subtitle conversion.
 .br
 \fBpgsrip\fR or \fBsub2srt\fR \(em PGS bitmap subtitle OCR to SRT.
 Configurable via \fB\-\-ocr\-tool\fR.
@@ -532,7 +539,7 @@ Terminated by signal (SIGTERM).
 .BR MP4Box (1)
 .SH BUGS
 Report bugs at
-.UR https://github.com/TheBluWiz/muxm/issues
+.UR https://github.com/TheBluWiz/MuxMaster/issues
 .UE .
 .SH COPYRIGHT
 Copyright \(co 2025\(en2026 Jamey Wicklund (theBluWiz).
