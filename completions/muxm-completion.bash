@@ -34,7 +34,7 @@ _muxm_completions() {
         # Flags that take a free-form value — offer no completion, fall through to files
         --crf|--stereo-bitrate|--threads|-l|--level|--x265-params|\
         --audio-track|--audio-lang-pref|--audio-force-codec|\
-        --sub-lang-pref|--ocr-lang)
+        --max-copy-bitrate|--sub-lang-pref|--ocr-lang)
             COMPREPLY=()
             return ;;
     esac
@@ -60,10 +60,12 @@ _muxm_completions() {
 
             --crf -p --preset --x265-params -l --level
             --video-codec --tonemap --no-tonemap
+            --sdr-force-10bit --no-sdr-force-10bit
             --no-conservative-vbv
             --no-dv --allow-dv-fallback --no-allow-dv-fallback
             --dv-convert-p81 --no-dv-convert-p81
             --video-copy-if-compliant --no-video-copy-if-compliant
+            --max-copy-bitrate
 
             --audio-track --audio-lang-pref
             --stereo-fallback --no-stereo-fallback --stereo-bitrate
