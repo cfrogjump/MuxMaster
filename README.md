@@ -197,8 +197,6 @@ brew install tesseract            # PGS subtitle OCR engine
 brew install ffmpeg-full          # ffmpeg with libass (for --sub-burn-forced) + tesseract
 ```
 
-Note: `ffmpeg-full` is keg-only, so after installing it you'll need to run `brew link --force ffmpeg-full` to make it available in your PATH. It conflicts with the standard `ffmpeg` formula — Homebrew will prompt you to unlink one before linking the other.
-
 ### Manual Install (macOS/Linux)
 
 ```bash
