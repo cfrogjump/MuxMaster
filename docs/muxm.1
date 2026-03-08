@@ -1,4 +1,4 @@
-.TH MUXM 1 "2026-03-02" "MuxMaster v1.0.0" "User Commands"
+.TH MUXM 1 "2026-03-09" "MuxMaster v1.0.1" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -293,6 +293,27 @@ Show the ffmpeg/ffprobe startup banner (hidden by default).
 .TP
 .BR \-\-no\-overwrite
 Do not overwrite existing intermediate files (ffmpeg overwrites by default).
+.TP
+.BR \-\-replace\-source
+Replace the original source file with the encoded output. Prompts for
+confirmation before proceeding. Requires an interactive terminal (stdin
+must be a TTY); in non\-interactive shells (scripts, pipelines), this flag
+is rejected with an error directing you to use
+.BR \-\-force\-replace\-source .
+.TP
+.BR \-\-force\-replace\-source
+Replace the original source file with the encoded output without prompting
+for confirmation. This is the scripting\-friendly variant of
+.BR \-\-replace\-source .
+.PP
+.B Source collision auto\-versioning:
+When the derived output path matches the source file and neither
+.B \-\-replace\-source
+nor
+.B \-\-force\-replace\-source
+is given, muxm automatically appends a version number to avoid collision:
+.IR movie(1).mp4 ", " movie(2).mp4 ,
+etc.
 .SH EXAMPLES
 .TP
 .B muxm Movie.mkv

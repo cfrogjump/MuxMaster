@@ -4,7 +4,26 @@ All notable changes to MuxMaster will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [1.0.0] - 2026-03-09
+## [1.0.1] - 2026-03-09
+
+Output file collisions now handled gracefully. Adds new flags `--replace-source` and `--force-replace-source`.
+
+### Fixed
+
+- **Source/output collision no longer fatal.** When the derived output path matches the source file (e.g., `muxm movie.mp4` where the default output extension is also `.mp4`), muxm now auto-appends a version number instead of aborting: `movie(1).mp4`, `movie(2).mp4`, etc. The version number increments until a free filename is found.
+
+### Added
+
+- **`--replace-source`** — Replace the original source file with the encoded output after an interactive confirmation prompt. Requires a TTY; rejected in non-interactive shells with a clear error directing the user to `--force-replace-source`.
+- **`--force-replace-source`** — Same as `--replace-source` but skips the confirmation prompt. Designed for scripting and automation.
+- Both flags registered in `--help`, `--print-effective-config`, tab completions, man page, and `.muxmrc` config generator.
+- New `collision` test suite in `test_muxm.sh` with 17 assertions covering auto-versioning, sequential incrementing, TTY rejection, in-place replacement, and no-collision passthrough.
+
+### Changed
+
+- Existing tests in `test_edge` and `_test_cli_error_codes` updated to expect auto-versioning behavior instead of the previous fatal error.
+
+## [1.0.0] - 2026-03-07
 
 Initial public release.
 
@@ -79,4 +98,5 @@ Initial public release.
 - Structured exit codes for scripting and automation (10 = missing tool, 11 = bad arguments, 12 = corrupt source, 40–43 = pipeline failures)
 - Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions
 
+[1.0.1]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.1
 [1.0.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.0

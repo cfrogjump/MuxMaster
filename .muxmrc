@@ -5,7 +5,7 @@
 #  Tip: Uncomment a line to override. Keep values shell-safe.
 # ================================================================
 # Profile: atv-directplay-hq
-# Generated: 2026-03-06 20:31:35
+# Generated: 2026-03-08 16:23:41
 #
 # Variables set by this profile are uncommented below.
 # All other variables are commented with their defaults — uncomment to customize.
@@ -93,7 +93,7 @@ HDR_TARGET_PIXFMT=yuv420p10le
 
 # Tone-map HDR to SDR (used by the universal profile for max compatibility)
 #   1 = convert HDR/HLG sources to SDR  |  0 = preserve HDR (default)
-#TONEMAP_HDR_TO_SDR=1
+#TONEMAP_HDR_TO_SDR=0
 
 # Tone-map filter chain: advanced ffmpeg filter string for HDR→SDR conversion.
 #TONEMAP_FILTER='zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
@@ -157,7 +157,7 @@ STEREO_BITRATE=256k
 
 # Maximum output channels (caps E-AC-3 downmix target)
 #   6 = 5.1, 8 = 7.1
-#MAX_AUDIO_CHANNELS=2
+#MAX_AUDIO_CHANNELS=8
 
 # Add a stereo AAC fallback track when primary >2ch
 ADD_STEREO_IF_MULTICH=1
@@ -167,7 +167,7 @@ EAC3_BITRATE_5_1=640k
 EAC3_BITRATE_7_1=768k
 
 # Force all audio to a specific codec (e.g., "aac" for universal playback)
-#AUDIO_FORCE_CODEC=aac
+#AUDIO_FORCE_CODEC=
 
 # Allow lossless audio codecs (TrueHD, DTS-HD MA, FLAC) to pass through
 #   1 = copy lossless  |  0 = transcode to lossy
@@ -204,13 +204,13 @@ SUB_EXPORT_EXTERNAL=0
 # Enable OCR for bitmap subtitles (PGS/VobSub → SRT)
 # MP4 cannot carry PGS bitmaps; OCR converts them to text-based SRT.
 #   1 = attempt OCR  |  0 = drop bitmap subtitles that can't be embedded
-SUB_ENABLE_OCR=1
+#SUB_ENABLE_OCR=1
 
 # OCR tool for bitmap → text subtitle conversion
 # Supported: "pgsrip", "sub2srt"
 # pgsrip requires: pgsrip (pipx) + tesseract. Install via --install-dependencies.
-# Auto-detected: pgsrip found on this machine at config-generation time.
-SUB_OCR_TOOL=pgsrip
+# No OCR tool detected. Install pgsrip or sub2srt and regenerate, or uncomment manually.
+#SUB_OCR_TOOL=sub2srt
 
 # OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)
 #SUB_OCR_LANG=eng
@@ -260,6 +260,12 @@ SKIP_IF_IDEAL=1
 
 # Keep temporary workdir even on success
 #KEEP_TEMP_ALWAYS=0
+
+# Replace the original source file with the output (requires interactive TTY)
+#REPLACE_SOURCE=0
+
+# Replace the original source file without confirmation (scripting-friendly)
+#FORCE_REPLACE_SOURCE=0
 
 
 # =========================

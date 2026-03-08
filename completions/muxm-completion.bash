@@ -87,6 +87,7 @@ _muxm_completions() {
             --report-json --no-report-json
             --checksum --no-checksum
             --no-overwrite
+            --replace-source --force-replace-source
 
             -k --keep-temp -K --keep-temp-always
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner

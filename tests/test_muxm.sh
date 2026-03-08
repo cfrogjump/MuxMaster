@@ -7,8 +7,8 @@
 #  Usage:
 #    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
 #
-#  Suites: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, dryrun, video, audio, subs,
-#          output, edge, e2e, hdr, containers, metadata
+#  Suites: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun, video,
+#          audio, subs, output, edge, e2e, hdr, containers, metadata
 #  Default: all
 # =============================================================================
 set -euo pipefail
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
     --verbose) VERBOSE=1; shift ;;
     -h|--help)
       echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, toggles, unit, completions, config, profiles, conflicts, dryrun, video, hdr,"
+      echo "Suites: all, cli, toggles, unit, completions, config, profiles, conflicts, collision, dryrun, video, hdr,"
       echo "        audio, subs, output, containers, metadata, edge, e2e"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -550,9 +550,9 @@ _test_cli_error_codes() {
   # Too many positional args
   assert_exit $EXIT_VALIDATION "Too many args exits $EXIT_VALIDATION" a.mkv b.mp4 c.mp4
 
-  # Source = output prevention
+  # Source = output auto-versioning (collision no longer dies; auto-versions instead)
   out="$(run_muxm --output-ext mkv "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "same file" "Source=output prevented" "$out"
+  assert_contains "Source collision" "Source=output triggers auto-versioning" "$out"
 
   # --no-overwrite: should refuse when output already exists (#28)
   local out_exist="$TESTDIR/cli_nooverwrite.mp4"
@@ -1797,6 +1797,136 @@ test_metadata() {
 # SECURITY NOTE: The injection tests (--output-ext "mp4;", --ocr-tool "sub2srt;rm -rf /")
 # verify that user-supplied strings are never interpolated into shell commands unsanitized.
 # These are regression tests for real attack vectors in media-processing CLI tools.
+# === Suite: Collision Handling (auto-versioning, --replace-source, --force-replace-source) ===
+# Validates the filename collision behavior when source and derived output paths match:
+#   - Auto-versioning: movie(1).mp4, movie(2).mp4, ...
+#   - --replace-source requires interactive TTY (rejected in pipes/scripts)
+#   - --force-replace-source replaces the source file without prompting
+#   - CLI flags appear in --help and --print-effective-config
+test_collision() {
+  section "Collision Handling (auto-versioning & source replacement)"
+
+  # ---- Setup: create an .mp4 source so derived output (.mp4) collides ----
+  local coll_dir="$TESTDIR/collision"
+  mkdir -p "$coll_dir"
+  local coll_src="$coll_dir/movie.mp4"
+  gen_media "$coll_src" blue \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2
+
+  # ---- Auto-version: movie.mp4 → movie(1).mp4 ----
+  log "Testing auto-versioning: movie.mp4 → movie(1).mp4"
+  local out
+  out="$(run_muxm --crf 28 --preset ultrafast "$coll_src")"
+  assert_contains "Source collision" "Auto-version: collision note printed" "$out"
+  assert_contains "movie(1).mp4" "Auto-version: output renamed to movie(1).mp4" "$out"
+  if [[ -f "$coll_dir/movie(1).mp4" && -s "$coll_dir/movie(1).mp4" ]]; then
+    pass "Auto-version: movie(1).mp4 created"
+  else
+    fail "Auto-version: movie(1).mp4 not found"
+  fi
+
+  # ---- Increment: movie(1).mp4 exists → movie(2).mp4 ----
+  log "Testing auto-versioning increment: movie(1) exists → movie(2).mp4"
+  out="$(run_muxm --crf 28 --preset ultrafast "$coll_src")"
+  assert_contains "movie(2).mp4" "Auto-version increment: output renamed to movie(2).mp4" "$out"
+  if [[ -f "$coll_dir/movie(2).mp4" && -s "$coll_dir/movie(2).mp4" ]]; then
+    pass "Auto-version increment: movie(2).mp4 created"
+  else
+    fail "Auto-version increment: movie(2).mp4 not found"
+  fi
+
+  # ---- Further increment: movie(1) and movie(2) exist → movie(3).mp4 ----
+  log "Testing auto-versioning further increment: → movie(3).mp4"
+  out="$(run_muxm --crf 28 --preset ultrafast "$coll_src")"
+  assert_contains "movie(3).mp4" "Auto-version further: output renamed to movie(3).mp4" "$out"
+  if [[ -f "$coll_dir/movie(3).mp4" && -s "$coll_dir/movie(3).mp4" ]]; then
+    pass "Auto-version further: movie(3).mp4 created"
+  else
+    fail "Auto-version further: movie(3).mp4 not found"
+  fi
+
+  # ---- No collision when source ext != output ext (e.g., .mkv → .mp4) ----
+  log "Testing no collision when extensions differ (.mkv → .mp4)"
+  local nocoll_dir="$coll_dir/nocoll_test"
+  mkdir -p "$nocoll_dir"
+  local nocoll_src="$nocoll_dir/nocoll.mkv"
+  cp "$TESTDIR/basic_sdr_subs.mkv" "$nocoll_src"
+  out="$(run_muxm --crf 28 --preset ultrafast "$nocoll_src")"
+  if echo "$out" | grep -qiF "Source collision"; then
+    fail "No collision expected for .mkv → .mp4 but collision note found"
+  else
+    pass "No collision for .mkv → .mp4 (extensions differ)"
+  fi
+
+  # ---- --replace-source: rejected when stdin is not a TTY ----
+  # Redirect stdin from /dev/null to guarantee it's not a TTY.
+  # (Command substitution alone doesn't change stdin — if the test is run from
+  # an interactive terminal, stdin would still be a TTY and muxm would proceed
+  # to the interactive confirmation prompt, hanging forever.)
+  log "Testing --replace-source rejection in non-interactive shell"
+  local rs_out rs_code
+  rs_out="$(cd "$TESTDIR" && "$MUXM" --replace-source --crf 28 --preset ultrafast "$coll_src" </dev/null 2>&1)" && rs_code=$? || rs_code=$?
+  if [[ "$rs_code" -eq $EXIT_VALIDATION ]]; then
+    pass "--replace-source: rejected with exit $EXIT_VALIDATION (non-TTY)"
+  else
+    fail "--replace-source: expected exit $EXIT_VALIDATION, got $rs_code"
+  fi
+  assert_contains "not a TTY" "--replace-source: error mentions TTY" "$rs_out"
+  assert_contains "force-replace-source" "--replace-source: error suggests --force-replace-source" "$rs_out"
+
+  # ---- --force-replace-source: replaces the original file ----
+  log "Testing --force-replace-source replaces original"
+  local frs_dir="$coll_dir/force_replace"
+  mkdir -p "$frs_dir"
+  local frs_src="$frs_dir/source.mp4"
+  gen_media "$frs_src" red \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2
+  local original_size
+  original_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
+  out="$(run_muxm --force-replace-source --crf 28 --preset ultrafast "$frs_src")"
+  assert_contains "replaced" "--force-replace-source: replacement note" "$out"
+  if [[ -f "$frs_src" && -s "$frs_src" ]]; then
+    local new_size
+    new_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
+    # The re-encoded file should exist; size will differ from original
+    if [[ "$new_size" != "$original_size" || "$new_size" -gt 0 ]]; then
+      pass "--force-replace-source: source file was replaced (size changed: $original_size → $new_size)"
+    else
+      fail "--force-replace-source: source file unchanged (size: $original_size → $new_size)"
+    fi
+  else
+    fail "--force-replace-source: source file missing after encode"
+  fi
+  # Verify no versioned files were created (replacement should be in-place)
+  if ls "$frs_dir"/source\(*.mp4 >/dev/null 2>&1; then
+    fail "--force-replace-source: versioned files created (should replace in-place)"
+  else
+    pass "--force-replace-source: no versioned files (in-place replacement)"
+  fi
+
+  # ---- --replace-source and --force-replace-source in --help ----
+  out="$(run_muxm --help)"
+  assert_contains "replace-source" "--help mentions --replace-source" "$out"
+  assert_contains "force-replace-source" "--help mentions --force-replace-source" "$out"
+
+  # ---- --replace-source and --force-replace-source in --print-effective-config ----
+  out="$(run_muxm --force-replace-source --print-effective-config)"
+  assert_contains "REPLACE_SOURCE" "Effective config shows REPLACE_SOURCE" "$out"
+  assert_contains "FORCE_REPLACE_SOURCE      = 1" "Effective config: FORCE_REPLACE_SOURCE = 1" "$out"
+
+  # ---- Explicit output path: no auto-versioning when source != output ----
+  log "Testing explicit output path: no collision"
+  local explicit_out="$coll_dir/explicit_output.mp4"
+  out="$(run_muxm --crf 28 --preset ultrafast "$coll_src" "$explicit_out")"
+  if echo "$out" | grep -qiF "Source collision"; then
+    fail "Explicit output path should not trigger collision handling"
+  else
+    pass "Explicit output path: no collision triggered"
+  fi
+}
+
 test_edge() {
   section "Edge Cases & Security"
 
@@ -1829,18 +1959,18 @@ test_edge() {
     skip "Filesystem does not support tab in filename — control character test skipped"
   fi
 
-  # ---- Source/output collision prevention ----
-  # muxm must refuse when source and output point to the same file.
+  # ---- Source/output collision auto-versioning ----
+  # When source and output point to the same file, muxm auto-versions the output
+  # filename instead of dying (unless --replace-source / --force-replace-source).
   local collision_file="$TESTDIR/collision_test.mkv"
   cp "$TESTDIR/basic_sdr_subs.mkv" "$collision_file" 2>/dev/null || \
     ffmpeg -hide_banner -loglevel error -y \
       -f lavfi -i "color=c=blue:s=160x120:r=24:d=1" \
       -c:v libx264 -preset ultrafast -crf 28 "$collision_file"
-  assert_exit $EXIT_VALIDATION "Reject source==output (same file)" \
-    --crf 28 --preset ultrafast "$collision_file" "$collision_file"
   local collision_out
   collision_out="$(run_muxm --crf 28 --preset ultrafast "$collision_file" "$collision_file")"
-  assert_contains "same file" "Collision error mentions 'same file'" "$collision_out"
+  assert_contains "Source collision" "Collision triggers auto-versioning note" "$collision_out"
+  assert_contains "renamed to" "Collision note mentions renamed output" "$collision_out"
 
   # ---- Invalid --output-ext rejection ----
   assert_exit $EXIT_VALIDATION "Reject --output-ext webm (invalid container)" \
@@ -2528,6 +2658,7 @@ run_suites() {
       test_config
       test_profiles
       test_conflicts
+      test_collision
       test_dryrun
       test_video
       test_hdr
@@ -2547,6 +2678,7 @@ run_suites() {
     config)       test_config ;;
     profiles)     test_profiles ;;
     conflicts)    test_conflicts ;;
+    collision)    test_collision ;;
     dryrun)       test_dryrun ;;
     video)        test_video ;;
     hdr)          test_hdr ;;
@@ -2559,7 +2691,7 @@ run_suites() {
     e2e)          test_profile_e2e ;;
     *)
       echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, dryrun,"
+      echo "Valid: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun,"
       echo "       video, hdr, audio, subs, output, containers, metadata, edge, e2e"
       exit 1
       ;;
@@ -2609,7 +2741,7 @@ summary() {
 # Core media: basic_sdr_subs.mkv only — needed by cli, dryrun, edge, etc. (~3s to generate).
 # EXTENDED_SUITES: Full fixture set (multi-track, HDR, chapters, metadata) (~15s to generate).
 readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|unit)$"
-readonly EXTENDED_SUITES="^(dryrun|video|hdr|audio|subs|output|containers|metadata|edge|e2e|all)$"
+readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|output|containers|metadata|edge|e2e|all)$"
 
 preflight
 if [[ ! "$SUITE" =~ $MEDIA_FREE_SUITES ]]; then
