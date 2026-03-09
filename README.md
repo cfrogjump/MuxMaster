@@ -65,6 +65,7 @@ muxm --profile <n> input.mkv
 | `dv-archival` | Lossless preservation | MKV | Copy (no re-encode) | Lossless passthrough | Preserve |
 | `hdr10-hq` | Max HDR10 quality | MKV | HEVC CRF 17 | Lossless + stereo fallback | Strip |
 | `atv-directplay-hq` | Apple TV Direct Play | MP4 | HEVC Main10 (copy if compliant) | E-AC-3 + AAC stereo | P8.1 auto |
+| `atv-directplay-hq-nvenc` | Apple TV Direct Play (GPU) | MP4 | HEVC NVENC CQ 17 | E-AC-3 + AAC stereo | Strip |
 | `streaming` | Modern HEVC streaming | MP4 | HEVC CRF 20 | E-AC-3 448k + AAC stereo | Strip |
 | `animation` | Anime/cartoon optimized | MKV | HEVC CRF 16, 10-bit | Lossless + stereo fallback | Strip |
 | `universal` | Play anywhere | MP4 | H.264 SDR (tone-map HDR) | AAC stereo | Strip |
@@ -91,6 +92,41 @@ Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 wit
 
 ```
 muxm --profile atv-directplay-hq movie.mkv
+```
+
+### `atv-directplay-hq-nvenc` — Apple TV Direct Play with NVIDIA NVENC
+
+Optimized for Apple TV Direct Play using NVIDIA NVENC GPU encoding. Targets the same Apple TV / Plex Direct Play compatibility as `atv-directplay-hq`, but uses GPU-accelerated HEVC encoding instead of CPU-based x265. Decoding remains on CPU, so this profile is ideal for faster encodes on systems with NVIDIA GPUs while maintaining full ATV compatibility. Does not burn forced subtitles to keep the encode path simple; uses soft subtitles instead.
+
+**Requirements:**
+- ffmpeg compiled with `hevc_nvenc` support
+- Working NVIDIA GPU driver
+- Runtime NVENC library: `libnvidia-encode.so.1` (on Debian/Ubuntu, install `libnvidia-encode1`)
+
+**Typical behavior:**
+- Video decode: CPU
+- Video encode: NVIDIA GPU (HEVC, CQ 17, preset p5)
+- Audio: E-AC-3 surround + AAC stereo fallback
+- Subtitles: Soft subtitles (no burn-in)
+- DV handling: Strips DV (NVENC does not support DV injection in this profile)
+
+**Verification:**
+```bash
+# Check GPU availability
+nvidia-smi
+
+# Verify ffmpeg has hevc_nvenc support
+ffmpeg -hide_banner -encoders | grep nvenc
+```
+
+**Troubleshooting:**
+If you see `Cannot load libnvidia-encode.so.1`:
+- **Debian/Ubuntu:** `sudo apt-get install libnvidia-encode1`
+- **Fedora/RHEL:** `sudo dnf install libnvidia-encode`
+- **Arch:** `sudo pacman -S nvidia-utils`
+
+```
+muxm --profile atv-directplay-hq-nvenc movie.mkv
 ```
 
 ### `streaming` — Modern HEVC Streaming
