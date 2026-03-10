@@ -639,9 +639,9 @@ _dep_check_only(){
   if command -v ffmpeg >/dev/null 2>&1; then
     printf "  %-14s" "  └ libass"
     if ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
-      printf "✅ built with libass support\n"
+      printf "\t✅ built with libass support\n"
     else
-      printf "⚠️  built without libass — --sub-burn-forced will not work\n"
+      printf "\t⚠️  built without libass — --sub-burn-forced will not work\n"
     fi
   fi
   _check_tool ffprobe
