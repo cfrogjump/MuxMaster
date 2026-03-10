@@ -39,50 +39,36 @@ muxm --profile atv-directplay-hq movie.mkv
 
 MuxMaster automatically detects and utilizes available hardware acceleration on your system. During `muxm --setup`, the script detects your hardware capabilities (NVIDIA GPU, Intel GPU, or Apple Silicon) and caches the result in `~/.muxmrc` for fast future runs.
 
+**📖 Full Guide:** See [Hardware Acceleration Guide](docs/hardware_acceleration.md) for detailed setup, troubleshooting, and platform-specific information.
+
 ### Supported Hardware Platforms
 
-| Platform | Decode Support | Encode Support | Detection Method |
-| --- | --- | --- | --- |
-| **NVIDIA GPU (CUDA)** | H.264, HEVC, VP8, VP9, AV1, MPEG-2, VC-1 | H.264, HEVC | `nvidia-smi` + ffmpeg `hevc_nvenc` |
-| **Intel GPU (QuickSync)** | H.264, HEVC, VP8, VP9, AV1, MPEG-2 | H.264, HEVC | ffmpeg `hevc_qsv` support |
-| **Apple Silicon (VideoToolbox)** | H.264, HEVC | H.264, HEVC | macOS + ffmpeg `hevc_videotoolbox` |
+| Platform | GPU Decode | GPU Encode | FFmpeg Required | Performance |
+|----------|------------|------------|-----------------|-------------|
+| **NVIDIA GPU (CUDA)** | ✅ Full support | ✅ H.264, HEVC | `--enable-nvenc` | 3-5x faster |
+| **Intel GPU (QuickSync)** | ⚠️ CPU fallback | ✅ H.264, HEVC | `--enable-libmfx` | 2-3x faster |
+| **Apple Silicon (VideoToolbox)** | ✅ Full support | ✅ H.264, HEVC | `--enable-videotoolbox` | 2-4x faster |
 
-### Setup & Configuration
+### Quick Setup
 
 **First-time setup** (recommended):
 ```bash
 muxm --setup
 ```
 
-This runs hardware detection and generates `~/.muxmrc` with your detected hardware type. Future runs will use the cached configuration for zero-overhead hardware detection.
+This runs hardware detection and generates `~/.muxmrc` with your detected hardware type.
 
 **Check your hardware capabilities:**
 ```bash
 muxm --show-hardware-info
 ```
 
-Output example:
-```
-=== Hardware Acceleration Info ===
-
-Detected Hardware: nvidia
-Hardware Enabled: 1
-
-Capabilities:
-  ✅ NVIDIA GPU (CUDA) — hevc_nvenc, h264_nvenc, CUVID decoders
-  ❌ Intel GPU (QuickSync) — not available
-  ❌ Apple Silicon (VideoToolbox) — not available
-
-Current Configuration:
-  HWACCEL_TYPE=nvidia
-  HWACCEL_ENABLED=1
-  HWACCEL_DECODE=1
-  HWACCEL_ENCODE=1
-```
+**FFmpeg Requirements:**
+- **macOS**: `brew install ffmpeg` (includes VideoToolbox)
+- **Linux**: `sudo apt install ffmpeg` (includes NVENC on most distros)
+- **Cross-platform**: [Jellyfin-FFmpeg 7](https://github.com/jellyfin/jellyfin-ffmpeg/releases) (pre-compiled with all hardware support)
 
 ### CLI Flags
-
-Control hardware acceleration behavior with command-line flags:
 
 ```bash
 # Use specific hardware (overrides auto-detection)
@@ -97,6 +83,14 @@ muxm --hwaccel cpu --profile atv-directplay-hq movie.mkv
 muxm --hwaccel-decode --no-hwaccel-encode movie.mkv  # GPU decode, CPU encode
 muxm --no-hwaccel-decode --hwaccel-encode movie.mkv  # CPU decode, GPU encode
 ```
+
+### Key Features
+
+- **Automatic Detection**: Detects NVIDIA, Intel, and Apple Silicon GPUs
+- **Seamless Fallback**: Falls back to CPU encoding if hardware fails
+- **Subtitle Support**: Hardware encoding works with subtitle burn-in and OCR
+- **Quality Preservation**: Maintains visual quality while improving speed
+- **Cross-Platform**: Works on macOS and Linux with appropriate ffmpeg builds
 
 ### How It Works
 
