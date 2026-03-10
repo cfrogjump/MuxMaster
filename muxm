@@ -4801,7 +4801,9 @@ run_video_pipeline() {
   if (( HWACCEL_ENABLED )) && (( HWACCEL_DECODE )) && _gpu_decode_supported; then
     case "$HWACCEL_TYPE" in
       nvidia)
-        decode_args=(-hwaccel cuda -hwaccel_output_format cuda)
+        # Note: NVIDIA CUDA decode without -hwaccel_output_format cuda to avoid format conversion issues
+        # The decoder will output software frames that the encoder can process
+        decode_args=(-hwaccel cuda)
         note "→ GPU decode enabled (NVIDIA CUDA) for encode"
         report_add "gpu_decode" "enabled (nvidia_cuda)"
         ;;
