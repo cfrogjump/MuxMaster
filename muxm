@@ -100,6 +100,12 @@ readonly DV_CONTAINER_PATTERN='DOVI configuration record|dv_profile|dv_version'
 # JSON report accumulator (for dv-archival reporting)
 declare -a REPORT_ENTRIES=()
 
+# Hardware acceleration detection and configuration
+HWACCEL_TYPE=""                # nvidia|intel|apple|cpu (detected at runtime)
+declare -i HWACCEL_ENABLED=0   # 1 if hardware acceleration is available and enabled
+HWACCEL_DECODE=1               # Enable hardware decode when available
+HWACCEL_ENCODE=1               # Enable hardware encode when available
+
 # ===== Section 4: Opinionated defaults ========================================================
 # ---- Video encode (x265)
 declare -i CRF_VALUE=18
@@ -1877,21 +1883,73 @@ for _arg in "$@"; do
 done
 unset _arg
 
+# ===== Section 9a: Hardware detection =========================================================
+# Detect available hardware acceleration capabilities and cache in config file.
+
+_detect_nvidia_gpu(){
+  # Check for NVIDIA GPU and CUDA support
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_detect_intel_gpu(){
+  # Check for Intel GPU and QuickSync support
+  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_qsv; then
+    return 0
+  fi
+  return 1
+}
+
+_detect_apple_silicon(){
+  # Check for Apple Silicon and VideoToolbox support
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_videotoolbox; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_detect_hardware(){
+  # Detect available hardware acceleration in priority order
+  if _detect_nvidia_gpu; then
+    HWACCEL_TYPE="nvidia"
+    HWACCEL_ENABLED=1
+    return 0
+  elif _detect_intel_gpu; then
+    HWACCEL_TYPE="intel"
+    HWACCEL_ENABLED=1
+    return 0
+  elif _detect_apple_silicon; then
+    HWACCEL_TYPE="apple"
+    HWACCEL_ENABLED=1
+    return 0
+  else
+    HWACCEL_TYPE="cpu"
+    HWACCEL_ENABLED=0
+    return 1
+  fi
+}
+
 # ===== Section 9b: Full setup (--setup) =======================================================
-# Combines --install-dependencies, --install-man, and --install-completions into a single
-# first-time-setup command. Each installer runs in a subshell so its internal exit calls
-# don't short-circuit the overall flow.
+# Combines --install-dependencies, --install-man, --install-completions, and hardware
+# detection into a single first-time-setup command. Each installer runs in a subshell
+# so its internal exit calls don't short-circuit the overall flow.
 
 _setup_all(){
   say "=== ${APP_NAME} v${VERSION} — Full Setup ==="
   echo ""
-  say "Running all installers: dependencies, manual page, tab completion."
+  say "Running all installers: dependencies, manual page, tab completion, hardware detection."
   echo ""
 
   local -i failures=0
 
   # ---- 1. Dependencies ----
-  say "━━━ Step 1/3: Dependencies ━━━"
+  say "━━━ Step 1/4: Dependencies ━━━"
   echo ""
   if ( _dep_install_dependencies ); then
     : # success
@@ -1901,7 +1959,7 @@ _setup_all(){
   echo ""
 
   # ---- 2. Manual page ----
-  say "━━━ Step 2/3: Manual Page ━━━"
+  say "━━━ Step 2/4: Manual Page ━━━"
   echo ""
   if ( _install_man ); then
     : # success
@@ -1911,9 +1969,23 @@ _setup_all(){
   echo ""
 
   # ---- 3. Tab completion ----
-  say "━━━ Step 3/3: Tab Completion ━━━"
+  say "━━━ Step 3/4: Tab Completion ━━━"
   echo ""
   if ( _install_completions ); then
+    : # success
+  else
+    (( failures++ )) || true
+  fi
+  echo ""
+
+  # ---- 4. Hardware detection and config generation ----
+  say "━━━ Step 4/4: Hardware Detection & Config ━━━"
+  echo ""
+  _detect_hardware
+  say "Detected hardware acceleration: $HWACCEL_TYPE"
+  echo ""
+  say "Generating user config (~/.muxmrc) with hardware settings..."
+  if ( _create_config_user_with_hardware ); then
     : # success
   else
     (( failures++ )) || true
@@ -1925,6 +1997,9 @@ _setup_all(){
   if (( failures == 0 )); then
     say "✅ Setup complete — ${APP_NAME} v${VERSION} is ready."
     echo ""
+    printf '  Detected hardware: %s\n' "$HWACCEL_TYPE"
+    printf '  Config saved to: ~/.muxmrc\n'
+    echo ""
     printf '  Verify with:\n'
     printf '    man %s            # manual page\n' "$CLI_NAME"
     printf '    %s --version      # version check\n' "$CLI_NAME"
@@ -1934,6 +2009,40 @@ _setup_all(){
     warn "Setup finished with $failures step(s) reporting errors. Check output above."
     exit 1
   fi
+}
+
+_create_config_user_with_hardware(){
+  # Generate ~/.muxmrc with hardware settings detected during setup
+  local config_path="$HOME/.muxmrc"
+  if [[ -f "$config_path" ]]; then
+    warn "Config file already exists: $config_path"
+    return 0
+  fi
+  
+  # Create config with hardware settings
+  {
+    echo "# ================================================================"
+    echo "#  MuxMaster .muxmrc — Hardware-Optimized Configuration"
+    echo "#  Generated by: muxm --setup"
+    echo "#  Hardware detected: $HWACCEL_TYPE"
+    echo "# ================================================================"
+    echo ""
+    echo "# Hardware acceleration settings (auto-detected during setup)"
+    echo "HWACCEL_TYPE='$HWACCEL_TYPE'"
+    echo "HWACCEL_ENABLED=$HWACCEL_ENABLED"
+    echo "HWACCEL_DECODE=1"
+    echo "HWACCEL_ENCODE=1"
+    echo ""
+    echo "# Default profile"
+    echo "PROFILE_NAME='atv-directplay-hq'"
+    echo ""
+    echo "# Uncomment to customize (CLI flags override these settings)"
+    echo "#CRF_VALUE=18"
+    echo "#PRESET_VALUE=slower"
+  } > "$config_path"
+  
+  say "✅ Config generated: $config_path"
+  return 0
 }
 
 # Pre-scan for --setup
@@ -2057,6 +2166,24 @@ HEADER
   printf '#\n'
   printf '# Variables set by this profile are uncommented below.\n'
   printf '# All other variables are commented with their defaults — uncomment to customize.\n'
+  echo ""
+
+  echo "# ========================="
+  echo "# Hardware Acceleration"
+  echo "# ========================="
+  echo ""
+  echo "# Hardware acceleration type: nvidia|intel|apple|cpu"
+  echo "# Auto-detected during 'muxm --setup' and cached here for future runs"
+  printf '#HWACCEL_TYPE=%s\n' "${HWACCEL_TYPE:-cpu}"
+  echo ""
+  echo "# Enable hardware acceleration (1=enabled, 0=disabled)"
+  printf '#HWACCEL_ENABLED=%s\n' "${HWACCEL_ENABLED:-0}"
+  echo ""
+  echo "# Enable hardware decode when available (1=enabled, 0=disabled)"
+  printf '#HWACCEL_DECODE=1\n'
+  echo ""
+  echo "# Enable hardware encode when available (1=enabled, 0=disabled)"
+  printf '#HWACCEL_ENCODE=1\n'
   echo ""
 
   echo "# ========================="
