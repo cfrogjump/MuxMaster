@@ -1935,6 +1935,74 @@ _detect_hardware(){
   fi
 }
 
+# ===== Section 9a-ii: Hardware codec mapping ===================================================
+# Map source codecs to hardware-specific decoders and encoders
+
+_get_hwaccel_decoder(){
+  # Args: $1 = source codec, $2 = hardware type
+  # Returns: decoder name or empty string if not supported
+  local src_codec="$1" hwtype="${2:-${HWACCEL_TYPE}}"
+  src_codec="$(_lower "$src_codec")"
+  
+  case "$hwtype" in
+    nvidia)
+      case "$src_codec" in
+        h264) echo "h264_cuvid" ;;
+        hevc) echo "hevc_cuvid" ;;
+        vp8) echo "vp8_cuvid" ;;
+        vp9) echo "vp9_cuvid" ;;
+        av1) echo "av1_cuvid" ;;
+        mpeg2) echo "mpeg2_cuvid" ;;
+        vc1) echo "vc1_cuvid" ;;
+      esac
+      ;;
+    intel)
+      case "$src_codec" in
+        h264) echo "h264_qsv" ;;
+        hevc) echo "hevc_qsv" ;;
+        vp8) echo "vp8_qsv" ;;
+        vp9) echo "vp9_qsv" ;;
+        av1) echo "av1_qsv" ;;
+        mpeg2) echo "mpeg2_qsv" ;;
+      esac
+      ;;
+    apple)
+      case "$src_codec" in
+        h264) echo "h264_videotoolbox" ;;
+        hevc) echo "hevc_videotoolbox" ;;
+      esac
+      ;;
+  esac
+}
+
+_get_hwaccel_encoder(){
+  # Args: $1 = target codec (h264|hevc), $2 = hardware type
+  # Returns: encoder name or empty string if not supported
+  local tgt_codec="$1" hwtype="${2:-${HWACCEL_TYPE}}"
+  tgt_codec="$(_lower "$tgt_codec")"
+  
+  case "$hwtype" in
+    nvidia)
+      case "$tgt_codec" in
+        h264) echo "h264_nvenc" ;;
+        hevc) echo "hevc_nvenc" ;;
+      esac
+      ;;
+    intel)
+      case "$tgt_codec" in
+        h264) echo "h264_qsv" ;;
+        hevc) echo "hevc_qsv" ;;
+      esac
+      ;;
+    apple)
+      case "$tgt_codec" in
+        h264) echo "h264_videotoolbox" ;;
+        hevc) echo "hevc_videotoolbox" ;;
+      esac
+      ;;
+  esac
+}
+
 # ===== Section 9b: Full setup (--setup) =======================================================
 # Combines --install-dependencies, --install-man, --install-completions, and hardware
 # detection into a single first-time-setup command. Each installer runs in a subshell
@@ -2619,32 +2687,33 @@ unset _prescan_args _filtered_args _i
 # ---- Profile application functions (pure assignment, no side effects) ----
 
 apply_profile_dv_archival() {
-  # Goal: Preserve DV + HDR10 metadata, lossless audio, lossless remux only.
+  # Goal: Bit-perfect preservation. Copy video, lossless audio, all subs/chapters, JSON report.
   DISABLE_DV=0
-  ALLOW_DV_FALLBACK=1
-  DV_CONVERT_TO_P81_IF_FAIL=1
-  # Container: auto (keep source extension; default to mkv for broad codec support)
+  ALLOW_DV_FALLBACK=0
+  DV_CONVERT_TO_P81_IF_FAIL=0
+  # Container: mkv (best for preservation)
   OUTPUT_EXT="mkv"
-  # Video: copy, don't re-encode
+  # Video: copy without re-encoding
+  VIDEO_CODEC="copy"
   VIDEO_COPY_IF_COMPLIANT=1
-  VIDEO_CODEC="libx265"
-  # Audio: lossless passthrough, no stereo fallback by default
+  # Audio: lossless passthrough
   AUDIO_LOSSLESS_PASSTHROUGH=1
   ADD_STEREO_IF_MULTICH=0
-  AUDIO_CODEC_PREFERENCE="truehd,dts,flac,eac3,ac3,aac,alac,other"
-  # Subs: keep all; no burn
+  # Subs: keep all
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
   SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
-  # Chapters/metadata: keep
+  # Chapters/metadata: keep everything
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
+  # Reporting: JSON report
+  REPORT_JSON=1
   # Skip-if-ideal: on
   SKIP_IF_IDEAL=1
-  # Reporting: JSON
-  REPORT_JSON=1
+  # Hardware acceleration: not applicable (copy mode)
+  HWACCEL_ENABLED=0
 }
 
 apply_profile_hdr10_hq() {
@@ -2674,6 +2743,8 @@ apply_profile_hdr10_hq() {
   # Chapters/metadata: keep
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
+  # Hardware acceleration: enabled for HEVC encode
+  HWACCEL_ENABLED=1
 }
 
 apply_profile_atv_directplay_hq() {
@@ -2709,6 +2780,8 @@ apply_profile_atv_directplay_hq() {
   STRIP_METADATA=0
   # Skip-if-ideal: on
   SKIP_IF_IDEAL=1
+  # Hardware acceleration: enabled for HEVC encode
+  HWACCEL_ENABLED=1
 }
 
 apply_profile_atv_directplay_hq_nvenc() {
@@ -2743,6 +2816,8 @@ apply_profile_atv_directplay_hq_nvenc() {
   STRIP_METADATA=0
   # Skip-if-ideal: off (always encode with NVENC)
   SKIP_IF_IDEAL=0
+  # Hardware acceleration: enabled for NVENC encode
+  HWACCEL_ENABLED=1
 }
 
 apply_profile_universal() {
@@ -2774,6 +2849,8 @@ apply_profile_universal() {
   # Chapters/metadata: strip
   KEEP_CHAPTERS=0
   STRIP_METADATA=1
+  # Hardware acceleration: enabled for H.264 encode
+  HWACCEL_ENABLED=1
 }
 
 apply_profile_streaming() {
@@ -2797,6 +2874,8 @@ apply_profile_streaming() {
   STEREO_BITRATE="192k"
   EAC3_BITRATE_5_1="448k"
   EAC3_BITRATE_7_1="640k"
+  # Hardware acceleration: enabled for HEVC encode
+  HWACCEL_ENABLED=1
   # Subs: soft forced, full embedded, no SDH
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
@@ -2840,6 +2919,8 @@ apply_profile_animation() {
   # Chapters/metadata: keep (OP/ED chapter markers)
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
+  # Hardware acceleration: enabled for HEVC encode
+  HWACCEL_ENABLED=1
 }
 
 # Dispatcher
@@ -4436,11 +4517,25 @@ run_video_pipeline() {
   local thread_args=()
   [[ -n "${THREADS:-}" ]] && thread_args=(-threads "$THREADS")
   
-  # GPU decode support for NVENC profile (when source codec supports it)
-  if [[ "$VIDEO_CODEC" == "hevc_nvenc" ]] && _gpu_decode_supported; then
-    decode_args=(-hwaccel cuda -hwaccel_output_format cuda)
-    note "→ GPU decode enabled (CUDA) for NVENC encode"
-    report_add "gpu_decode" "enabled (cuda)"
+  # GPU decode support (when hardware acceleration is enabled and source codec supports it)
+  if (( HWACCEL_ENABLED )) && (( HWACCEL_DECODE )) && _gpu_decode_supported; then
+    case "$HWACCEL_TYPE" in
+      nvidia)
+        decode_args=(-hwaccel cuda -hwaccel_output_format cuda)
+        note "→ GPU decode enabled (NVIDIA CUDA) for encode"
+        report_add "gpu_decode" "enabled (nvidia_cuda)"
+        ;;
+      intel)
+        decode_args=(-hwaccel qsv -hwaccel_output_format qsv)
+        note "→ GPU decode enabled (Intel QuickSync) for encode"
+        report_add "gpu_decode" "enabled (intel_qsv)"
+        ;;
+      apple)
+        decode_args=(-hwaccel videotoolbox -hwaccel_output_format videotoolbox)
+        note "→ GPU decode enabled (Apple VideoToolbox) for encode"
+        report_add "gpu_decode" "enabled (apple_videotoolbox)"
+        ;;
+    esac
   fi
 
   # Tone-mapping filter (universal profile: HDR→SDR)
@@ -4479,40 +4574,60 @@ run_video_pipeline() {
     vf_str="$(IFS=','; echo "${vf_filters[*]}")"
   fi
 
-  if [[ "$VIDEO_CODEC" == "libx264" ]]; then
-    # H.264 encode (universal profile)
-    log "→ Encoding video (H.264/SDR, preset ${PRESET_VALUE}, CRF ${CRF_VALUE}) → $V_BASE"
-    encode_args=(
-      -c:v libx264
-      -preset "$PRESET_VALUE"
-      -crf "$CRF_VALUE"
-      -pix_fmt yuv420p
-      "${COLOR_ARGS[@]}"
-    )
+  # Determine target codec (h264 or hevc) and select appropriate encoder
+  local target_codec="hevc"
+  [[ "$VIDEO_CODEC" == "libx264" ]] && target_codec="h264"
+  
+  # Select encoder: hardware-accelerated if available and enabled, else CPU
+  local selected_encoder="$VIDEO_CODEC"
+  local encoder_type="cpu"
+  
+  if (( HWACCEL_ENABLED )) && (( HWACCEL_ENCODE )); then
+    # Try to get hardware encoder for target codec
+    selected_encoder="$(_get_hwaccel_encoder "$target_codec" "$HWACCEL_TYPE")"
+    if [[ -n "$selected_encoder" ]]; then
+      encoder_type="$HWACCEL_TYPE"
+    else
+      # Hardware encoder not available for this codec, fall back to CPU
+      selected_encoder="$VIDEO_CODEC"
+      encoder_type="cpu"
+    fi
+  fi
+  
+  # Build encoder-specific arguments
+  if [[ "$target_codec" == "h264" ]]; then
+    # H.264 encode
+    log "→ Encoding video (H.264/SDR, encoder: $selected_encoder, preset ${PRESET_VALUE}, CRF ${CRF_VALUE}) → $V_BASE"
+    encode_args=(-c:v "$selected_encoder" -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
     report_add "video_codec" "h264"
-  elif [[ "$VIDEO_CODEC" == "hevc_nvenc" ]]; then
-    # HEVC NVENC encode (atv-directplay-hq-nvenc profile)
-    log "→ Encoding video (HEVC NVENC, preset ${PRESET_VALUE}, CQ ${CRF_VALUE}) → $V_BASE"
-    encode_args=(
-      -c:v hevc_nvenc
-      -preset "$PRESET_VALUE"
-      -cq "$CRF_VALUE"
-      -pix_fmt "$TARGET_PIXFMT"
-      "${COLOR_ARGS[@]}"
-    )
-    report_add "video_codec" "hevc_nvenc"
+    report_add "video_encoder" "$selected_encoder"
+    report_add "encoder_type" "$encoder_type"
   else
-    # HEVC libx265 encode (default, hdr10-hq, atv-directplay-hq, streaming, animation)
-    log "→ Encoding video (${PROFILE_DESC}, ${TARGET_PIXFMT}, preset ${PRESET_VALUE}, CRF ${CRF_VALUE}) → $V_BASE"
-    encode_args=(
-      -c:v libx265
-      -preset "$PRESET_VALUE"
-      -crf "$CRF_VALUE"
-      -pix_fmt "$TARGET_PIXFMT"
-      "${COLOR_ARGS[@]}"
-      -x265-params "$X265_PARAMS"
-    )
+    # HEVC encode (libx265, hevc_nvenc, hevc_qsv, or hevc_videotoolbox)
+    log "→ Encoding video (HEVC, encoder: $selected_encoder, preset ${PRESET_VALUE}, CRF ${CRF_VALUE}) → $V_BASE"
+    
+    case "$selected_encoder" in
+      hevc_nvenc)
+        # NVIDIA NVENC: use -cq instead of -crf
+        encode_args=(-c:v hevc_nvenc -preset "$PRESET_VALUE" -cq "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        ;;
+      hevc_qsv)
+        # Intel QuickSync: use -global_quality instead of -crf
+        encode_args=(-c:v hevc_qsv -preset "$PRESET_VALUE" -global_quality "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        ;;
+      hevc_videotoolbox)
+        # Apple VideoToolbox: use -q:v instead of -crf
+        encode_args=(-c:v hevc_videotoolbox -q:v "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        ;;
+      *)
+        # libx265 (CPU encode)
+        encode_args=(-c:v libx265 -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}" -x265-params "$X265_PARAMS")
+        ;;
+    esac
+    
     report_add "video_codec" "hevc"
+    report_add "video_encoder" "$selected_encoder"
+    report_add "encoder_type" "$encoder_type"
   fi
 
   if (( DRY_RUN )); then
