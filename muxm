@@ -4787,7 +4787,9 @@ run_video_pipeline() {
         report_add "gpu_decode" "enabled (nvidia_cuda)"
         ;;
       intel)
-        decode_args=(-hwaccel qsv -hwaccel_output_format qsv)
+        # Note: Intel QSV decode without -hwaccel_output_format qsv to avoid format conversion issues
+        # The decoder will output software frames that the encoder can process
+        decode_args=(-hwaccel qsv)
         note "→ GPU decode enabled (Intel QuickSync) for encode"
         report_add "gpu_decode" "enabled (intel_qsv)"
         ;;
