@@ -18,6 +18,7 @@ muxm --profile atv-directplay-hq movie.mkv
 
 - [Why MuxMaster?](#why-muxmaster)
 - [Format Profiles](#format-profiles)
+- [Hardware Acceleration](#hardware-acceleration)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
 - [Upgrading](#upgrading)
@@ -29,6 +30,145 @@ muxm --profile atv-directplay-hq movie.mkv
 - [Bug Reports](#bug-reports)
 - [Contact](#contact)
 - [Author](#author)
+
+---
+
+<a id="hardware-acceleration"></a>
+
+## ⚡ Hardware Acceleration
+
+MuxMaster automatically detects and utilizes available hardware acceleration on your system. During `muxm --setup`, the script detects your hardware capabilities (NVIDIA GPU, Intel GPU, or Apple Silicon) and caches the result in `~/.muxmrc` for fast future runs.
+
+### Supported Hardware Platforms
+
+| Platform | Decode Support | Encode Support | Detection Method |
+| --- | --- | --- | --- |
+| **NVIDIA GPU (CUDA)** | H.264, HEVC, VP8, VP9, AV1, MPEG-2, VC-1 | H.264, HEVC | `nvidia-smi` + ffmpeg `hevc_nvenc` |
+| **Intel GPU (QuickSync)** | H.264, HEVC, VP8, VP9, AV1, MPEG-2 | H.264, HEVC | ffmpeg `hevc_qsv` support |
+| **Apple Silicon (VideoToolbox)** | H.264, HEVC | H.264, HEVC | macOS + ffmpeg `hevc_videotoolbox` |
+
+### Setup & Configuration
+
+**First-time setup** (recommended):
+```bash
+muxm --setup
+```
+
+This runs hardware detection and generates `~/.muxmrc` with your detected hardware type. Future runs will use the cached configuration for zero-overhead hardware detection.
+
+**Check your hardware capabilities:**
+```bash
+muxm --show-hardware-info
+```
+
+Output example:
+```
+=== Hardware Acceleration Info ===
+
+Detected Hardware: nvidia
+Hardware Enabled: 1
+
+Capabilities:
+  ✅ NVIDIA GPU (CUDA) — hevc_nvenc, h264_nvenc, CUVID decoders
+  ❌ Intel GPU (QuickSync) — not available
+  ❌ Apple Silicon (VideoToolbox) — not available
+
+Current Configuration:
+  HWACCEL_TYPE=nvidia
+  HWACCEL_ENABLED=1
+  HWACCEL_DECODE=1
+  HWACCEL_ENCODE=1
+```
+
+### CLI Flags
+
+Control hardware acceleration behavior with command-line flags:
+
+```bash
+# Use specific hardware (overrides auto-detection)
+muxm --hwaccel nvidia --profile atv-directplay-hq movie.mkv
+muxm --hwaccel intel --profile streaming movie.mkv
+muxm --hwaccel apple --profile universal movie.mkv
+
+# Disable hardware acceleration entirely
+muxm --hwaccel cpu --profile atv-directplay-hq movie.mkv
+
+# Control decode/encode separately
+muxm --hwaccel-decode --no-hwaccel-encode movie.mkv  # GPU decode, CPU encode
+muxm --no-hwaccel-decode --hwaccel-encode movie.mkv  # CPU decode, GPU encode
+```
+
+### How It Works
+
+1. **Detection**: During `muxm --setup`, the script checks for available hardware and caches the result
+2. **Auto-Selection**: When encoding, the script automatically selects the appropriate hardware encoder if available
+3. **Fallback**: If hardware is unavailable or unsupported for a specific codec, encoding automatically falls back to CPU
+4. **Source Codec Detection**: GPU decode is automatically enabled when the source codec is supported by your hardware
+5. **Quality Parameters**: Each hardware platform uses its native quality parameter:
+   - **NVIDIA NVENC**: `-cq` (constant quality, 0-51)
+   - **Intel QuickSync**: `-global_quality` (0-51)
+   - **Apple VideoToolbox**: `-q:v` (0-51)
+   - **CPU (libx265/libx264)**: `-crf` (0-51)
+
+### Profile Hardware Support
+
+All encoding profiles support hardware acceleration:
+
+| Profile | Hardware Decode | Hardware Encode | Notes |
+| --- | --- | --- | --- |
+| `dv-archival` | ❌ | ❌ | Copy mode, no encoding |
+| `hdr10-hq` | ✅ | ✅ | HEVC encode |
+| `atv-directplay-hq` | ✅ | ✅ | HEVC encode |
+| `atv-directplay-hq-nvenc` | ✅ | ✅ | HEVC NVENC (NVIDIA only) |
+| `streaming` | ✅ | ✅ | HEVC encode |
+| `animation` | ✅ | ✅ | HEVC encode |
+| `universal` | ✅ | ✅ | H.264 encode |
+
+### Performance Impact
+
+Hardware acceleration can significantly reduce encoding time:
+
+- **NVIDIA NVENC**: 2-5x faster than CPU x265 (quality trade-off varies)
+- **Intel QuickSync**: 1.5-3x faster than CPU x265
+- **Apple VideoToolbox**: 2-4x faster than CPU x265 on Apple Silicon
+
+### Troubleshooting
+
+**Hardware not detected?**
+
+Check your ffmpeg build:
+```bash
+# NVIDIA
+ffmpeg -hide_banner -encoders | grep nvenc
+
+# Intel
+ffmpeg -hide_banner -encoders | grep qsv
+
+# Apple
+ffmpeg -hide_banner -encoders | grep videotoolbox
+```
+
+**NVIDIA: "Cannot load libnvidia-encode.so.1"**
+
+Install the NVENC runtime library:
+```bash
+# Debian/Ubuntu
+sudo apt-get install libnvidia-encode1
+
+# Fedora/RHEL
+sudo dnf install libnvidia-encode
+
+# Arch
+sudo pacman -S nvidia-utils
+```
+
+**Intel QuickSync not available?**
+
+Ensure your CPU supports QuickSync and ffmpeg was compiled with libmfx support. On Linux, install `libmfx-dev`.
+
+**Apple VideoToolbox not available?**
+
+VideoToolbox is built into macOS. Ensure ffmpeg was compiled with `--enable-videotoolbox`. Homebrew's ffmpeg includes this by default.
 
 ---
 
