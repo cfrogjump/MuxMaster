@@ -96,7 +96,7 @@ muxm --profile atv-directplay-hq movie.mkv
 
 ### `atv-directplay-hq-nvenc` — Apple TV Direct Play with NVIDIA NVENC
 
-Optimized for Apple TV Direct Play using NVIDIA NVENC GPU encoding. Targets the same Apple TV / Plex Direct Play compatibility as `atv-directplay-hq`, but uses GPU-accelerated HEVC encoding instead of CPU-based x265. Decoding remains on CPU, so this profile is ideal for faster encodes on systems with NVIDIA GPUs while maintaining full ATV compatibility. Does not burn forced subtitles to keep the encode path simple; uses soft subtitles instead.
+Optimized for Apple TV Direct Play using NVIDIA NVENC GPU encoding. Targets the same Apple TV / Plex Direct Play compatibility as `atv-directplay-hq`, but uses GPU-accelerated HEVC encoding instead of CPU-based x265. Intelligently detects source codec and enables GPU decoding when supported, providing full GPU acceleration for compatible sources. Does not burn forced subtitles to keep the encode path simple; uses soft subtitles instead.
 
 **Requirements:**
 - ffmpeg compiled with `hevc_nvenc` support
@@ -104,11 +104,22 @@ Optimized for Apple TV Direct Play using NVIDIA NVENC GPU encoding. Targets the 
 - Runtime NVENC library: `libnvidia-encode.so.1` (on Debian/Ubuntu, install `libnvidia-encode1`)
 
 **Typical behavior:**
-- Video decode: CPU
+- Video decode: GPU (CUDA) when source codec supports it (H.264, HEVC, VP8, VP9, AV1, MPEG-2, VC-1); CPU otherwise
 - Video encode: NVIDIA GPU (HEVC, CQ 17, preset p5)
 - Audio: E-AC-3 surround + AAC stereo fallback
 - Subtitles: Soft subtitles (no burn-in)
 - DV handling: Strips DV (NVENC does not support DV injection in this profile)
+
+**GPU Decode Support:**
+The profile automatically detects source codec and enables CUDA hardware decoding for:
+- H.264 / AVC
+- HEVC / H.265
+- VP8, VP9
+- AV1
+- MPEG-2
+- VC-1
+
+For unsupported codecs, decoding falls back to CPU automatically.
 
 **Verification:**
 ```bash

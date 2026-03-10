@@ -3660,6 +3660,25 @@ _has_stream(){
   _jq_cache -e "[.streams[] | select(.codec_type==\"$1\")] | length > 0" >/dev/null
 }
 
+# Detect if source codec supports NVIDIA CUDA hardware decoding.
+# Supported codecs: h264, hevc, vp8, vp9, av1, mpeg2, vc1
+# Args: none
+# Returns: 0 if GPU decode is supported, 1 otherwise
+# Globals: METADATA_CACHE (read)
+_gpu_decode_supported(){
+  local src_codec
+  src_codec="$(_lower "$(_probe_field codec_name)")"
+  
+  case "$src_codec" in
+    h264|hevc|vp8|vp9|av1|mpeg2|vc1)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # ===== Section 22: Color space & pixel format decision ========================================
 declare -i IS_DV=0
 PROFILE_DESC="SDR"
@@ -4286,8 +4305,16 @@ run_video_pipeline() {
   # Build encode command based on VIDEO_CODEC and PROFILE_DESC
   local -a vf_filters=()
   local -a encode_args=()
+  local -a decode_args=()
   local thread_args=()
   [[ -n "${THREADS:-}" ]] && thread_args=(-threads "$THREADS")
+  
+  # GPU decode support for NVENC profile (when source codec supports it)
+  if [[ "$VIDEO_CODEC" == "hevc_nvenc" ]] && _gpu_decode_supported; then
+    decode_args=(-hwaccel cuda -hwaccel_output_format cuda)
+    note "→ GPU decode enabled (CUDA) for NVENC encode"
+    report_add "gpu_decode" "enabled (cuda)"
+  fi
 
   # Tone-mapping filter (universal profile: HDR→SDR)
   if [[ "$PROFILE_DESC" == "SDR-TONEMAP" ]]; then
@@ -4365,7 +4392,9 @@ run_video_pipeline() {
     : > "$V_BASE" 2>/dev/null || true
     mark_done "Encode base video (dry-run)"
   else
-    local -a ff_cmd=("${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0)
+    local -a ff_cmd=("${FFMPEG_FLAGS[@]}")
+    [[ ${#decode_args[@]} -gt 0 ]] && ff_cmd+=("${decode_args[@]}")
+    ff_cmd+=(-i "$SRC_ABS" -map 0:v:0)
     [[ -n "$vf_str" ]] && ff_cmd+=(-vf "$vf_str")
     if (( v_needs_raw_es )); then
       ff_cmd+=("${encode_args[@]}" "${thread_args[@]}" -an -sn -dn -f hevc "$V_BASE")
