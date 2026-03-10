@@ -6630,6 +6630,12 @@ main() {
   (( SKIP_AUDIO )) && note "[Quick Test] Audio processing disabled (--skip-audio)"
   (( SKIP_SUBS  )) && note "[Quick Test] Subtitle processing disabled (--skip-subs)"
 
+  # Detect hardware acceleration if not already set by config
+  # This ensures hardware is detected even if --setup hasn't been run
+  if [[ -z "$HWACCEL_TYPE" ]]; then
+    _detect_hardware
+  fi
+
   # Cache metadata once for all operations
   cache_stream_metadata
 
