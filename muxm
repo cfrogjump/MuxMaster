@@ -4832,7 +4832,9 @@ run_video_pipeline() {
         report_add "gpu_decode" "disabled (intel_qsv_device_unavailable)"
         ;;
       apple)
-        decode_args=(-hwaccel videotoolbox -hwaccel_output_format videotoolbox)
+        # Note: Apple VideoToolbox decode without -hwaccel_output_format videotoolbox to avoid format conversion issues
+        # The decoder will output software frames that the encoder can process
+        decode_args=(-hwaccel videotoolbox)
         note "→ GPU decode enabled (Apple VideoToolbox) for encode"
         report_add "gpu_decode" "enabled (apple_videotoolbox)"
         ;;
