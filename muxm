@@ -4890,8 +4890,16 @@ run_video_pipeline() {
     
     case "$selected_encoder" in
       hevc_nvenc)
-        # NVIDIA NVENC: use -cq instead of -crf
-        encode_args=(-c:v hevc_nvenc -preset "$PRESET_VALUE" -cq "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        # NVIDIA NVENC: use -cq instead of -crf, map libx265 presets to NVENC presets
+        # libx265: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+        # NVENC: default, fast, medium, slow
+        local nvenc_preset="medium"
+        case "$PRESET_VALUE" in
+          ultrafast|superfast|veryfast|faster|fast) nvenc_preset="fast" ;;
+          medium) nvenc_preset="medium" ;;
+          slow|slower|veryslow) nvenc_preset="slow" ;;
+        esac
+        encode_args=(-c:v hevc_nvenc -preset "$nvenc_preset" -cq "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
         ;;
       hevc_qsv)
         # Intel QuickSync: use -global_quality instead of -crf
