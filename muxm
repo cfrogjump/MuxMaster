@@ -668,6 +668,70 @@ _dep_check_only(){
   _check_tool pgsrip
   echo ""
 
+  say "Hardware Acceleration (optional — for faster encoding):"
+  echo ""
+  
+  # Detect and display hardware capabilities
+  local -i hw_total=0 hw_available=0 hw_unavailable=0
+  
+  printf "  %-20s" "NVIDIA GPU (CUDA)"
+  hw_total=$(( hw_total + 1 ))
+  if _detect_nvidia_gpu; then
+    printf "✅ detected\n"
+    hw_available=$(( hw_available + 1 ))
+  else
+    printf "❌ not found\n"
+    hw_unavailable=$(( hw_unavailable + 1 ))
+  fi
+  
+  printf "  %-20s" "Intel GPU (QuickSync)"
+  hw_total=$(( hw_total + 1 ))
+  if _detect_intel_gpu; then
+    printf "✅ detected\n"
+    hw_available=$(( hw_available + 1 ))
+  else
+    printf "❌ not found\n"
+    hw_unavailable=$(( hw_unavailable + 1 ))
+  fi
+  
+  printf "  %-20s" "Apple Silicon (VT)"
+  hw_total=$(( hw_total + 1 ))
+  if _detect_apple_silicon; then
+    printf "✅ detected\n"
+    hw_available=$(( hw_available + 1 ))
+  else
+    printf "❌ not found\n"
+    hw_unavailable=$(( hw_unavailable + 1 ))
+  fi
+  
+  echo ""
+  say "Summary: $hw_total checked, $hw_available available, $hw_unavailable unavailable"
+  echo ""
+  
+  say "Installation instructions for hardware support:"
+  echo ""
+  echo "  • NVIDIA GPU (CUDA):"
+  echo "    - Requires: NVIDIA GPU driver + ffmpeg with hevc_nvenc support"
+  echo "    - Install NVENC library:"
+  echo "      macOS:  brew install nvidia-video-sdk"
+  echo "      Linux:  sudo apt install libnvidia-encode1  (Debian/Ubuntu)"
+  echo "              sudo dnf install libnvidia-encode   (Fedora/RHEL)"
+  echo "              sudo pacman -S nvidia-utils         (Arch)"
+  echo ""
+  echo "  • Intel GPU (QuickSync):"
+  echo "    - Requires: Intel CPU with QuickSync + ffmpeg with hevc_qsv support"
+  echo "    - Install: libmfx-dev (Linux) or included in ffmpeg (macOS/Windows)"
+  echo ""
+  echo "  • Apple Silicon (VideoToolbox):"
+  echo "    - Built into macOS — no additional installation needed"
+  echo "    - Requires: ffmpeg compiled with --enable-videotoolbox"
+  echo "    - Homebrew ffmpeg includes this by default"
+  echo ""
+  echo "  After installing hardware support, run:"
+  echo "    muxm --show-hardware-info    # Check detected hardware"
+  echo "    muxm --setup                 # Cache hardware detection"
+  echo ""
+
   say "Summary: $total checked, $found found, $missing missing"
   echo ""
 
