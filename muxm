@@ -622,14 +622,15 @@ _detect_intel_gpu(){
     return 1
   fi
   
-  # Test if QSV device is actually available by attempting to initialize it
-  # Use a simple encoder-only test (no decode) to verify device availability
-  # This avoids format conversion issues that can occur with decode+encode pipelines
-  if "$ffmpeg_path" -hide_banner -f lavfi -i color=c=black:s=320x240:d=0.01 \
-    -c:v hevc_qsv -t 0.01 -f null - >/dev/null 2>&1; then
+  # Test if QSV device is actually available by attempting a minimal encode
+  # This verifies that the VAAPI device can be created and the encoder can be initialized
+  # We use a very short duration to minimize test time
+  if "$ffmpeg_path" -hide_banner -f lavfi -i color=c=black:s=320x240:d=0.001 \
+    -c:v hevc_qsv -t 0.001 -f null - >/dev/null 2>&1; then
     return 0
   fi
   
+  # If encoder test fails, QSV device is not available
   return 1
 }
 
