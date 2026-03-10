@@ -598,6 +598,62 @@ fi
 [[ -n "$FFPROBE_LOGLEVEL" ]] && ! is_valid_loglevel "$FFPROBE_LOGLEVEL" && \
   die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config. Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
 
+# ===== Section 6b: Hardware detection (early definition for dependency installer) ==========
+# Define hardware detection functions early so they're available in _dep_check_only
+
+_detect_nvidia_gpu(){
+  # Check for NVIDIA GPU and CUDA support
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_detect_intel_gpu(){
+  # Check for Intel GPU and QuickSync support
+  # Note: requires ffmpeg to be installed to check encoder availability
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    return 1
+  fi
+  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_qsv; then
+    return 0
+  fi
+  return 1
+}
+
+_detect_apple_silicon(){
+  # Check for Apple Silicon and VideoToolbox support
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_videotoolbox; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_detect_hardware(){
+  # Detect available hardware acceleration in priority order
+  if _detect_nvidia_gpu; then
+    HWACCEL_TYPE="nvidia"
+    HWACCEL_ENABLED=1
+    return 0
+  elif _detect_intel_gpu; then
+    HWACCEL_TYPE="intel"
+    HWACCEL_ENABLED=1
+    return 0
+  elif _detect_apple_silicon; then
+    HWACCEL_TYPE="apple"
+    HWACCEL_ENABLED=1
+    return 0
+  else
+    HWACCEL_TYPE="cpu"
+    HWACCEL_ENABLED=0
+    return 1
+  fi
+}
+
 # ===== Section 7: Dependency installer ========================================================
 # Invoked via --install-dependencies. Checks for all tools required by muxm and
 # installs any that are missing via Homebrew and pipx. Exits after completion.
@@ -2011,61 +2067,8 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ===== Section 9a: Hardware detection =========================================================
-# Detect available hardware acceleration capabilities and cache in config file.
-
-_detect_nvidia_gpu(){
-  # Check for NVIDIA GPU and CUDA support
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc; then
-      return 0
-    fi
-  fi
-  return 1
-}
-
-_detect_intel_gpu(){
-  # Check for Intel GPU and QuickSync support
-  # Note: requires ffmpeg to be installed to check encoder availability
-  if ! command -v ffmpeg >/dev/null 2>&1; then
-    return 1
-  fi
-  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_qsv; then
-    return 0
-  fi
-  return 1
-}
-
-_detect_apple_silicon(){
-  # Check for Apple Silicon and VideoToolbox support
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_videotoolbox; then
-      return 0
-    fi
-  fi
-  return 1
-}
-
-_detect_hardware(){
-  # Detect available hardware acceleration in priority order
-  if _detect_nvidia_gpu; then
-    HWACCEL_TYPE="nvidia"
-    HWACCEL_ENABLED=1
-    return 0
-  elif _detect_intel_gpu; then
-    HWACCEL_TYPE="intel"
-    HWACCEL_ENABLED=1
-    return 0
-  elif _detect_apple_silicon; then
-    HWACCEL_TYPE="apple"
-    HWACCEL_ENABLED=1
-    return 0
-  else
-    HWACCEL_TYPE="cpu"
-    HWACCEL_ENABLED=0
-    return 1
-  fi
-}
+# ===== Section 9a: Hardware codec mapping ===================================================
+# (Hardware detection functions moved to Section 6b for early availability)
 
 # ===== Section 9a-ii: Hardware codec mapping ===================================================
 # Map source codecs to hardware-specific decoders and encoders
