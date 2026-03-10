@@ -4787,11 +4787,11 @@ run_video_pipeline() {
         report_add "gpu_decode" "enabled (nvidia_cuda)"
         ;;
       intel)
-        # Note: Intel QSV decode without -hwaccel_output_format qsv to avoid format conversion issues
-        # The decoder will output software frames that the encoder can process
-        decode_args=(-hwaccel qsv)
-        note "→ GPU decode enabled (Intel QuickSync) for encode"
-        report_add "gpu_decode" "enabled (intel_qsv)"
+        # Note: Intel QSV decode is disabled due to device initialization issues
+        # QSV encoder will still be used for encoding, but decoding will use CPU
+        # This avoids "No device available for decoder" errors while still benefiting from hardware encode
+        note "→ GPU decode disabled for Intel QuickSync (using CPU decode)"
+        report_add "gpu_decode" "disabled (intel_qsv_device_unavailable)"
         ;;
       apple)
         decode_args=(-hwaccel videotoolbox -hwaccel_output_format videotoolbox)
