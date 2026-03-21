@@ -2578,6 +2578,24 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_exit "audio_lossless_muxable('dts','mp4')=not muxable"         1 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "dts"
   assert_muxm_fn_exit "audio_lossless_muxable('alac','mov')=muxable"            0 audio_lossless_muxable 'MUX_FORMAT="mov"'      "alac"
   assert_muxm_fn_exit "audio_lossless_muxable('truehd','mov')=not muxable"      1 audio_lossless_muxable 'MUX_FORMAT="mov"'      "truehd"
+
+  # ---- _audio_copy_ext ----
+  # Maps ffprobe codec names to file extensions that ffmpeg can mux when
+  # stream-copying.  The truehd→thd mapping is the fix for the "Unable to
+  # choose an output format for audio_primary.truehd" fatal error.
+  # A regression here silently breaks lossless passthrough for the affected codec.
+  assert_muxm_fn_stdout "_audio_copy_ext('truehd')=thd"       "thd"       _audio_copy_ext "" "truehd"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s16le')=wav"    "wav"       _audio_copy_ext "" "pcm_s16le"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s24le')=wav"    "wav"       _audio_copy_ext "" "pcm_s24le"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s32le')=wav"    "wav"       _audio_copy_ext "" "pcm_s32le"
+  assert_muxm_fn_stdout "_audio_copy_ext('dca')=dts"          "dts"       _audio_copy_ext "" "dca"
+  # Passthrough codecs — extension should equal the codec name
+  assert_muxm_fn_stdout "_audio_copy_ext('aac')=aac"          "aac"       _audio_copy_ext "" "aac"
+  assert_muxm_fn_stdout "_audio_copy_ext('ac3')=ac3"          "ac3"       _audio_copy_ext "" "ac3"
+  assert_muxm_fn_stdout "_audio_copy_ext('eac3')=eac3"        "eac3"      _audio_copy_ext "" "eac3"
+  assert_muxm_fn_stdout "_audio_copy_ext('flac')=flac"        "flac"      _audio_copy_ext "" "flac"
+  assert_muxm_fn_stdout "_audio_copy_ext('dts')=dts"          "dts"       _audio_copy_ext "" "dts"
+  assert_muxm_fn_stdout "_audio_copy_ext('alac')=alac"        "alac"      _audio_copy_ext "" "alac"
 }
 
 _test_unit_sub_helpers() {
