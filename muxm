@@ -1127,8 +1127,9 @@ Format: number with k suffix (e.g.,
 .BR 50000k ).
 Empty (default) disables the check.
 .TP
-.BR \-\-no\-dv
-Disable Dolby Vision extraction/injection.
+.BR \-\-dv " , " \-\-no\-dv
+Enable or disable Dolby Vision extraction/injection. Use \fB\-\-dv\fR to
+re\-enable DV handling after a profile disables it (e.g., \fBanimation\fR).
 .TP
 .BR \-\-allow\-dv\-fallback " , " \-\-no\-allow\-dv\-fallback
 If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
@@ -1707,7 +1708,7 @@ _muxm_completions() {
             --video-codec --tonemap --no-tonemap
             --sdr-force-10bit --no-sdr-force-10bit
             --no-conservative-vbv
-            --no-dv --allow-dv-fallback --no-allow-dv-fallback
+            --dv --no-dv --allow-dv-fallback --no-allow-dv-fallback
             --dv-convert-p81 --no-dv-convert-p81
             --video-copy-if-compliant --no-video-copy-if-compliant
             --max-copy-bitrate
@@ -2867,6 +2868,7 @@ while [[ $# -gt 0 ]]; do
     --x265-params) X265_PARAMS_BASE="${2:-}"; shift 2 ;;
     -l|--level) LEVEL_VALUE="${2:-}"; shift 2 ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
+    --dv) DISABLE_DV=0; shift ;;
     --no-dv) DISABLE_DV=1; shift ;;
     --allow-dv-fallback) ALLOW_DV_FALLBACK=1; shift ;;
     --no-allow-dv-fallback) ALLOW_DV_FALLBACK=0; shift ;;
@@ -3797,10 +3799,10 @@ apply_level_vbv() {
 #      metadata in frame side data (catches cases where container metadata
 #      is missing but RPU NAL units are present).
 #
-# Returns: 0 if DV detected, 1 otherwise.
+# Returns: 0 if DV detected, 1 if not detected, 2 if detection was skipped (DISABLE_DV=1).
 # Globals: DISABLE_DV (read), FFPROBE_FLAGS (read), SRC_ABS (read)
 detect_dv() {
-  (( DISABLE_DV )) && return 1
+  (( DISABLE_DV )) && return 2
   
   local probe_output
   probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || {
@@ -3820,6 +3822,21 @@ detect_dv() {
   
   printf '%s\n' "$probe_output" | grep -m1 -qiE 'DOVI|dolby' && return 0
   return 1
+}
+
+# _source_has_dv_metadata — Lightweight check for DV presence using the metadata cache.
+#
+# Unlike detect_dv, this does NOT honour DISABLE_DV and never probes frames.
+# It only checks the already-populated METADATA_CACHE for a DOVI configuration
+# record. Intended for informational messages when DV detection was skipped.
+#
+# Returns: 0 if DOVI configuration record found in cache, 1 otherwise.
+# Globals: METADATA_CACHE (read)
+_source_has_dv_metadata() {
+  [[ -n "${METADATA_CACHE:-}" ]] || return 1
+  _jq_cache -e '
+    [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]? |
+    select(.side_data_type == "DOVI configuration record")' >/dev/null 2>&1
 }
 
 # Populate DV source metadata from ffprobe side data and container records.
@@ -6223,7 +6240,12 @@ main() {
   fi
   
   # Detect Dolby Vision
-  if detect_dv; then
+  # detect_dv returns: 0=detected, 1=not found, 2=skipped (DISABLE_DV).
+  # Use || to capture non-zero returns without triggering errexit.
+  local _dv_rc=0
+  detect_dv || _dv_rc=$?
+
+  if (( _dv_rc == 0 )); then
     IS_DV=1
     note "Dolby Vision detected — extraction/injection will be attempted in the video pipeline."
     report_add "dv_detected" "true"
@@ -6237,12 +6259,24 @@ main() {
     if (( DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "hdr10-hq" ]]; then
       _check_hdr10_static_metadata
     fi
+  elif (( _dv_rc == 2 )); then
+    # Detection was skipped because DISABLE_DV=1. Check the metadata cache
+    # so we can tell the user if the source actually contains DV.
+    IS_DV=0
+    local _dv_skip_source="--no-dv"
+    [[ -n "${PROFILE_NAME:-}" ]] && _dv_skip_source="profile '${PROFILE_NAME}'"
+    if _source_has_dv_metadata; then
+      warn "Source contains Dolby Vision but DV handling is disabled (${_dv_skip_source}). Use --dv to override."
+      report_add "dv_detected" "skipped (present in source)"
+    else
+      note "DV detection skipped (disabled by ${_dv_skip_source})."
+      report_add "dv_detected" "skipped"
+    fi
   else
     IS_DV=0
     note "No Dolby Vision detected."
     report_add "dv_detected" "false"
   fi
-  (( DISABLE_DV )) && note "DV handling explicitly disabled via --no-dv."
 
   # Decide color space and build x265 params
   decide_color_and_pixfmt
