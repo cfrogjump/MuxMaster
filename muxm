@@ -51,7 +51,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -151,6 +151,9 @@ declare -i SUB_MAX_TRACKS=3
 declare -i SUB_ENABLE_OCR=1
 SUB_OCR_TOOL="sub2srt"
 SUB_OCR_LANG="eng"
+# Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT.
+# Only effective when the output container supports it (MKV). Ignored for MP4/MOV.
+declare -i SUB_PRESERVE_TEXT_FORMAT=0
 
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
@@ -962,7 +965,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   cat <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-03-02" "MuxMaster v1.0.1" "User Commands"
+.TH MUXM 1 "2026-03-20" "MuxMaster v1.0.2" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -1210,6 +1213,16 @@ Exclude SDH/HI subtitle tracks.
 .BR \-\-no\-ocr
 Disable PGS\(->SRT OCR.
 .TP
+.BR \-\-sub\-preserve\-format " , " \-\-no\-sub\-preserve\-format
+Preserve/convert native text subtitle formats (ASS/SSA).
+When enabled and the output container is MKV, ASS/SSA subtitles are
+stream\-copied in their native format, preserving positioning, fonts,
+and typesetting. When disabled (or when the output container is MP4/MOV),
+ASS/SSA subtitles are converted to plain\-text SRT.
+The
+.B animation
+profile enables this by default.
+.TP
 .BR \-\-ocr\-tool " " \fITOOL\fR
 OCR backend: pgsrip or sub2srt.
 .TP
@@ -1391,7 +1404,8 @@ Major variable groups:
 .B Subtitles
 .BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED ", " SUB_INCLUDE_FULL ", "
 .BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_BURN_FORCED ", "
-.BR SUB_EXPORT_EXTERNAL ", " SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
+.BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
+.BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
 .BR SUB_OCR_LANG .
 .TP
 .B Output / operational
@@ -1699,6 +1713,7 @@ _muxm_completions() {
 
             --sub-burn-forced --no-sub-burn-forced
             --sub-export-external --no-sub-export-external
+            --sub-preserve-format --no-sub-preserve-format
             --sub-lang-pref --no-sub-sdh --no-subtitles
             --ocr-lang --no-ocr --ocr-tool
 
@@ -2290,6 +2305,12 @@ HEADER
   echo "# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)"
   printf '#SUB_OCR_LANG=eng\n'
   echo ""
+  echo "# Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT"
+  echo "#   1 = keep ASS/SSA styling (positioning, fonts, typesetting)  |  0 = convert to SRT"
+  echo "#   Only effective when output container is MKV; ignored for MP4/MOV."
+  echo "#   The animation profile enables this by default."
+  _V SUB_PRESERVE_TEXT_FORMAT
+  echo ""
 
   echo ""
   echo "# ========================="
@@ -2671,6 +2692,7 @@ apply_profile_animation() {
   SUB_MAX_TRACKS=6
   SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
+  SUB_PRESERVE_TEXT_FORMAT=1
   # Chapters/metadata: keep (OP/ED chapter markers)
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
@@ -2862,6 +2884,8 @@ while [[ $# -gt 0 ]]; do
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
     --no-sub-export-external) SUB_EXPORT_EXTERNAL=0; shift ;;
+    --sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=1; shift ;;
+    --no-sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=0; shift ;;
 
     --skip-video) SKIP_VIDEO=1; shift ;;
     --skip-audio) SKIP_AUDIO=1; shift ;;
@@ -3015,6 +3039,11 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
         _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
           "Burning subs destroys ASS styling (typesetting, signs, karaoke). Soft subs recommended."
 
+      # Disabling format preservation converts ASS to plain-text SRT
+      (( ! SUB_PRESERVE_TEXT_FORMAT )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-sub-preserve-format" \
+          "ASS/SSA subtitles will be converted to SRT, losing positioning and styling."
+
       # H.264 8-bit causes banding in animation
       [[ "$VIDEO_CODEC" == "libx264" ]] && \
         _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
@@ -3150,6 +3179,7 @@ Effective config (post config-files + profile + CLI):
   SUB_ENABLE_OCR            = $SUB_ENABLE_OCR
   SUB_OCR_TOOL              = $SUB_OCR_TOOL
   SUB_OCR_LANG              = $SUB_OCR_LANG
+  SUB_PRESERVE_TEXT_FORMAT  = $SUB_PRESERVE_TEXT_FORMAT
 
   [Output / Muxing]
   OUTPUT_EXT                = $OUTPUT_EXT
@@ -5421,10 +5451,12 @@ _pick_direct_text_sub_relidx(){
   echo ""
 }
 
-# Prepare subtitle to SRT format (with OCR if needed)
+# Prepare subtitle for output (extract, convert, or OCR as needed).
+# When SUB_PRESERVE_TEXT_FORMAT=1 and the output container is MKV,
+# ASS/SSA subtitles are extracted in native format instead of converting to SRT.
 # Args: subtitle_stream_index
-# Returns: path to SRT file or empty string if failed
-_prepare_sub_to_srt(){
+# Returns: path to prepared subtitle file or empty string if failed
+_prepare_subtitle(){
   local idx="$1" codec srt sup vob_base
 
   if [[ ! -d "$WORKDIR" ]]; then
@@ -5435,9 +5467,25 @@ _prepare_sub_to_srt(){
   codec="$(_sp_sub_field "$idx" codec_name)"; codec="${codec,,}"
   srt="$WORKDIR/sub.${idx}.srt"
 
+  # Check if we should preserve native text format (ASS/SSA) for this run.
+  # Conditions: SUB_PRESERVE_TEXT_FORMAT=1, output container is MKV, and codec is ASS/SSA.
+  local _preserve_native=0
+  if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+    case "$codec" in
+      ass|ssa) _preserve_native=1 ;;
+    esac
+  fi
+
   if (( DRY_RUN )); then
-    printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run)\n" >"$srt" 2>/dev/null || true
-    echo "$srt"
+    if (( _preserve_native )); then
+      local dry_out="$WORKDIR/sub.${idx}.${codec}"
+      printf "[Script Info]\n; dry-run\n" >"$dry_out" 2>/dev/null || true
+      note "[Subs] DRY-RUN: would extract subtitle #${idx} as native ${codec} (preserving styling)"
+      echo "$dry_out"
+    else
+      printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run)\n" >"$srt" 2>/dev/null || true
+      echo "$srt"
+    fi
     return 0
   fi
 
@@ -5454,14 +5502,28 @@ _prepare_sub_to_srt(){
       ;;
       
     ass|ssa|webvtt|vtt)
-      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
-      local sub_pid=$!
-      spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
-      if wait "$sub_pid" 2>/dev/null; then
-        echo "$srt"
-        return 0
+      if (( _preserve_native )); then
+        # Extract in native format (copy, no conversion)
+        local native_out="$WORKDIR/sub.${idx}.${codec}"
+        ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$native_out" 2>"$WORKDIR/sub_${idx}.err" &
+        local sub_pid=$!
+        spinner "$sub_pid" "Extracting subtitle #${idx} (${codec} native copy)"
+        if wait "$sub_pid" 2>/dev/null; then
+          echo "$native_out"
+          return 0
+        fi
+        warn "Failed to extract native ${codec} subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
+      else
+        # Convert to SRT (legacy behavior)
+        ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
+        local sub_pid=$!
+        spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
+        if wait "$sub_pid" 2>/dev/null; then
+          echo "$srt"
+          return 0
+        fi
+        warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       fi
-      warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       ;;
       
     hdmv_pgs_subtitle|pgs)
@@ -5583,40 +5645,44 @@ A_PRIMARY_CHANNELS=""
 A_PRIMARY_CODEC=""
 A_STEREO_LANG=""
 
-# Process a prepared subtitle: either export as external SRT or embed.
-# Sets _SUB_EMBED_PATH to the SRT path if embedded, empty if exported externally.
-# Args: $1 — SRT file path, $2 — label (full|sdh)
+# Process a prepared subtitle: either export as external file or embed.
+# Sets _SUB_EMBED_PATH to the subtitle path if embedded, empty if exported externally.
+# Args: $1 — subtitle file path (may be .srt, .ass, .ssa), $2 — label (full|sdh)
 # Globals: SUB_EXPORT_EXTERNAL, OUT, OUTPUT_EXT, DRY_RUN, EXTERNAL_SRT_PATHS (modified)
 _SUB_EMBED_PATH=""
 _export_or_embed_sub(){
-  local srt_path="$1" label="$2"
+  local sub_path="$1" label="$2"
   _SUB_EMBED_PATH=""
+  # Derive extension from the prepared subtitle file
+  local sub_ext="${sub_path##*.}"
   if (( SUB_EXPORT_EXTERNAL )); then
-    local ext_srt="${OUT%."${OUTPUT_EXT}"}.${label}.srt"
+    local ext_sub="${OUT%."${OUTPUT_EXT}"}.${label}.${sub_ext}"
     if (( ! DRY_RUN )); then
-      cp -f "$srt_path" "$ext_srt" 2>/dev/null || true
+      cp -f "$sub_path" "$ext_sub" 2>/dev/null || true
     fi
-    EXTERNAL_SRT_PATHS+=("$ext_srt")
-    note "[Subs] Exported $label → external $ext_srt"
-    report_add "sub_${label}" "external srt"
+    EXTERNAL_SRT_PATHS+=("$ext_sub")
+    note "[Subs] Exported $label → external $ext_sub"
+    report_add "sub_${label}" "external ${sub_ext}"
   else
-    _SUB_EMBED_PATH="$srt_path"
-    note "[Subs] Prepared $label → $srt_path"
-    report_add "sub_${label}" "embedded"
+    _SUB_EMBED_PATH="$sub_path"
+    note "[Subs] Prepared $label → $sub_path"
+    report_add "sub_${label}" "embedded (${sub_ext})"
   fi
 }
 
 # build_subtitle_plan — Scan, categorize, and prepare subtitle tracks.
 #
 # Scans all subtitle streams for language/forced/SDH classification, selects
-# the best candidates (up to SUB_MAX_TRACKS), and prepares them as SRT files
-# via extraction, conversion, or OCR. Routes forced subtitles to either the
+# the best candidates (up to SUB_MAX_TRACKS), and prepares them as subtitle
+# files via extraction, conversion, or OCR. When SUB_PRESERVE_TEXT_FORMAT=1
+# and the output is MKV, ASS/SSA tracks are extracted in native format;
+# otherwise they are converted to SRT. Routes forced subtitles to either the
 # burn-in path (SRT_FORCED_BURN_PATH) or embed path (SRT_FORCED) based on
 # SUB_BURN_FORCED. Non-forced subtitles are either embedded or exported as
-# external .srt files based on SUB_EXPORT_EXTERNAL.
+# external files based on SUB_EXPORT_EXTERNAL.
 #
-# Falls back to direct-mapping a text subtitle from source if no SRTs were
-# prepared and at least one SUB_INCLUDE_* flag is enabled.
+# Falls back to direct-mapping a text subtitle from source if no prepared
+# subtitles were produced and at least one SUB_INCLUDE_* flag is enabled.
 #
 # Sets: SRT_FORCED, SRT_FULL, SRT_SDH, SRT_FORCED_BURN_PATH, SRT_DIRECT_MAP,
 #       DIRECT_SUB_RELIDX, EXTERNAL_SRT_PATHS[], and associated *_LANG/*_TITLE vars
@@ -5682,7 +5748,7 @@ build_subtitle_plan(){
   # Prepare selected subtitles (up to SUB_MAX_TRACKS)
   local p pick_count=0
   if [[ -n "$forced_idx" ]]; then
-    p="$(_prepare_sub_to_srt "$forced_idx")"
+    p="$(_prepare_subtitle "$forced_idx")"
     if [[ -n "$p" ]]; then
       SRT_FORCED_LANG="$(_sp_sub_lang "$forced_idx")"
       SRT_FORCED_TITLE="Forced"
@@ -5700,7 +5766,7 @@ build_subtitle_plan(){
     fi
   fi
   if [[ -n "$full_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
-    p="$(_prepare_sub_to_srt "$full_idx")"
+    p="$(_prepare_subtitle "$full_idx")"
     if [[ -n "$p" ]]; then
       SRT_FULL_LANG="$(_sp_sub_lang "$full_idx")"
       local _full_src_title
@@ -5714,7 +5780,7 @@ build_subtitle_plan(){
     fi
   fi
   if [[ -n "$sdh_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
-    p="$(_prepare_sub_to_srt "$sdh_idx")"
+    p="$(_prepare_subtitle "$sdh_idx")"
     if [[ -n "$p" ]]; then
       SRT_SDH_LANG="$(_sp_sub_lang "$sdh_idx")"
       SRT_SDH_TITLE="SDH"
@@ -5879,38 +5945,63 @@ mux_final() {
     ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
   fi
 
-  # Codec settings: copy everything, convert subs to appropriate codec
+  # Codec settings: copy everything; subtitle codecs are assigned per-stream below
   ff_codec+=( -c copy )
 
-  if (( forced_present || full_present || sdh_present )) || [[ -n "$src_sub_idx" ]]; then
+  # _sub_codec_for_file — Determine the ffmpeg subtitle codec flag for a prepared file.
+  # ASS/SSA files in MKV are stream-copied to preserve styling; all others convert.
+  # Args: $1 — path to prepared subtitle file
+  # Stdout: codec name suitable for -c:s:N (e.g., "copy", "srt", "mov_text")
+  _sub_codec_for_file(){
+    local ext="${1##*.}"
     if [[ "$MUX_FORMAT" == "matroska" ]]; then
-      # MKV can handle SRT natively (subrip)
-      ff_codec+=( -c:s srt )
+      case "$ext" in
+        ass|ssa) echo "copy" ;;   # preserve native ASS/SSA in MKV
+        *)       echo "srt" ;;
+      esac
     else
-      # MP4/MOV: must use mov_text
-      ff_codec+=( -c:s mov_text )
+      echo "mov_text"
     fi
-  fi
+  }
 
-  # Subtitle metadata: language, title, and disposition tagging.
+  # Subtitle metadata: language, title, disposition, and per-stream codec tagging.
   # Output subtitle index tracks which output stream we're tagging.
   local -i out_s_idx=0
   if (( forced_present )); then
+    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FORCED")" )
     [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
     [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
     ff_codec+=( "-disposition:s:${out_s_idx}" forced )
     out_s_idx=$(( out_s_idx + 1 ))
   fi
   if (( full_present )); then
+    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FULL")" )
     [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
     [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
     ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
     out_s_idx=$(( out_s_idx + 1 ))
   fi
   if (( sdh_present )); then
+    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_SDH")" )
     [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
     [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
     ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
+    out_s_idx=$(( out_s_idx + 1 ))
+  fi
+  if [[ -n "$src_sub_idx" ]]; then
+    # Direct-mapped subtitle from source: check if we should preserve native format
+    local _dm_codec
+    _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
+    if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+      case "$_dm_codec" in
+        ass|ssa) ff_codec+=( "-c:s:${out_s_idx}" copy ) ;;
+        *)       ff_codec+=( "-c:s:${out_s_idx}" srt ) ;;
+      esac
+    elif [[ "$MUX_FORMAT" == "matroska" ]]; then
+      ff_codec+=( "-c:s:${out_s_idx}" srt )
+    else
+      ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+    fi
     out_s_idx=$(( out_s_idx + 1 ))
   fi
 

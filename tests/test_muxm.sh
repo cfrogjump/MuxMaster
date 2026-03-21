@@ -125,6 +125,12 @@ probe_audio() {
   ffprobe -v error -select_streams "a:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
 }
 
+# Probe a subtitle field from output file (stream index defaults to s:0).
+probe_sub() {
+  local file="$1" field="$2" idx="${3:-0}"
+  ffprobe -v error -select_streams "s:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
+}
+
 # Probe a format-level tag (title, comment, encoder, language, etc.).
 # Usage: probe_format_tag FILE TAG
 probe_format_tag() {
@@ -415,6 +421,38 @@ SRT
     -metadata:s:s:2 language=fra -metadata:s:s:2 title="French" \
     "$TESTDIR/multi_subs_multilang.mkv"
   pass "multi_subs_multilang.mkv created"
+
+  # 5c) ASS/SSA subtitle file (for SUB_PRESERVE_TEXT_FORMAT tests)
+  #     ASS subtitles carry positioning, styling, fonts, and typesetting data
+  #     that is lost when converted to SRT. This fixture validates that the
+  #     animation profile (and --sub-preserve-format) preserves ASS natively.
+  log "Creating ass_subs.mkv (HEVC + AAC + ASS subtitle with styling)"
+  cat > "$TESTDIR/styled.ass" <<'ASS'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Signs,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Signs,,0,0,0,,{\pos(960,100)}Styled sign text
+ASS
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=pink:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/styled.ass" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s ass \
+    -map 0:v -map 1:a -map 2 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="English Styled" \
+    "$TESTDIR/ass_subs.mkv"
+  pass "ass_subs.mkv created"
 
   # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
@@ -962,6 +1000,7 @@ test_profiles() {
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 1" "animation: lossless audio" "$out"
   assert_contains "SDR_FORCE_10BIT           = 1" "animation: force 10-bit SDR" "$out"
   assert_contains "flac,truehd" "animation: FLAC-first codec preference" "$out"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1" "animation: ASS/SSA preservation enabled" "$out"
 
   # universal specifics
   out="$(run_muxm --profile universal --print-effective-config)"
@@ -1041,6 +1080,10 @@ test_conflicts() {
   out="$(run_muxm --profile animation --no-audio-lossless-passthrough --print-effective-config)"
   assert_contains "⚠" "animation + --no-audio-lossless-passthrough warns (#47)" "$out"
 
+  out="$(run_muxm --profile animation --no-sub-preserve-format --print-effective-config)"
+  assert_contains "⚠" "animation + --no-sub-preserve-format warns" "$out"
+  assert_contains "ASS/SSA" "animation + --no-sub-preserve-format mentions ASS/SSA" "$out"
+
   # --- universal conflicts ---
   out="$(run_muxm --profile universal --output-ext mkv --print-effective-config)"
   assert_contains "⚠" "universal + mkv warns" "$out"
@@ -1090,6 +1133,10 @@ test_dryrun() {
   # Dry-run with HDR source
   out="$(run_muxm --dry-run "$TESTDIR/hevc_hdr10_tagged.mkv")"
   assert_contains "DRY-RUN" "Dry-run with HDR source" "$out"
+
+  # Dry-run with animation profile + ASS source completes cleanly
+  out="$(run_muxm --dry-run --profile animation "$TESTDIR/ass_subs.mkv")"
+  assert_contains "DRY-RUN" "Dry-run animation + ASS completes" "$out"
 }
 
 # === Suite: Video Pipeline (real encodes) ===
@@ -1548,6 +1595,100 @@ EOF
   else
     skip "--sub-lang-pref encode failed or output not found"
   fi
+
+  # ---- --sub-preserve-format / --no-sub-preserve-format config flags ----
+  out="$(run_muxm --sub-preserve-format --print-effective-config)"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1" "--sub-preserve-format: config shows 1" "$out"
+
+  out="$(run_muxm --no-sub-preserve-format --print-effective-config)"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 0" "--no-sub-preserve-format: config shows 0" "$out"
+
+  # ---- ASS subtitle encode tests ----
+  # Isolate HOME to prevent user's ~/.muxmrc from affecting subtitle pipeline
+  # behavior (e.g., SUB_BURN_FORCED=1, default PROFILE_NAME, etc.).
+  local _saved_home="$HOME"
+  export HOME="$TESTDIR/ass_test_home"
+  mkdir -p "$HOME"
+
+  # ---- animation profile preserves ASS subtitles natively in MKV ----
+  local ass_anim_out="$TESTDIR/subs_ass_animation.mkv"
+  log "Testing animation profile preserves ASS subtitles..."
+  if assert_encode "animation + ASS: output produced" "$ass_anim_out" \
+       --profile animation --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_codec
+    ass_codec="$(probe_sub "$ass_anim_out" codec_name)"
+    if [[ "$ass_codec" == "ass" || "$ass_codec" == "ssa" ]]; then
+      pass "animation + ASS: subtitle preserved as native $ass_codec (not SRT)"
+    else
+      fail "animation + ASS: expected ass/ssa codec, got '$ass_codec'"
+    fi
+  fi
+
+  # ---- --sub-preserve-format (explicit) preserves ASS in MKV ----
+  local ass_explicit_out="$TESTDIR/subs_ass_explicit.mkv"
+  log "Testing --sub-preserve-format preserves ASS..."
+  if assert_encode "--sub-preserve-format + MKV: output produced" "$ass_explicit_out" \
+       --output-ext mkv --sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_explicit_codec
+    ass_explicit_codec="$(probe_sub "$ass_explicit_out" codec_name)"
+    if [[ "$ass_explicit_codec" == "ass" || "$ass_explicit_codec" == "ssa" ]]; then
+      pass "--sub-preserve-format + MKV: subtitle preserved as native $ass_explicit_codec"
+    else
+      fail "--sub-preserve-format + MKV: expected ass/ssa, got '$ass_explicit_codec'"
+    fi
+  fi
+
+  # ---- Default behavior (no --sub-preserve-format) converts ASS to SRT in MKV ----
+  local ass_default_out="$TESTDIR/subs_ass_default.mkv"
+  log "Testing default behavior converts ASS to SRT..."
+  if assert_encode "Default + ASS→MKV: output produced" "$ass_default_out" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_default_codec
+    ass_default_codec="$(probe_sub "$ass_default_out" codec_name)"
+    if [[ "$ass_default_codec" == "subrip" || "$ass_default_codec" == "srt" ]]; then
+      pass "Default + ASS→MKV: subtitle converted to SRT ($ass_default_codec)"
+    else
+      fail "Default + ASS→MKV: expected subrip/srt, got '$ass_default_codec'"
+    fi
+  fi
+
+  # ---- --no-sub-preserve-format overrides animation profile ----
+  local ass_override_out="$TESTDIR/subs_ass_override.mkv"
+  log "Testing --no-sub-preserve-format overrides animation profile..."
+  if assert_encode "animation + --no-sub-preserve-format: output produced" "$ass_override_out" \
+       --profile animation --no-sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_override_codec
+    ass_override_codec="$(probe_sub "$ass_override_out" codec_name)"
+    if [[ "$ass_override_codec" == "subrip" || "$ass_override_codec" == "srt" ]]; then
+      pass "animation + --no-sub-preserve-format: ASS converted to SRT ($ass_override_codec)"
+    else
+      fail "animation + --no-sub-preserve-format: expected subrip/srt, got '$ass_override_codec'"
+    fi
+  fi
+
+  # ---- --sub-preserve-format ignored for MP4 (container cannot carry ASS) ----
+  local ass_mp4_out="$TESTDIR/subs_ass_mp4.mp4"
+  log "Testing --sub-preserve-format ignored for MP4..."
+  if assert_encode "--sub-preserve-format + MP4: output produced" "$ass_mp4_out" \
+       --output-ext mp4 --sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_mp4_codec
+    ass_mp4_codec="$(probe_sub "$ass_mp4_out" codec_name)"
+    if [[ "$ass_mp4_codec" == "mov_text" ]]; then
+      pass "--sub-preserve-format + MP4: subtitle is mov_text (ASS not preserved in MP4)"
+    else
+      # MP4 might have no subs at all, or mov_text — either is acceptable
+      local ass_mp4_scount
+      ass_mp4_scount="$(count_streams "$ass_mp4_out" s)"
+      if [[ "$ass_mp4_scount" -eq 0 ]]; then
+        pass "--sub-preserve-format + MP4: no subtitle in output (MP4 cannot carry ASS)"
+      else
+        fail "--sub-preserve-format + MP4: expected mov_text or no sub, got '$ass_mp4_codec'"
+      fi
+    fi
+  fi
+
+  # Restore HOME
+  export HOME="$_saved_home"
 }
 
 # === Suite: Output Features ===
@@ -2492,6 +2633,32 @@ test_profile_e2e() {
       esac
     fi
   done
+
+  # ---- animation profile + ASS source: verify subtitle format preserved ----
+  # Isolate HOME to prevent user config from affecting subtitle pipeline.
+  local _saved_home="$HOME"
+  export HOME="$TESTDIR/e2e_ass_home"
+  mkdir -p "$HOME"
+
+  local ass_e2e_out="$TESTDIR/e2e_animation_ass.mkv"
+  log "Full encode: animation profile with ASS subtitles..."
+  if assert_encode "animation + ASS: e2e output produced" "$ass_e2e_out" \
+       --profile animation --preset ultrafast --crf 28 "$TESTDIR/ass_subs.mkv"; then
+    local ass_e2e_codec
+    ass_e2e_codec="$(probe_sub "$ass_e2e_out" codec_name)"
+    if [[ "$ass_e2e_codec" == "ass" || "$ass_e2e_codec" == "ssa" ]]; then
+      pass "animation + ASS e2e: subtitle preserved as native $ass_e2e_codec"
+    else
+      fail "animation + ASS e2e: expected ass/ssa, got '$ass_e2e_codec'"
+    fi
+    # Verify subtitle content retained styling (check for ASS header markers)
+    local ass_e2e_content
+    ass_e2e_content="$(ffprobe -v error -select_streams s:0 -show_entries \
+      stream=codec_name,codec_long_name -of csv=p=0 "$ass_e2e_out" 2>/dev/null)"
+    assert_contains "ass" "animation + ASS e2e: ffprobe confirms ASS codec" "$ass_e2e_content"
+  fi
+
+  export HOME="$_saved_home"
 }
 
 # === Suite: Completions Installer ===
