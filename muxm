@@ -4051,6 +4051,13 @@ RPU_FINAL="$WORKDIR/rpu_final.bin"
 # based on whether DV injection is needed:
 #   DV path:     .hevc raw ES (dovi_tool requires raw elementary streams)
 #   Non-DV path: .mkv container (preserves timestamps for matroska final mux)
+#
+# NOTE: On non-DV paths and DV fallback paths, V_MIXED is reassigned to alias
+# V_BASE (or V_INJECTED) rather than copying the file.  This avoids multi-GB
+# file copies for no functional gain.  Downstream consumers (mux_final, DV
+# container verification, pre-wrap) only read V_MIXED — they never write to it.
+# Consequence for --keep-temp-always: the workdir will contain only video_base
+# (not a separate video_mixed) on non-DV runs.
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
 
@@ -4397,7 +4404,7 @@ run_video_pipeline() {
 
   # Default: no DV, or DV disabled, or H.264 (no DV possible) → use base
   if (( IS_DV == 0 || DISABLE_DV == 1 )) || [[ "$VIDEO_CODEC" == "libx264" ]]; then
-    cp -f "$V_BASE" "$V_MIXED"
+    V_MIXED="$V_BASE"
     mark_done "Use base video (non-DV)"
     return 0
   fi
@@ -4462,7 +4469,7 @@ run_video_pipeline() {
   if (( ! rpu_extracted && ! DRY_RUN )); then
     warn "All DV RPU extraction methods failed; using base video."
     if (( ALLOW_DV_FALLBACK )); then
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV extract failed)"
       return 0
     fi
@@ -4541,7 +4548,7 @@ run_video_pipeline() {
     warn "RPU validation failed — RPU may be corrupt or incompatible."
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (RPU validation failed)"
       return 0
     fi
@@ -4563,7 +4570,7 @@ run_video_pipeline() {
     warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV inject failed)"
       return 0
     fi
@@ -4575,7 +4582,7 @@ run_video_pipeline() {
     warn "DV injection produced empty file."
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV inject empty)"
       return 0
     fi
@@ -4601,7 +4608,7 @@ run_video_pipeline() {
       warn "  doesn't exist in the re-encoded single-layer output."
       report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
       # Fall back to the unconverted injected file
-      cp -f "$V_INJECTED" "$V_MIXED"
+      V_MIXED="$V_INJECTED"
     fi
   fi
 

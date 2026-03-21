@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [1.0.2] - 2026-03-20
 
-Enforce HEVC Level 5.1 VBV guardrails in `atv-directplay-hq` re-encodes to prevent bitrate spikes that cause stutter on Apple TV 4K. Fix crash when subtitle or audio stream titles contain literal pipe characters. Add ASS/SSA subtitle format preservation for MKV containers.
+Enforce HEVC Level 5.1 VBV guardrails in `atv-directplay-hq` re-encodes to prevent bitrate spikes that cause stutter on Apple TV 4K. Fix crash when subtitle or audio stream titles contain literal pipe characters. Add ASS/SSA subtitle format preservation for MKV containers. Eliminate redundant multi-GB file copies in the video pipeline.
 
 ### Added
 
@@ -26,6 +26,7 @@ Enforce HEVC Level 5.1 VBV guardrails in `atv-directplay-hq` re-encodes to preve
 ### Changed
 
 - `--create-config ... atv-directplay-hq` now emits `LEVEL_VALUE` and `CONSERVATIVE_VBV` as uncommented (active) variables, matching the profile's new defaults.
+- **Video pipeline no longer copies multi-GB intermediates on non-DV and DV-fallback paths.** Six `cp -f` operations that duplicated the encoded video from `V_BASE` to `V_MIXED` (or `V_INJECTED` to `V_MIXED`) have been replaced with variable reassignment. Downstream consumers (`mux_final`, DV container verification, DV pre-wrap) only read `V_MIXED` and never write to it, so an alias is functionally identical to a file copy. For a typical 2-hour 4K HEVC encode at CRF 17–18, this eliminates 8–25 GB of redundant disk I/O, saves 10–30 seconds of wall-clock time, and halves peak intermediate disk usage. The only user-visible change is that `--keep-temp-always` workdirs will no longer contain a separate `video_mixed` file on non-DV runs.
 
 ## [1.0.1] - 2026-03-09
 
