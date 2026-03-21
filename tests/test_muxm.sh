@@ -2595,7 +2595,7 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_stdout "_audio_copy_ext('eac3')=eac3"        "eac3"      _audio_copy_ext "" "eac3"
   assert_muxm_fn_stdout "_audio_copy_ext('flac')=flac"        "flac"      _audio_copy_ext "" "flac"
   assert_muxm_fn_stdout "_audio_copy_ext('dts')=dts"          "dts"       _audio_copy_ext "" "dts"
-  assert_muxm_fn_stdout "_audio_copy_ext('alac')=alac"        "alac"      _audio_copy_ext "" "alac"
+  assert_muxm_fn_stdout "_audio_copy_ext('alac')=m4a"          "m4a"       _audio_copy_ext "" "alac"
 }
 
 _test_unit_sub_helpers() {

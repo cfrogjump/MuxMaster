@@ -5036,6 +5036,9 @@ select_best_audio(){
 }
 
 # Check if audio codec can be direct-play copied to MP4
+# SYNC: Codecs listed here can reach do_copy=1 in run_audio_pipeline.
+#   Any codec added here MUST have a valid ffmpeg muxer extension — if not,
+#   add a mapping in _audio_copy_ext().  See also: audio_is_lossless().
 audio_is_direct_play_copyable(){
   local codec="$1"
   case "$codec" in
@@ -5045,6 +5048,10 @@ audio_is_direct_play_copyable(){
 }
 
 # Check if audio codec is lossless (for AUDIO_LOSSLESS_PASSTHROUGH)
+# SYNC: Codecs listed here can reach do_copy=1 via the lossless passthrough
+#   path in run_audio_pipeline.  Any codec added here MUST have a valid ffmpeg
+#   muxer extension — if not, add a mapping in _audio_copy_ext().
+#   See also: audio_is_direct_play_copyable(), audio_lossless_muxable().
 audio_is_lossless(){
   local codec="$1"
   case "$codec" in
@@ -5073,15 +5080,20 @@ audio_lossless_muxable(){
 
 # Map ffprobe codec name to a file extension ffmpeg can mux when stream-copying.
 # ffmpeg auto-detects the muxer from the output filename extension. Some codecs
-# (notably TrueHD) use an ffprobe name that doesn't match any registered muxer
-# extension, causing "Unable to choose an output format" errors during copy.
+# (notably TrueHD and ALAC) use an ffprobe name that doesn't match any registered
+# muxer extension, causing "Unable to choose an output format" errors during copy.
 # This function returns a safe extension for the intermediate copy file.
+# SYNC: Every codec that can reach do_copy=1 in run_audio_pipeline must produce
+#   a valid extension here.  When adding codecs to audio_is_lossless() or
+#   audio_is_direct_play_copyable(), verify the ffprobe name has a matching
+#   ffmpeg muxer — if not, add an explicit mapping below.
 # Args: $1 — codec name (lowercased, from ffprobe)
 # Stdout: file extension (without dot) suitable for ffmpeg -c copy output
 _audio_copy_ext(){
   local codec="$1"
   case "$codec" in
     truehd)                       echo "thd" ;;   # ffmpeg truehd muxer recognizes .thd
+    alac)                         echo "m4a" ;;   # ffmpeg has no .alac muxer; .m4a (ipod) works
     pcm_s16le|pcm_s24le|pcm_s32le) echo "wav" ;;  # raw PCM needs a container
     dca)                          echo "dts" ;;    # ffprobe reports dca, muxer expects .dts
     *)                            echo "$codec" ;; # aac, ac3, eac3, flac, dts, etc. work as-is
