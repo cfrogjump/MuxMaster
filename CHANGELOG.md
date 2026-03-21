@@ -6,12 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [1.0.2] - 2026-03-20
 
-Enforce HEVC Level 5.1 VBV guardrails in `atv-directplay-hq` re-encodes to prevent bitrate spikes that cause stutter on Apple TV 4K. Fix crash when subtitle or audio stream titles contain literal pipe characters.
+Enforce HEVC Level 5.1 VBV guardrails in `atv-directplay-hq` re-encodes to prevent bitrate spikes that cause stutter on Apple TV 4K. Fix crash when subtitle or audio stream titles contain literal pipe characters. Add ASS/SSA subtitle format preservation for MKV containers.
+
+### Added
+
+- **`--sub-preserve-format` / `--no-sub-preserve-format`** — New CLI flag pair controlling whether text-based subtitles (ASS/SSA) are kept in their native format or converted to plain-text SRT. When enabled and the output container is MKV, ASS/SSA subtitles are stream-copied with full positioning, fonts, and typesetting intact. Ignored for MP4/MOV containers (which cannot carry ASS). Controllable via the `SUB_PRESERVE_TEXT_FORMAT` config variable in `.muxmrc`.
+- **`animation` profile now preserves ASS/SSA subtitles by default.** The profile sets `SUB_PRESERVE_TEXT_FORMAT=1`, fulfilling its documented promise of preserving styled ASS/SSA subtitles in MKV output. Previously, ASS subtitles were unconditionally converted to SRT regardless of profile or container, losing all positioning, styling, and typesetting data.
+- New conflict warning when `animation` profile is combined with `--no-sub-preserve-format`, alerting that ASS/SSA styling will be lost.
+- `SUB_PRESERVE_TEXT_FORMAT` added to `--print-effective-config`, `--create-config` template, man page, and tab completions.
+- New `ass_subs.mkv` test fixture and 10 new test assertions across `test_profiles`, `test_conflicts`, `test_dryrun`, `test_subs`, and `test_profile_e2e` suites validating ASS preservation, SRT conversion fallback, CLI override, and MP4 container limitation.
+- `probe_sub` helper added to `test_muxm.sh` for subtitle stream field inspection.
 
 ### Fixed
 
 - **`atv-directplay-hq` re-encodes now capped by Level 5.1 VBV.** Previously, the copy path was guarded by `MAX_COPY_BITRATE=50000k` but the re-encode path had no bitrate ceiling — a CRF 17 encode of complex scenes could spike beyond what the Apple TV 4K hardware decoder sustains without buffering. The profile now sets `LEVEL_VALUE="5.1"`, which activates the existing conservative VBV machinery (`vbv-maxrate=40000k`, `vbv-bufsize=80000k`). Can be overridden with `--level` or `--no-conservative-vbv`.
 - **Pipe characters in stream titles no longer break field parsing.** Subtitle titles such as `"Original | English"` or `"Original | English | (SDH)"` contain literal `|` which corrupted the pipe-delimited output of `_sub_stream_info` and the verify-block audio jq call. The `forced` variable would receive fragments like `" English|0"` instead of `0`, causing an arithmetic evaluation crash under `nounset`. Switched all internal field delimiters from `|` to `\t` (tab) across 4 jq producer functions, 10 consumer `read`/`cut`/parameter-expansion sites, and their fallback defaults. Tab is safe because it effectively never appears in media metadata. The audio pipeline (`_audio_stream_info`, `_score_audio_stream`, and their consumers) was not actively broken — the free-text `title` field happened to be last, absorbing extra pipes — but was migrated for consistency to prevent silent breakage if fields are ever reordered.
+- **ASS/SSA subtitles no longer silently converted to SRT.** The subtitle pipeline unconditionally funneled all text-based subtitles through SRT conversion via `_prepare_sub_to_srt`, destroying ASS positioning, fonts, and typesetting — even when the output container (MKV) natively supports ASS. The `--no-ocr` flag only gated PGS bitmap OCR, not text-format conversion. The function has been renamed to `_prepare_subtitle` and now checks `SUB_PRESERVE_TEXT_FORMAT` and the output container format before deciding whether to convert or stream-copy. The final mux stage (`mux_final`) has been updated from a blanket `-c:s srt` to per-stream codec assignment, so ASS and SRT tracks can coexist in the same output.
 
 ### Changed
 

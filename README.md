@@ -151,7 +151,7 @@ When you run `muxm`, the script executes a multi-stage pipeline that inspects th
 
 **4. Audio Pipeline.** Audio track selection is language-preference-aware and codec-aware. When multiple tracks exist, `muxm` scores each one based on language match, channel count, surround layout, codec preference, and bitrate — with configurable weights in `.muxmrc` (see `man muxm` for details). The pipeline picks the best available track (honoring `--audio-lang-pref`), decides whether to copy it through or transcode it based on the profile's codec requirements, and optionally generates a stereo AAC fallback track from the surround source. Lossless codecs (TrueHD, DTS-HD MA, FLAC) are passed through untouched when the profile and container support it.
 
-**5. Subtitle Pipeline.** Subtitles are categorized into forced, full, and SDH tracks. PGS bitmap subtitles are OCR'd to SRT (via `pgsrip` or `sub2srt`) when the output container can't carry them natively. Forced subtitles can be burned into the video stream; other tracks can be embedded or exported as external `.srt` files. The pipeline respects language preferences and can exclude SDH tracks.
+**5. Subtitle Pipeline.** Subtitles are categorized into forced, full, and SDH tracks. PGS bitmap subtitles are OCR'd to SRT (via `pgsrip` or `sub2srt`) when the output container can't carry them natively. Text-based subtitles (ASS/SSA) can be preserved in their native format — retaining positioning, fonts, and typesetting — when the output container is MKV (`--sub-preserve-format`), or converted to plain-text SRT for broader compatibility. Forced subtitles can be burned into the video stream; other tracks can be embedded or exported as external `.srt` files. The pipeline respects language preferences and can exclude SDH tracks.
 
 **6. Final Mux.** All processed streams are assembled into the target container (MP4, MKV, M4V, or MOV) with correct codec tagging, chapter markers, subtitle disposition flags, and metadata. For Dolby Vision in MP4, `muxm` verifies that the `dvcC`/`dvvC` container signaling record is present via `MP4Box`.
 
@@ -295,6 +295,7 @@ muxm [options] <source> [target.mp4]
 | `--audio-lossless-passthrough` | Allow lossless codecs to pass through |
 | `--sub-lang-pref LANGS` | Subtitle language preference (comma-separated) |
 | `--sub-burn-forced` | Burn forced subtitles into video |
+| `--sub-preserve-format` | Keep ASS/SSA subtitles in native format (MKV only; use `--no-sub-preserve-format` to force SRT conversion) |
 | `--output-ext mp4\|mkv\|m4v\|mov` | Output container |
 | `--report-json` | Generate a JSON report alongside the output file |
 | `--checksum` | Write a SHA-256 checksum file for the output |
