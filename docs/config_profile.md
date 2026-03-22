@@ -45,8 +45,8 @@ target. Generate a JSON report and SHA-256 checksum for archival integrity.
   and a re-encode is explicitly requested via CLI override).
 - All audio tracks matching the language filter are copied losslessly. Commentary
   tracks are excluded by default.
-- All subtitle tracks are kept. Forced tracks are detected and flagged.
-  Language tags are normalized.
+- All subtitle tracks are kept (up to `SUB_MAX_TRACKS`, default 99). Forced
+  tracks are detected and flagged. Language tags are normalized.
 - The skip-if-ideal heuristic avoids touching files that already conform.
 
 **CLI:** `muxm --profile dv-archival input.mkv`

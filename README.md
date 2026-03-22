@@ -44,7 +44,7 @@ You can solve all of this with raw ffmpeg, but the command will be 15+ flags lon
 
 **Tdarr** solves the batch-processing and automation problem well, especially at library scale. But it requires a server, a database, a web UI, and Node.js — it's infrastructure. If you want to process a single file, or a handful of files, with precise control over DV handling, audio track selection, and subtitle policy, Tdarr's plugin system means writing JavaScript to configure what `muxm` handles with a single `--profile` flag. Tdarr is a media library manager; MuxMaster is a per-file encoding tool that aims to make every decision correctly so you don't have to inspect the output.
 
-MuxMaster sits in the gap between "I know ffmpeg well enough to do this manually" and "I need a server-based automation platform." It's a single Bash script with only three required dependencies (ffmpeg, jq, and bc) and optional tooling for Dolby Vision and subtitle OCR. It understands Dolby Vision at the RPU level, and its profile system encodes the tribal knowledge of what actually works on real hardware into repeatable, overridable presets.
+MuxMaster sits in the gap between "I know ffmpeg well enough to do this manually" and "I need a server-based automation platform." It's a single Bash script with only three required packages (ffmpeg, jq, and bc) and optional tooling for Dolby Vision and subtitle OCR. It understands Dolby Vision at the RPU level, and its profile system encodes the tribal knowledge of what actually works on real hardware into repeatable, overridable presets.
 
 Configuration is where the design philosophy comes together. Most CLI tools expect you to read the source code to learn which variables exist, then hand-build a dotfile from scratch. `muxm --create-config` generates a complete, commented config file pre-seeded with a real profile's values — you start from a working baseline and customize, not from a blank page. Configs cascade through three tiers (system, user, project) so an encoding team can lock organization defaults in `/etc/.muxmrc` while individuals override their preferred CRF or audio settings in `~/.muxmrc` and specific project directories can pin a streaming profile. And `--print-effective-config` shows you the fully resolved result of all those layers *before* you commit to an encode, so you always know exactly what's about to happen.
 
@@ -87,7 +87,7 @@ muxm --profile hdr10-hq movie.mkv
 
 ### `atv-directplay-hq` — Apple TV Direct Play
 
-Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround with AAC stereo fallback, and forced subtitle burn-in. Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
+Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present) with AAC stereo fallback, and forced subtitle burn-in. Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
 
 ```
 muxm --profile atv-directplay-hq movie.mkv
@@ -337,7 +337,7 @@ Hardcoded defaults
     → ~/.muxmrc            (user defaults)
       → ./.muxmrc          (project-specific)
         → --profile        (format profile)
-      → CLI flags          (highest — always wins)
+          → CLI flags      (highest — always wins)
 ```
 
 ### Setting a Default Profile

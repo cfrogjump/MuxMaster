@@ -1,6 +1,6 @@
 # MuxMaster (muxm) Testing Plan
 
-**Version:** v3.0.0  
+**Version:** v1.1.0  
 **Date:** 2026-03-22  
 **Scope:** Comprehensive feature coverage — automated test harness + manual testing checklist
 
@@ -14,7 +14,7 @@ muxm has grown to include 6 format profiles, 70+ CLI flags, layered configuratio
 
 | File | Purpose |
 |------|---------|
-| `test_muxm.sh` | Automated test harness v2.0 — generates synthetic media, runs ~330 assertions across 18 suites |
+| `test_muxm.sh` | Automated test harness v2.0 — generates synthetic media, runs ~500 assertions across 19 suites |
 | This document | Manual testing procedures for features that require real media or subjective verification; identifies ~100 additional test cases for new features |
 
 ### Running the Automated Tests
@@ -32,7 +32,7 @@ muxm has grown to include 6 format profiles, 70+ CLI flags, layered configuratio
 ./test_muxm.sh --muxm ./muxm --verbose
 
 # Available suites: all, cli, toggles, unit, completions, setup, config, profiles,
-#                   conflicts, dryrun, video, hdr, audio, subs, output,
+#                   conflicts, collision, dryrun, video, hdr, audio, subs, output,
 #                   containers, metadata, edge, e2e
 ```
 
@@ -226,7 +226,23 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 101n | Cross: `--tonemap` + `--video-codec libx265` | ⚠️ SDR in HEVC is unusual | ❌ |
 | 101o | Cross: `--sub-burn-forced` + `SUB_INCLUDE_FORCED=0` | ⚠️ no forced subs to burn | ❌ |
 
-### 1.8 Dry-Run Mode (suite: `dryrun`)
+### 1.8 Collision Handling (suite: `collision`)
+
+Validates filename collision auto-versioning and source replacement flags. Uses an `.mp4` source whose derived output path collides with the source.
+
+| # | Test | Assertion | Auto |
+|---|------|-----------|------|
+| 101p | Auto-version on collision | Source `.mp4` → derived output collides → collision note printed, output renamed to `movie(1).mp4` | ✅ |
+| 101q | Auto-version increment | `movie(1).mp4` exists → next encode produces `movie(2).mp4` | ✅ |
+| 101r | Auto-version further increment | `movie(1)` and `movie(2)` exist → produces `movie(3).mp4` | ✅ |
+| 101s | No collision when extensions differ | `.mkv` source → `.mp4` output, no collision note | ✅ |
+| 101t | `--replace-source` non-TTY rejection | stdin is not a TTY → exits 11, error mentions TTY and suggests `--force-replace-source` | ✅ |
+| 101u | `--force-replace-source` | Source file replaced atomically, no versioned files created | ✅ |
+| 101v | `--replace-source` in `--help` | `--help` output mentions `--replace-source` and `--force-replace-source` | ✅ |
+| 101w | `--force-replace-source` in effective config | `FORCE_REPLACE_SOURCE = 1` shown in `--print-effective-config` | ✅ |
+| 101x | Explicit output path: no collision | Source and explicit output differ → no auto-versioning triggered | ✅ |
+
+### 1.9 Dry-Run Mode (suite: `dryrun`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -236,7 +252,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 105 | `--dry-run` + `--skip-subs` | "[Quick Test]" announced | ✅ |
 | 106 | `--dry-run` + HDR source | "DRY-RUN" announced for HDR input | ✅ |
 
-### 1.9 Video Pipeline (suite: `video`)
+### 1.10 Video Pipeline (suite: `video`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -249,7 +265,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 113 | `--level 5.1` config acceptance | LEVEL_VALUE = 5.1 in effective config | ✅ |
 | 114 | `--level 5.1` VBV injection | Dry-run with HDR source includes vbv-maxrate/vbv-bufsize in x265 params | ✅ |
 
-### 1.10 HDR Pipeline (suite: `hdr`)
+### 1.11 HDR Pipeline (suite: `hdr`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -258,7 +274,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 117 | `--tonemap` + HDR source | Tonemap filter chain (SDR-TONEMAP/zscale) present in dry-run | ✅ |
 | 118 | `--profile universal` + HDR source | Tonemap filter chain present in dry-run (profile implies tonemap) | ✅ |
 
-### 1.11 Audio Pipeline (suite: `audio`)
+### 1.12 Audio Pipeline (suite: `audio`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -277,7 +293,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 131 | `--audio-titles` encode | Output audio stream has descriptive title tag | ✅ |
 | 132 | `--no-audio-titles` encode | No descriptive codec title in output audio stream | ✅ |
 
-### 1.12 Subtitle Pipeline (suite: `subs`)
+### 1.13 Subtitle Pipeline (suite: `subs`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -292,7 +308,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 141 | `SUB_MAX_TRACKS=1` via config file | Output limited to ≤1 subtitle track | ✅ |
 | 142 | `--sub-lang-pref spa` with multilang source | Output subtitle track is Spanish | ✅ |
 
-### 1.13 Output Features (suite: `output`)
+### 1.14 Output Features (suite: `output`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -317,14 +333,14 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 156e | Source collision auto-versioning | Source = output (no replace flag) → output renamed to `file(1).ext` | ❌ |
 | 156f | `--replace-source` non-TTY rejection | Exits 11 when stdin is not a TTY | ❌ |
 
-### 1.14 Container Formats (suite: `containers`)
+### 1.15 Container Formats (suite: `containers`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
 | 157 | `--output-ext mov` | Output produced, container is MOV/MP4 family | ✅ |
 | 158 | `--output-ext m4v` | Output produced, container is MP4 family | ✅ |
 
-### 1.15 Metadata & Miscellaneous Flags (suite: `metadata`)
+### 1.16 Metadata & Miscellaneous Flags (suite: `metadata`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -337,7 +353,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 163b | Profile comment content | `dv-archival` tagline present in output comment tag | ❌ |
 | 163c | `DISK_FREE_WARN_GB` warning | Encode on nearly-full volume emits disk space warning | ❌ |
 
-### 1.16 Edge Cases & Security (suite: `edge`)
+### 1.17 Edge Cases & Security (suite: `edge`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -363,7 +379,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 178e | `--max-copy-bitrate` with non-k format | Edge: empty string, missing k suffix, "0k" | ❌ |
 | 178f | Source collision auto-version loop | Source = output with existing `(1)` file → output becomes `(2)` | ❌ |
 
-### 1.17 Profile End-to-End Encodes (suite: `e2e`)
+### 1.18 Profile End-to-End Encodes (suite: `e2e`)
 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
@@ -374,7 +390,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 183 | `hdr10-hq` full encode | Output exists (.mkv), HEVC codec, 10-bit pixel format | ✅ |
 | 184 | `atv-directplay-hq` full encode | Output exists (.mp4), HEVC codec, audio present | ✅ |
 
-### 1.18 Pure-Function Unit Tests (suite: `unit`)
+### 1.19 Pure-Function Unit Tests (suite: `unit`)
 
 Direct tests for deterministic helper functions extracted from muxm and run in isolation. Validates edge cases not exercised by encode pipelines.
 
@@ -822,7 +838,7 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Max copy bitrate | ❌ None | Bitrate-gated copy (M75–M77) | --max-copy-bitrate ceiling logic untested |
 | Multi-track audio (dv-archival) | ❌ None | Multi-track filter (M49–M53) | AUDIO_MULTI_TRACK, AUDIO_KEEP_COMMENTARY, language filtering untested |
 | Multi-track subtitles (archival/animation) | ❌ None | Multi-track filter (M54–M58) | SUB_MULTI_TRACK, language filtering, SUB_MAX_TRACKS cap untested |
-| Source replacement | ❌ None | Interactive + forced (M59–M63) | --replace-source, --force-replace-source, auto-versioning untested |
+| Source replacement & collision | ✅ Full | Interactive prompt (M59–M60) | Auto-versioning, --force-replace-source, non-TTY rejection, --help/config registration all tested; interactive --replace-source confirmation requires TTY |
 | Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box |
 | DV container verification | ❌ None | dvcC box checks (M64–M68) | verify_dv_container_record, pre-wrap, mp4box fallback untested |
 | DV P7/P5→P8.1 conversion | ❌ None | Profile conversion (M69–M70) | dovi_tool convert pipeline untested |
@@ -856,69 +872,67 @@ The following areas are present in muxm but have no or incomplete automated test
 
 1. **Toggle flag completeness** — 20+ toggles lack the positive or negative counterpart in the toggle suite. Adding `--sdr-force-10bit`, `--no-sdr-force-10bit`, `--profile-comment`, `--no-profile-comment`, `--sub-preserve-format`, `--no-sub-preserve-format`, `--dv`, `--no-dv`, `--tonemap`, `--no-tonemap`, `--skip-if-ideal`, `--report-json`, `--checksum`, `--strip-metadata`, `--keep-chapters`, `--sub-burn-forced`, `--sub-export-external`, `--video-copy-if-compliant`, `--replace-source`, and `--force-replace-source` would make the toggle suite truly exhaustive.
 
-2. **Source replacement pipeline** — `--replace-source` (interactive prompt, TTY check) and `--force-replace-source` (no prompt) are completely untested. Auto-versioning on source/output collision (`file(1).ext`) is also untested. These affect file safety.
+2. **Multi-track audio filtering (dv-archival)** — `_build_audio_keep_list()`, `run_audio_pipeline_multi()`, `AUDIO_MULTI_TRACK`, `AUDIO_KEEP_COMMENTARY`, and language-based filtering have no automated coverage. A synthetic multi-audio fixture could enable automated filter verification.
 
-3. **Multi-track audio filtering (dv-archival)** — `_build_audio_keep_list()`, `run_audio_pipeline_multi()`, `AUDIO_MULTI_TRACK`, `AUDIO_KEEP_COMMENTARY`, and language-based filtering have no automated coverage. A synthetic multi-audio fixture could enable automated filter verification.
+3. **Multi-track subtitle filtering (dv-archival/animation)** — `_build_subtitle_keep_list()`, `SUB_MULTI_TRACK`, language/type filtering, and `SUB_MAX_TRACKS` cap in multi-track mode have no automated coverage.
 
-4. **Multi-track subtitle filtering (dv-archival/animation)** — `_build_subtitle_keep_list()`, `SUB_MULTI_TRACK`, language/type filtering, and `SUB_MAX_TRACKS` cap in multi-track mode have no automated coverage.
-
-5. **Conflict warnings: remaining ~15 combinations** — dv-archival multi-track conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-export-external), MOV container warnings for all profiles, hdr10-hq + DV re-enabled, animation + --no-sub-preserve-format, universal + --dv, and cross-profile tonemap+libx265 are all untested.
+4. **Conflict warnings: remaining ~15 combinations** — dv-archival multi-track conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-export-external), MOV container warnings for all profiles, hdr10-hq + DV re-enabled, animation + --no-sub-preserve-format, universal + --dv, and cross-profile tonemap+libx265 are all untested.
 
 **High Priority:**
 
-6. **`_audio_copy_ext()` unit tests** — Maps codec names to ffmpeg-compatible file extensions for intermediate copy files. truehd→thd, alac→m4a, pcm→wav, dca→dts. Incorrect mapping causes "Unable to choose output format" errors.
+5. **`_audio_copy_ext()` unit tests** — Maps codec names to ffmpeg-compatible file extensions for intermediate copy files. truehd→thd, alac→m4a, pcm→wav, dca→dts. Incorrect mapping causes "Unable to choose output format" errors.
 
-7. **`_codec_max_channels()` unit tests** — Returns encoder channel limits (eac3→6, ac3→6). If this returns wrong values, ffmpeg fatally errors with "channel layout not supported."
+6. **`_codec_max_channels()` unit tests** — Returns encoder channel limits (eac3→6, ac3→6). If this returns wrong values, ffmpeg fatally errors with "channel layout not supported."
 
-8. **`_sii_audio_is_container_safe()` unit tests** — Container compatibility gate for skip-if-ideal remux. truehd+mp4→reject, aac+mp4→accept. Wrong results cause mux failures on the "ideal" fast path.
+7. **`_sii_audio_is_container_safe()` unit tests** — Container compatibility gate for skip-if-ideal remux. truehd+mp4→reject, aac+mp4→accept. Wrong results cause mux failures on the "ideal" fast path.
 
-9. **`_profile_comment()` unit tests** — Returns profile tagline strings. Easy to test; verifies each profile returns a non-empty tagline.
+8. **`_profile_comment()` unit tests** — Returns profile tagline strings. Easy to test; verifies each profile returns a non-empty tagline.
 
-10. **`apply_level_vbv()` per-level unit tests** — VBV parameter injection for levels 4.1, 5.0, 5.1, 5.2. Currently only 5.1 tested via a real encode; a unit test confirming exact maxrate/bufsize values for each level would be deterministic.
+9. **`apply_level_vbv()` per-level unit tests** — VBV parameter injection for levels 4.1, 5.0, 5.1, 5.2. Currently only 5.1 tested via a real encode; a unit test confirming exact maxrate/bufsize values for each level would be deterministic.
 
-11. **`--install-man` standalone** — Only tested indirectly via `--setup`. A standalone invocation test would catch regressions in the man page generator.
+10. **`--install-man` standalone** — Only tested indirectly via `--setup`. A standalone invocation test would catch regressions in the man page generator.
 
-12. **`--create-config user` and `--create-config system` scopes** — Only the `project` scope is explicitly tested. The `user` scope writes to `~/.muxmrc` (testable with isolated HOME).
+11. **`--create-config user` and `--create-config system` scopes** — Only the `project` scope is explicitly tested. The `user` scope writes to `~/.muxmrc` (testable with isolated HOME).
 
 **Medium Priority:**
 
-13. **`select_best_audio()` scoring integration** — Unit tests cover individual scoring helpers but not the top-level function that combines them. A unit test with mock multi-track probe output would verify the complete scoring pipeline.
+12. **`select_best_audio()` scoring integration** — Unit tests cover individual scoring helpers but not the top-level function that combines them. A unit test with mock multi-track probe output would verify the complete scoring pipeline.
 
-14. **`decide_color_and_pixfmt()` unit tests** — Determines HDR color metadata and pixel format. Currently only tested indirectly via HDR encode outputs.
+13. **`decide_color_and_pixfmt()` unit tests** — Determines HDR color metadata and pixel format. Currently only tested indirectly via HDR encode outputs.
 
-15. **`check_skip_if_ideal()` multi-track path** — The skip-if-ideal function has a multi-track audio/subtitle code path that is untested (requires ideal multi-track source).
+14. **`check_skip_if_ideal()` multi-track path** — The skip-if-ideal function has a multi-track audio/subtitle code path that is untested (requires ideal multi-track source).
 
-16. **`build_subtitle_plan()` unit tests** — Complex subtitle selection (forced detection, SDH filtering, language preference, max-tracks limiting).
+15. **`build_subtitle_plan()` unit tests** — Complex subtitle selection (forced detection, SDH filtering, language preference, max-tracks limiting).
 
-17. **`realpath_fallback()` unit tests** — Cross-platform path resolution. A direct test with symlinks, relative paths, and non-existent files would improve portability confidence.
+16. **`realpath_fallback()` unit tests** — Cross-platform path resolution. A direct test with symlinks, relative paths, and non-existent files would improve portability confidence.
 
-18. **`_validate_media_file()` unit tests** — Beyond empty-file and non-readable tests, validate behavior with video-only, audio-only, and other unusual layouts.
+17. **`_validate_media_file()` unit tests** — Beyond empty-file and non-readable tests, validate behavior with video-only, audio-only, and other unusual layouts.
 
-19. **`DEBUG=1` mode** — Running a fast suite with `DEBUG=1` as a smoke test would catch cases where debug tracing breaks parsing or output.
+18. **`DEBUG=1` mode** — Running a fast suite with `DEBUG=1` as a smoke test would catch cases where debug tracing breaks parsing or output.
 
-20. **`AUDIO_CODEC_PREFERENCE` custom ordering** — A config-file override of `AUDIO_CODEC_PREFERENCE` is not tested to verify user-customized rankings propagate correctly.
+19. **`AUDIO_CODEC_PREFERENCE` custom ordering** — A config-file override of `AUDIO_CODEC_PREFERENCE` is not tested to verify user-customized rankings propagate correctly.
 
-21. **`--preset` validation boundary** — CLI parser rejection of `--preset bogus` with proper error message could use an explicit test.
+20. **`--preset` validation boundary** — CLI parser rejection of `--preset bogus` with proper error message could use an explicit test.
 
-22. **`ffmpeg_has_muxer()` unit tests** — Container format support detection with known-good and known-bad muxer names.
+21. **`ffmpeg_has_muxer()` unit tests** — Container format support detection with known-good and known-bad muxer names.
 
-23. **`_get_source_duration_secs()` three-tier lookup** — Duration detection from stream, format, and Matroska tags. A synthetic MKV with only Matroska DURATION tags would test tier 3 specifically.
+22. **`_get_source_duration_secs()` three-tier lookup** — Duration detection from stream, format, and Matroska tags. A synthetic MKV with only Matroska DURATION tags would test tier 3 specifically.
 
-24. **`_check_hdr10_static_metadata()` unit tests** — Detection of mastering display and content light level data. Currently only exercised via real DV sources.
+23. **`_check_hdr10_static_metadata()` unit tests** — Detection of mastering display and content light level data. Currently only exercised via real DV sources.
 
 **Lower Priority:**
 
-25. **Multi-pass config layering with profile conflicts** — Test where user config sets a profile, project config overrides a conflicting variable, and CLI adds another conflict. Verify all expected warnings.
+24. **Multi-pass config layering with profile conflicts** — Test where user config sets a profile, project config overrides a conflicting variable, and CLI adds another conflict. Verify all expected warnings.
 
-26. **Bash version guard** — Verify running under bash 3.2 produces the expected error message and exit.
+25. **Bash version guard** — Verify running under bash 3.2 produces the expected error message and exit.
 
-27. **Progress bar / spinner functions** — `ffmpeg_progress_bar()`, `run_with_spinner()`, and `spinner()` are UI functions. Smoke-test coverage (verify no error when called) would help.
+26. **Progress bar / spinner functions** — `ffmpeg_progress_bar()`, `run_with_spinner()`, and `spinner()` are UI functions. Smoke-test coverage (verify no error when called) would help.
 
-28. **Disk space preflight (`disk_free_warn`)** — Difficult to automate (requires a nearly-full volume) but could be mocked.
+27. **Disk space preflight (`disk_free_warn`)** — Difficult to automate (requires a nearly-full volume) but could be mocked.
 
-29. **macOS APFS hidden flag** — `chflags nohidden` after atomic move. Only testable on macOS with APFS.
+28. **macOS APFS hidden flag** — `chflags nohidden` after atomic move. Only testable on macOS with APFS.
 
-30. **`_detect_mp4box()` cross-platform** — Detect MP4Box (macOS) vs mp4box (Linux). Could be tested by mocking PATH.
+29. **`_detect_mp4box()` cross-platform** — Detect MP4Box (macOS) vs mp4box (Linux). Could be tested by mocking PATH.
 
 ---
 
