@@ -5237,10 +5237,13 @@ _audio_stream_info(){
 #      More channels = higher fidelity; 7.1 scores higher than 5.1.
 #   3. Surround bonus        — +AUDIO_SCORE_SURROUND_BONUS (30) if ≥ 6ch
 #      Discrete jump to prefer surround over stereo.
-#   4. Codec preference      — (120 − rank) from AUDIO_CODEC_PREFERENCE list
+#   4. Codec preference      — (10 − rank) × 10 from AUDIO_CODEC_PREFERENCE list
+#      10 points per rank position. Ensures codec ordering dominates bitrate.
 #      eac3 > ac3 > aac > alac > other by default.
-#   5. Bitrate (tie-break)   — br / 50000
+#   5. Bitrate (tie-break)   — br / 50000  (capped at 8)
 #      Small bonus for higher-bitrate tracks when all else is equal.
+#      Lossless codecs with unreported bitrate get a synthetic floor so they
+#      are not penalised for VBR / missing bit_rate metadata.
 #   6. Commentary penalty    — −AUDIO_SCORE_COMMENTARY_PENALTY (200) if title matches
 #      Demotes commentary/descriptive tracks so the main feature wins.
 #
@@ -5271,13 +5274,24 @@ _score_audio_stream(){
   # Surround bonus (>=6ch)
   (( ch >= 6 )) && score=$(( score + AUDIO_SCORE_SURROUND_BONUS ))
   # Codec preference: better rank -> higher score
-  local inv=$(( 120 - rank ))
+  # 10 points per rank position ensures codec ordering dominates the bitrate
+  # tie-breaker (max ~8 pts) while staying below language/channel signals.
+  local inv=$(( (10 - rank) * 10 ))
   (( inv < 0 )) && inv=0
   score=$(( score + inv ))
 
-  # Bitrate small tie-breaker (scaled)
+  # Lossless codecs (TrueHD, DTS-HD MA, FLAC, etc.) often report bit_rate=0
+  # because they are VBR. Give them a synthetic floor so they are not penalised
+  # relative to lossy codecs that do report bitrate.
+  if (( br == 0 )) && audio_is_lossless "$codec"; then
+    br=1536000   # ~1.5 Mbps — conservative TrueHD 5.1 average
+  fi
+
+  # Bitrate small tie-breaker (scaled, capped so it cannot overpower codec rank)
   if (( br > 0 )); then
-    score=$(( score + (br / 50000) ))
+    local br_bonus=$(( br / 50000 ))
+    (( br_bonus > 8 )) && br_bonus=8
+    score=$(( score + br_bonus ))
   fi
 
   # Commentary/descriptive track penalty

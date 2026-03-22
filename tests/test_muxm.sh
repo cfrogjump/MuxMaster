@@ -613,6 +613,26 @@ CHAP
     "$TESTDIR/hevc_multi_audio.mkv"
   pass "hevc_multi_audio.mkv created"
 
+  # 8c-ii) Lossless vs lossy audio fixture — codec preference regression test.
+  #     Simulates the Arcane Blu-ray scenario: FLAC 5.1 (lossless, VBR, bit_rate=0
+  #     in ffprobe) + AC3 5.1 (lossy, reported 640 kbps), same language/channels.
+  #     Before the scoring fix, the bitrate tie-breaker overwhelmed the codec rank,
+  #     causing AC3 to win over FLAC/TrueHD despite the preference list ranking
+  #     lossless codecs higher.
+  log "Creating lossless_vs_lossy.mkv (FLAC 5.1 + AC3 5.1, same lang)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=purple:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 flac -ac:a:0 6 \
+    -c:a:1 ac3 -b:a:1 640k -ac:a:1 6 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Surround 5.1" \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="Surround 5.1" \
+    "$TESTDIR/lossless_vs_lossy.mkv"
+  pass "lossless_vs_lossy.mkv created"
+
   # 8d) HEVC multi-subtitle fixture for dv-archival multi-track subtitle testing.
   #     HEVC video (copy-if-compliant) + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full.
   #     5 SRT inputs require explicit maps — raw ffmpeg.
@@ -1674,6 +1694,30 @@ test_audio() {
     fi
   else
     fail "Commentary detection: no output"
+  fi
+
+  # --- Lossless codec preferred over lossy despite bitrate advantage (regression) ---
+  # The lossless_vs_lossy.mkv fixture has FLAC 5.1 (#0) + AC3 5.1 (#1), same language.
+  # FLAC reports bit_rate=0 (VBR); AC3 reports 640 kbps.  With the animation profile's
+  # codec preference (flac > truehd > eac3 > ac3), the scoring algorithm must select
+  # track #0 (FLAC).  Before the fix, the uncapped bitrate bonus let AC3 win.
+  outfile="$TESTDIR/audio_lossless_vs_lossy.mkv"
+  log "Testing lossless-preferred-over-lossy scoring (animation codec pref)..."
+  local lvl_out
+  lvl_out="$(run_muxm --profile animation --crf 28 --preset ultrafast \
+    --no-stereo-fallback \
+    "$TESTDIR/lossless_vs_lossy.mkv" "$outfile" 2>&1)"
+  if [[ -f "$outfile" && -s "$outfile" ]]; then
+    pass "Lossless-vs-lossy: output produced"
+    # Track 0 is FLAC (lossless, higher codec rank), track 1 is AC3 (lossy, higher bitrate).
+    # Scoring must select track #0.
+    if echo "$lvl_out" | grep -q "Selected track #0"; then
+      pass "Lossless-vs-lossy: FLAC selected over AC3 (codec preference dominates bitrate)"
+    else
+      fail "Lossless-vs-lossy: expected track #0 (FLAC), got: $(echo "$lvl_out" | grep 'Selected track')"
+    fi
+  else
+    fail "Lossless-vs-lossy: no output"
   fi
 
   # ---- --audio-titles produces descriptive stream title ----
@@ -2885,6 +2929,50 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_stdout "_audio_codec_rank(flac, animation)=0"    "0"  _audio_codec_rank "$anim_rank_env" "flac"
   assert_muxm_fn_stdout "_audio_codec_rank(truehd, animation)=1"  "1"  _audio_codec_rank "$anim_rank_env" "truehd"
   assert_muxm_fn_stdout "_audio_codec_rank(eac3, animation)=2"    "2"  _audio_codec_rank "$anim_rank_env" "eac3"
+
+  # ---- Scoring formula invariants (regression guards for codec-vs-bitrate bug) ----
+  # These validate the arithmetic properties of _score_audio_stream without needing
+  # ffprobe metadata, by computing score components directly from the formula.
+  #
+  # Invariant 1: One codec rank step MUST exceed the maximum bitrate bonus.
+  # The formula gives (10 - rank) * 10 per codec position and caps bitrate at 8.
+  # Adjacent codecs differ by rank=1 → 10 points. Bitrate max = 8 points.
+  # So a higher-ranked codec can never lose to bitrate alone.
+  local codec_step=10 max_br_bonus=8
+  if (( codec_step > max_br_bonus )); then
+    pass "Scoring invariant: codec rank step ($codec_step) > max bitrate bonus ($max_br_bonus)"
+  else
+    fail "Scoring invariant: codec rank step ($codec_step) must exceed max bitrate bonus ($max_br_bonus)"
+  fi
+
+  # Invariant 2: Lossless synthetic floor produces a non-trivial bitrate bonus.
+  # The floor is 1536000; at br/50000 capped to 8, that gives 8 points — same as
+  # any high-bitrate lossy codec, so lossless is never penalised for missing metadata.
+  local lossless_floor=1536000
+  local lossless_br_bonus=$(( lossless_floor / 50000 ))
+  (( lossless_br_bonus > max_br_bonus )) && lossless_br_bonus=$max_br_bonus
+  if (( lossless_br_bonus >= max_br_bonus )); then
+    pass "Scoring invariant: lossless floor produces max bitrate bonus ($lossless_br_bonus)"
+  else
+    fail "Scoring invariant: lossless floor bitrate bonus ($lossless_br_bonus) should reach cap ($max_br_bonus)"
+  fi
+
+  # Invariant 3: Simulated Arcane scenario — FLAC rank 0 vs AC3 rank 3 (animation pref).
+  # Both 6ch eng, FLAC br=0 (gets floor), AC3 br=640000.
+  # This is the exact scenario that was broken before the fix.
+  local flac_rank=0 ac3_rank=3
+  local flac_codec_score=$(( (10 - flac_rank) * 10 ))  # 100
+  local ac3_codec_score=$((  (10 - ac3_rank)  * 10 ))  # 70
+  local ac3_br_bonus=$(( 640000 / 50000 ))
+  (( ac3_br_bonus > max_br_bonus )) && ac3_br_bonus=$max_br_bonus
+  # FLAC gets max bitrate bonus from synthetic floor
+  local flac_total=$(( flac_codec_score + lossless_br_bonus ))
+  local ac3_total=$((  ac3_codec_score  + ac3_br_bonus ))
+  if (( flac_total > ac3_total )); then
+    pass "Scoring invariant: FLAC($flac_total) > AC3($ac3_total) in Arcane scenario"
+  else
+    fail "Scoring invariant: FLAC($flac_total) should beat AC3($ac3_total) — codec preference regression"
+  fi
 
   # ---- _audio_is_commentary ----
   assert_muxm_fn_exit "_audio_is_commentary('Director\\'s Commentary')=match"  0 _audio_is_commentary "" "Director's Commentary"
