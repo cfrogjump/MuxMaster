@@ -4,7 +4,7 @@ All notable changes to MuxMaster will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [1.1.0] - 2026-03-22
 
 Multi-track audio and subtitles for `dv-archival` and `animation`: both profiles now keep all matching audio/subtitle tracks from the source instead of scoring and selecting one. Commentary/descriptive audio tracks are dropped by default in `dv-archival`. All surviving tracks are stream-copied (never transcoded). Configurable via `.muxmrc`.
 
@@ -169,6 +169,7 @@ Initial public release.
 - Structured exit codes for scripting and automation (10 = missing tool, 11 = bad arguments, 12 = corrupt source, 40–43 = pipeline failures)
 - Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions
 
+[1.1.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.1.0
 [1.0.2]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.2
 [1.0.1]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.1
 [1.0.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.0

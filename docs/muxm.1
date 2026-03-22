@@ -1,4 +1,4 @@
-.TH MUXM 1 "2026-03-09" "MuxMaster v1.0.1" "User Commands"
+.TH MUXM 1 "2026-03-22" "MuxMaster v1.1.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -36,7 +36,12 @@ Apply a named format profile.
 Available profiles:
 .TP
 .B dv\-archival
-Preserve DV + HDR10 + lossless audio. Copy video (no re\-encode). MKV.
+Preserve DV + HDR10 + all audio and subtitle tracks (multi\-track, copy
+only). MKV. Commentary/descriptive audio tracks dropped by default.
+Audio filterable via
+.BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY ;
+subtitles filterable via
+.BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED / FULL / SDH ", and " SUB_MAX_TRACKS .
 Skip if already ideal. JSON report.
 .TP
 .B hdr10\-hq
@@ -54,7 +59,7 @@ MP4. Targets Plex/Jellyfin on Shield, Fire TV, Roku, smart TVs, web.
 .B animation
 Anime/cartoon optimized. HEVC CRF 16, 10\-bit (even SDR),
 animation\-tuned x265 (low psy\-rd, adjusted deblock, extra b\-frames),
-lossless audio, preserve all subs (ASS/SSA). MKV.
+lossless audio, multi\-track subs (ASS/SSA + PGS bitmap). MKV.
 .TP
 .B universal
 Play anywhere. H.264 SDR (tone\-map HDR), AAC stereo, burn forced subs,
@@ -158,8 +163,9 @@ Format: number with k suffix (e.g.,
 .BR 50000k ).
 Empty (default) disables the check.
 .TP
-.BR \-\-no\-dv
-Disable Dolby Vision extraction/injection.
+.BR \-\-dv " , " \-\-no\-dv
+Enable or disable Dolby Vision extraction/injection. Use \fB\-\-dv\fR to
+re\-enable DV handling after a profile disables it (e.g., \fBanimation\fR).
 .TP
 .BR \-\-allow\-dv\-fallback " , " \-\-no\-allow\-dv\-fallback
 If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
@@ -168,8 +174,9 @@ If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
 Enable/disable automatic conversion to DV Profile 8.1 when native DV
 injection fails. Default: enabled.
 .TP
-.BR \-\-no\-conservative\-vbv
-Disable VBV guardrails.
+.BR \-\-conservative\-vbv " , " \-\-no\-conservative\-vbv
+Enable/disable VBV guardrails that cap bitrate and buffer size per x265
+level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
 Number of threads for ffmpeg encoding.
@@ -216,6 +223,35 @@ Language preference is the strongest signal by default, ensuring that a
 preferred\-language stereo track beats a foreign surround track. Reduce
 .B AUDIO_SCORE_LANG_BONUS
 to ~25 to prefer higher channel counts regardless of language.
+.SS Multi\-Track Audio (Archival)
+The
+.B dv\-archival
+profile uses multi\-track mode
+.RB ( AUDIO_MULTI_TRACK=1 ),
+which keeps all audio tracks that pass a subtractive filter instead of
+scoring and selecting one. All surviving tracks are stream\-copied from
+source (never transcoded). No stereo fallback is created.
+.PP
+Filters (configured via
+.IR .muxmrc ):
+.TP
+.B AUDIO_LANG_PREF
+When non\-empty, only tracks whose language matches the comma\-separated
+list are kept. When empty (the default for
+.BR dv\-archival ),
+all languages pass.
+.TP
+.B AUDIO_KEEP_COMMENTARY
+When 0 (the
+.B dv\-archival
+default), tracks whose title matches commentary or audio\-description
+keywords are dropped. Set to 1 to keep them.
+.PP
+Multi\-track mode is automatically demoted to single\-track if
+.B \-\-audio\-track
+or
+.B \-\-audio\-force\-codec
+is set on the CLI (the explicit flag wins).
 .SH SUBTITLE OPTIONS
 .TP
 .BR \-\-no\-subtitles
@@ -246,11 +282,71 @@ Exclude SDH/HI subtitle tracks.
 .BR \-\-no\-ocr
 Disable PGS\(->SRT OCR.
 .TP
+.BR \-\-sub\-preserve\-format " , " \-\-no\-sub\-preserve\-format
+Preserve/convert native text subtitle formats (ASS/SSA).
+When enabled and the output container is MKV, ASS/SSA subtitles are
+stream\-copied in their native format, preserving positioning, fonts,
+and typesetting. When disabled (or when the output container is MP4/MOV),
+ASS/SSA subtitles are converted to plain\-text SRT.
+The
+.B animation
+profile enables this by default.
+.TP
 .BR \-\-ocr\-tool " " \fITOOL\fR
 OCR backend: pgsrip or sub2srt.
 .TP
 .BR \-\-ocr\-lang " " \fILANG\fR
 OCR language (default: eng).
+.SS Multi\-Track Subtitles
+The
+.B dv\-archival
+and
+.B animation
+profiles use multi\-track subtitle mode
+.RB ( SUB_MULTI_TRACK=1 ),
+which keeps all subtitle tracks that pass a subtractive filter instead of
+selecting one per type. Surviving tracks are stream\-copied from
+source (no OCR, no intermediate files). The one exception is ASS/SSA
+tracks when
+.B SUB_PRESERVE_TEXT_FORMAT
+is 0 (or the output container is MP4/MOV): these are converted inline
+to SRT or mov_text respectively. All other codecs (PGS, SRT, VobSub)
+are always stream\-copied.
+.PP
+Filters (configured via
+.IR .muxmrc ):
+.TP
+.B SUB_LANG_PREF
+When non\-empty, only tracks whose language matches the comma\-separated
+list are kept. When empty (the default for
+.BR dv\-archival ),
+all languages pass.
+.TP
+.B SUB_INCLUDE_FORCED / SUB_INCLUDE_FULL / SUB_INCLUDE_SDH
+Type filters. When 0, tracks of that type are excluded. All three
+default to 1 in both
+.B dv\-archival
+and
+.BR animation .
+.TP
+.B SUB_MAX_TRACKS
+Maximum number of subtitle tracks to keep (applied after all other
+filters as a cap). Defaults to 99 for
+.BR dv\-archival ,
+6 for
+.BR animation .
+.PP
+Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target
+container (e.g., PGS into MP4) are silently skipped. Both
+.B dv\-archival
+and
+.B animation
+use MKV, which handles all subtitle formats.
+.PP
+Multi\-track subtitle mode is automatically demoted to single\-track if
+.B \-\-sub\-burn\-forced
+is set on the CLI (burn\-in requires extracting and processing a single
+forced track).
 .SH OUTPUT OPTIONS
 .TP
 .BR \-\-output\-ext " " \fIEXT\fR
@@ -261,6 +357,11 @@ Keep/strip chapter markers.
 .TP
 .BR \-\-strip\-metadata " , " \-\-no\-strip\-metadata
 Strip/keep non\-essential metadata.
+.TP
+.BR \-\-profile\-comment " , " \-\-no\-profile\-comment
+Embed/suppress profile tagline in container comment metadata. Default: on.
+When a profile is active, a short descriptive comment is written to the
+output container's comment field (MP4 \(cocmt, MKV COMMENT).
 .TP
 .BR \-\-skip\-if\-ideal " , " \-\-no\-skip\-if\-ideal
 Skip processing if source already matches profile requirements.
@@ -372,6 +473,42 @@ Install this manual page so \fBman muxm\fR works.
 .TP
 .B muxm \-\-install\-completions
 Install bash/zsh tab completion. Adds a source line to your shell RC files.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error (config write failure, dependency check failure, unhandled runtime error).
+.TP
+.B 10
+Missing required tool (ffmpeg, ffprobe, or jq not found).
+.TP
+.B 11
+Invalid arguments, unknown option or profile, bad input/output path, or security
+check failure (control characters in filename, source/output collision).
+.TP
+.B 12
+Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
+.TP
+.B 40
+Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
+.TP
+.B 41
+DV RPU injection failure, intermediate file validation failure, or final mux failure.
+.TP
+.B 42
+Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
+or corrupt encoded video stream).
+.TP
+.B 43
+Audio transcode or copy failure.
+.TP
+.B 130
+Interrupted by user (SIGINT / Ctrl\-C).
+.TP
+.B 143
+Terminated by signal (SIGTERM).
 .SH FILES
 .TP
 \fI/etc/.muxmrc\fR
@@ -424,11 +561,18 @@ Major variable groups:
 .BR AUDIO_SCORE_LANG_BONUS ", " AUDIO_SCORE_CHANNEL_MULTIPLIER ", "
 .BR AUDIO_SCORE_SURROUND_BONUS ", " AUDIO_SCORE_COMMENTARY_PENALTY .
 .TP
+.B Multi\-track audio (archival)
+.BR AUDIO_MULTI_TRACK ", " AUDIO_KEEP_COMMENTARY .
+.TP
 .B Subtitles
 .BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED ", " SUB_INCLUDE_FULL ", "
 .BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_BURN_FORCED ", "
-.BR SUB_EXPORT_EXTERNAL ", " SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
+.BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
+.BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
 .BR SUB_OCR_LANG .
+.TP
+.B Multi\-track subtitles (archival)
+.BR SUB_MULTI_TRACK .
 .TP
 .B Output / operational
 .BR OUTPUT_EXT ", " KEEP_CHAPTERS ", " STRIP_METADATA ", "
@@ -516,42 +660,6 @@ Configurable via \fB\-\-ocr\-tool\fR.
 .PP
 Run \fBmuxm \-\-install\-dependencies\fR to check for and install all
 tools via Homebrew and pipx.
-.SH EXIT STATUS
-.TP
-.B 0
-Success.
-.TP
-.B 1
-General error (config write failure, dependency check failure, unhandled runtime error).
-.TP
-.B 10
-Missing required tool (ffmpeg, ffprobe, or jq not found).
-.TP
-.B 11
-Invalid arguments, unknown option or profile, bad input/output path, or security
-check failure (control characters in filename, source/output collision).
-.TP
-.B 12
-Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
-.TP
-.B 40
-Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
-.TP
-.B 41
-DV RPU injection failure, intermediate file validation failure, or final mux failure.
-.TP
-.B 42
-Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
-or corrupt encoded video stream).
-.TP
-.B 43
-Audio transcode or copy failure.
-.TP
-.B 130
-Interrupted by user (SIGINT / Ctrl\-C).
-.TP
-.B 143
-Terminated by signal (SIGTERM).
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
@@ -565,7 +673,7 @@ Report bugs at
 .SH COPYRIGHT
 Copyright \(co 2025\(en2026 Jamey Wicklund (theBluWiz).
 .PP
-MuxMaster\(tm Freeware License v1.0.0 \(em
+MuxMaster\(tm Freeware License v1.0.1 \(em
 \(lqDo what you want, just don't pretend I warranty the universe.\(rq
 .SH AUTHOR
 Jamey Wicklund (theBluWiz).

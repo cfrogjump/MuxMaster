@@ -9,7 +9,7 @@
 # =============================================================================
 #
 # Requires:
-#   - ffmpeg, ffprobe, bc
+#   - ffmpeg, ffprobe, jq, bc
 #   - dovi_tool (optional for Dolby Vision RPU extraction/injection; script will fallback)
 #
 # Optional (for PGS subtitle OCR):
@@ -51,7 +51,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.0.2"
+readonly VERSION="1.1.0"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -990,7 +990,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   cat <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-03-20" "MuxMaster v1.0.2" "User Commands"
+.TH MUXM 1 "2026-03-22" "MuxMaster v1.1.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -1166,8 +1166,9 @@ If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
 Enable/disable automatic conversion to DV Profile 8.1 when native DV
 injection fails. Default: enabled.
 .TP
-.BR \-\-no\-conservative\-vbv
-Disable VBV guardrails.
+.BR \-\-conservative\-vbv " , " \-\-no\-conservative\-vbv
+Enable/disable VBV guardrails that cap bitrate and buffer size per x265
+level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
 Number of threads for ffmpeg encoding.
@@ -1464,6 +1465,42 @@ Install this manual page so \fBman muxm\fR works.
 .TP
 .B muxm \-\-install\-completions
 Install bash/zsh tab completion. Adds a source line to your shell RC files.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error (config write failure, dependency check failure, unhandled runtime error).
+.TP
+.B 10
+Missing required tool (ffmpeg, ffprobe, or jq not found).
+.TP
+.B 11
+Invalid arguments, unknown option or profile, bad input/output path, or security
+check failure (control characters in filename, source/output collision).
+.TP
+.B 12
+Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
+.TP
+.B 40
+Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
+.TP
+.B 41
+DV RPU injection failure, intermediate file validation failure, or final mux failure.
+.TP
+.B 42
+Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
+or corrupt encoded video stream).
+.TP
+.B 43
+Audio transcode or copy failure.
+.TP
+.B 130
+Interrupted by user (SIGINT / Ctrl\-C).
+.TP
+.B 143
+Terminated by signal (SIGTERM).
 .SH FILES
 .TP
 \fI/etc/.muxmrc\fR
@@ -1615,42 +1652,6 @@ Configurable via \fB\-\-ocr\-tool\fR.
 .PP
 Run \fBmuxm \-\-install\-dependencies\fR to check for and install all
 tools via Homebrew and pipx.
-.SH EXIT STATUS
-.TP
-.B 0
-Success.
-.TP
-.B 1
-General error (config write failure, dependency check failure, unhandled runtime error).
-.TP
-.B 10
-Missing required tool (ffmpeg, ffprobe, or jq not found).
-.TP
-.B 11
-Invalid arguments, unknown option or profile, bad input/output path, or security
-check failure (control characters in filename, source/output collision).
-.TP
-.B 12
-Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
-.TP
-.B 40
-Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
-.TP
-.B 41
-DV RPU injection failure, intermediate file validation failure, or final mux failure.
-.TP
-.B 42
-Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
-or corrupt encoded video stream).
-.TP
-.B 43
-Audio transcode or copy failure.
-.TP
-.B 130
-Interrupted by user (SIGINT / Ctrl\-C).
-.TP
-.B 143
-Terminated by signal (SIGTERM).
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
@@ -1664,7 +1665,7 @@ Report bugs at
 .SH COPYRIGHT
 Copyright \(co 2025\(en2026 Jamey Wicklund (theBluWiz).
 .PP
-MuxMaster\(tm Freeware License v1.0.0 \(em
+MuxMaster\(tm Freeware License v1.0.1 \(em
 \(lqDo what you want, just don't pretend I warranty the universe.\(rq
 .SH AUTHOR
 Jamey Wicklund (theBluWiz).
@@ -1820,7 +1821,7 @@ _muxm_completions() {
             --crf -p --preset --x265-params -l --level
             --video-codec --tonemap --no-tonemap
             --sdr-force-10bit --no-sdr-force-10bit
-            --no-conservative-vbv
+            --conservative-vbv --no-conservative-vbv
             --dv --no-dv --allow-dv-fallback --no-allow-dv-fallback
             --dv-convert-p81 --no-dv-convert-p81
             --video-copy-if-compliant --no-video-copy-if-compliant
@@ -2114,10 +2115,10 @@ _create_config_emit() {
 
   case "$profile" in
     dv-archival)
-      _active+="SKIP_IF_IDEAL REPORT_JSON "
-      _active+="AUDIO_CODEC_PREFERENCE "
+      _active+="SKIP_IF_IDEAL REPORT_JSON CHECKSUM "
+      _active+="AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE "
       _active+="AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY "
-      _active+="SUB_MULTI_TRACK SUB_MAX_TRACKS "
+      _active+="SUB_LANG_PREF SUB_MULTI_TRACK SUB_MAX_TRACKS "
       ;;
     hdr10-hq)
       _active+="CRF_VALUE PRESET_VALUE "
@@ -2140,7 +2141,7 @@ _create_config_emit() {
       _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT SDR_FORCE_10BIT "
       _active+="AUDIO_CODEC_PREFERENCE "
-      _active+="SUB_MULTI_TRACK SUB_MAX_TRACKS SUB_EXPORT_EXTERNAL "
+      _active+="SUB_MULTI_TRACK SUB_MAX_TRACKS SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT "
       ;;
     universal)
       _active+="TONEMAP_HDR_TO_SDR CRF_VALUE PRESET_VALUE "
@@ -2313,11 +2314,11 @@ HEADER
   echo "# Audio selection strategy"
   echo "# ========================="
   echo ""
-  echo "# Language preference list (comma-separated)"
-  printf '#AUDIO_LANG_PREF=eng\n'
+  echo "# Language preference list (comma-separated, empty = keep all languages)"
+  _V AUDIO_LANG_PREF quoted
   echo ""
   echo "# Codec preference order (leftmost best)"
-  printf '#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,alac,other\n'
+  _V AUDIO_CODEC_PREFERENCE quoted
   echo ""
   echo "# Force a specific audio track by index (0-based). Leave empty for auto."
   printf '#AUDIO_TRACK_OVERRIDE=\n'
@@ -2384,8 +2385,8 @@ HEADER
   echo "# Subtitles"
   echo "# ========================="
   echo ""
-  echo "# Language preference for subtitle track selection (comma-separated)"
-  printf '#SUB_LANG_PREF=eng\n'
+  echo "# Language preference for subtitle track selection (comma-separated, empty = keep all)"
+  _V SUB_LANG_PREF quoted
   echo ""
   echo "# Include forced subtitles (foreign dialogue, signs)"
   _V SUB_INCLUDE_FORCED
@@ -2496,7 +2497,7 @@ HEADER
   echo "# ========================="
   echo ""
   echo "# Write a SHA-256 checksum next to final output"
-  printf '#CHECKSUM=0\n'
+  _V CHECKSUM
   echo ""
   echo "# Dry-run: plan the steps without generating real outputs"
   printf '#DRY_RUN=0\n'
@@ -2745,6 +2746,7 @@ apply_profile_atv_directplay_hq() {
   CRF_VALUE=17
   PRESET_VALUE="slower"
   LEVEL_VALUE="5.1"
+  CONSERVATIVE_VBV=1
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
@@ -3023,6 +3025,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --x265-params) X265_PARAMS_BASE="${2:-}"; shift 2 ;;
     -l|--level) LEVEL_VALUE="${2:-}"; shift 2 ;;
+    --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
     --dv) DISABLE_DV=0; shift ;;
     --no-dv) DISABLE_DV=1; shift ;;
