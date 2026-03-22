@@ -100,6 +100,12 @@ readonly DV_CONTAINER_PATTERN='DOVI configuration record|dv_profile|dv_version'
 # JSON report accumulator (for dv-archival reporting)
 declare -a REPORT_ENTRIES=()
 
+# Skip-if-ideal stream keep-lists (populated by check_skip_if_ideal).
+# Used by the metadata remux in main() to build explicit -map flags instead
+# of -map 0, ensuring only container-compatible streams reach the output.
+declare -a SII_AUDIO_INDICES=()
+declare -a SII_SUB_INDICES=()
+
 # ===== Section 4: Opinionated defaults ========================================================
 # ---- Video encode (x265)
 declare -i CRF_VALUE=18
@@ -548,7 +554,10 @@ write_checksum(){
     warn "Checksum tool not found"; return 0
   fi
   note "Writing checksum → ${p}.sha256"
-  "${cmd[@]}" "$p" > "${p}.sha256"
+  "${cmd[@]}" "$p" > "${p}.sha256" &
+  local _cksum_pid=$!
+  spinner "$_cksum_pid" "Computing SHA-256 checksum"
+  wait "$_cksum_pid" 2>/dev/null
 }
 
 # Validate that a media file exists, is non-empty, and is parseable by ffprobe.
@@ -2674,8 +2683,9 @@ apply_profile_dv_archival() {
   STRIP_METADATA=0
   # Skip-if-ideal: on
   SKIP_IF_IDEAL=1
-  # Reporting: JSON
+  # Reporting: JSON + SHA-256 checksum (archival integrity)
   REPORT_JSON=1
+  CHECKSUM=1
 }
 
 apply_profile_hdr10_hq() {
@@ -3599,9 +3609,6 @@ _print_completed_steps(){
 # Globals read: FAILED, DRY_RUN, TMP_OUT, OUT, CHECKSUM, WORKDIR, DEBUG,
 #               KEEP_TEMP, KEEP_TEMP_ALWAYS, EXIT_CODE, FAIL_MSG, TERM_FD
 on_exit() {
-  # Close the raw-terminal FD if it was opened (Section 17)
-  [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
-
   # Clean up subtitle burn-in temp file (lives outside WORKDIR in /tmp)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
@@ -3632,6 +3639,9 @@ on_exit() {
       note "Build SUCCEEDED."
     fi
 
+    # Close the raw-terminal FD now that spinner output is complete (Section 17)
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+
     _print_completed_steps
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
@@ -3649,6 +3659,9 @@ on_exit() {
   else
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
+
+    # Close the raw-terminal FD (Section 17)
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     
     _print_completed_steps
     echo "See log: $LOGFILE"
@@ -3809,6 +3822,53 @@ check_skip_if_ideal() {
   fi
 
   if (( ideal )); then
+    # ---- Build validated stream keep-lists for the remux ----
+    # Multi-track profiles reuse their existing filter functions (which already
+    # validated all streams above — ideal=1 means nothing was dropped).
+    # Single-track profiles keep all streams that are container-compatible:
+    # a safety gate that prevents incompatible codecs from reaching the mux
+    # without changing track-selection behavior.
+    SII_AUDIO_INDICES=()
+    SII_SUB_INDICES=()
+
+    if (( AUDIO_MULTI_TRACK )); then
+      local _sii_alist
+      _sii_alist="$(_build_audio_keep_list)"
+      # shellcheck disable=SC2206  # intentional word-splitting of index list
+      SII_AUDIO_INDICES=( $_sii_alist )
+    else
+      local _sii_a_n _sii_a_i _sii_a_codec
+      _sii_a_n="$(_audio_stream_count)"
+      for (( _sii_a_i=0; _sii_a_i<_sii_a_n; _sii_a_i++ )); do
+        _sii_a_codec="$(_audio_codec "$_sii_a_i")"
+        if _sii_audio_is_container_safe "$_sii_a_codec"; then
+          SII_AUDIO_INDICES+=("$_sii_a_i")
+        else
+          log "  [skip-if-ideal] Excluding audio #$_sii_a_i ($_sii_a_codec) — incompatible with $OUTPUT_EXT container"
+        fi
+      done
+    fi
+
+    if (( SUB_MULTI_TRACK )); then
+      local _sii_slist
+      _sii_slist="$(_build_subtitle_keep_list)"
+      # shellcheck disable=SC2206  # intentional word-splitting of index list
+      SII_SUB_INDICES=( $_sii_slist )
+    else
+      local _sii_s_n _sii_s_i _sii_s_codec _sii_s_info
+      _sii_s_n="$(_sub_count)"
+      for (( _sii_s_i=0; _sii_s_i<_sii_s_n; _sii_s_i++ )); do
+        _sii_s_info="$(_sub_stream_info "$_sii_s_i")"
+        IFS=$'\t' read -r _sii_s_codec _ _ _ <<< "$_sii_s_info"
+        _sii_s_codec="${_sii_s_codec,,}"
+        if [[ "$MUX_FORMAT" == "matroska" ]] || _is_text_sub_codec "$_sii_s_codec"; then
+          SII_SUB_INDICES+=("$_sii_s_i")
+        else
+          log "  [skip-if-ideal] Excluding subtitle #$_sii_s_i ($_sii_s_codec) — incompatible with $OUTPUT_EXT container"
+        fi
+      done
+    fi
+
     note "✅ Source already matches profile '${PROFILE_NAME:-}' requirements — skipping processing."
     report_add "skip_if_ideal" "true"
     report_add "skip_reason" "source already compliant"
@@ -5300,6 +5360,22 @@ audio_lossless_muxable(){
       ;;
   esac
   return 1
+}
+
+# Check if an audio codec can be muxed into the current target container.
+# Used by the skip-if-ideal remux to gate streams that would fail the mux.
+# Conservative: rejects known-incompatible codecs, allows everything else
+# (ffmpeg will catch any edge cases during remux as a safe failure mode).
+# Args: $1 — codec name (lowercase)
+# Globals: MUX_FORMAT (read)
+_sii_audio_is_container_safe() {
+  local codec="$1"
+  [[ "$MUX_FORMAT" == "matroska" ]] && return 0
+  # MP4/MOV cannot mux TrueHD, DTS/DTS-HD MA, or raw PCM
+  case "$codec" in
+    truehd|dts|dca|pcm_*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 # Map ffprobe codec name to a file extension ffmpeg can mux when stream-copying.
@@ -6926,19 +7002,50 @@ main() {
       # Source is ideal — write report and exit clean
       write_json_report
       if (( ! DRY_RUN )); then
-        if (( (INCLUDE_AUDIO_TITLES && $(_audio_stream_count) > 0) || PROFILE_COMMENT )); then
-          # Stamp metadata (audio titles and/or profile comment) via instant -c copy remux
-          local -a _sii_meta=( "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -c copy )
-          if (( INCLUDE_AUDIO_TITLES )) && (( $(_audio_stream_count) > 0 )); then
-            local _sii_n _sii_i _sii_codec _sii_ch _sii_title
-            _sii_n="$(_audio_stream_count)"
-            for (( _sii_i=0; _sii_i<_sii_n; _sii_i++ )); do
-              _sii_codec="$(_audio_codec "$_sii_i")"
-              _sii_ch="$(_audio_channels "$_sii_i")"
+        # Determine if a remux is needed (metadata stamping or stream filtering)
+        local _sii_needs_remux=0
+        (( INCLUDE_AUDIO_TITLES && ${#SII_AUDIO_INDICES[@]} > 0 )) && _sii_needs_remux=1
+        (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]] && _sii_needs_remux=1
+        # Stream filtering: if keep-lists exclude any streams, we must remux
+        local _sii_total_a _sii_total_s
+        _sii_total_a="$(_audio_stream_count)"
+        _sii_total_s="$(_sub_count)"
+        (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) && _sii_needs_remux=1
+        (( ${#SII_SUB_INDICES[@]} < _sii_total_s )) && _sii_needs_remux=1
+
+        if (( _sii_needs_remux )); then
+          # Build explicit per-stream maps from validated keep-lists
+          local -a _sii_meta=( "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" )
+
+          # Video: always map
+          _sii_meta+=( -map 0:v:0 )
+
+          # Audio: map only validated streams
+          local _sii_a_idx
+          for _sii_a_idx in "${SII_AUDIO_INDICES[@]}"; do
+            _sii_meta+=( -map "0:a:${_sii_a_idx}" )
+          done
+
+          # Subtitles: map only validated streams
+          local _sii_s_idx
+          for _sii_s_idx in "${SII_SUB_INDICES[@]}"; do
+            _sii_meta+=( -map "0:s:${_sii_s_idx}" )
+          done
+
+          _sii_meta+=( -c copy )
+
+          # Audio titles: use output indices (sequential) not source indices
+          if (( INCLUDE_AUDIO_TITLES )) && (( ${#SII_AUDIO_INDICES[@]} > 0 )); then
+            local _sii_out_a=0 _sii_src_a _sii_codec _sii_ch _sii_title
+            for _sii_src_a in "${SII_AUDIO_INDICES[@]}"; do
+              _sii_codec="$(_audio_codec "$_sii_src_a")"
+              _sii_ch="$(_audio_channels "$_sii_src_a")"
               _sii_title="$(_audio_descriptive_title "$_sii_codec" "$_sii_ch")"
-              _sii_meta+=( "-metadata:s:a:${_sii_i}" "title=$_sii_title" )
+              _sii_meta+=( "-metadata:s:a:${_sii_out_a}" "title=$_sii_title" )
+              _sii_out_a=$(( _sii_out_a + 1 ))
             done
           fi
+
           # Profile comment
           if (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]]; then
             local _sii_comment
@@ -6947,13 +7054,25 @@ main() {
           fi
           [[ "$MUX_FORMAT" != "matroska" ]] && _sii_meta+=( -movflags +faststart )
           _sii_meta+=( -f "$MUX_FORMAT" "$TMP_OUT" )
-          ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" \
-            || die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
+          ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" &
+          local _sii_pid=$!
+          spinner "$_sii_pid" "Applying metadata (copy-remux)"
+          if ! wait "$_sii_pid" 2>/dev/null; then
+            die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
+          fi
+
+          # Log stream counts if filtering occurred
+          if (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) || (( ${#SII_SUB_INDICES[@]} < _sii_total_s )); then
+            note "Streams: ${#SII_AUDIO_INDICES[@]}/${_sii_total_a} audio, ${#SII_SUB_INDICES[@]}/${_sii_total_s} subtitle (container-filtered)."
+          fi
           note "Applied metadata via copy-remux (already ideal)."
         else
-          # No titles needed — hardlink (instant on same FS); fall back to copy
+          # No titles, no comment, no filtering — hardlink (instant on same FS); fall back to copy
           if ! ln -f "$SRC_ABS" "$TMP_OUT" 2>/dev/null; then
-            cp -f "$SRC_ABS" "$TMP_OUT"
+            cp -f "$SRC_ABS" "$TMP_OUT" &
+            local _sii_cp_pid=$!
+            spinner "$_sii_cp_pid" "Copying source to output"
+            wait "$_sii_cp_pid" 2>/dev/null
           fi
           note "Linked/copied source to output (already ideal)."
         fi
