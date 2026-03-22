@@ -6,24 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
-Multi-track audio for `dv-archival`: the profile now keeps all audio tracks from the source instead of scoring and selecting one. Commentary/descriptive tracks are dropped by default. All surviving tracks are stream-copied (never transcoded). Configurable via `.muxmrc`.
+Multi-track audio and subtitles for `dv-archival`: the profile now keeps all audio and subtitle tracks from the source instead of scoring and selecting one. Commentary/descriptive audio tracks are dropped by default. All surviving tracks are stream-copied (never transcoded). Configurable via `.muxmrc`.
 
 ### Added
 
 - **Multi-track audio pipeline** (`AUDIO_MULTI_TRACK=1`) — New audio mode that keeps all matching audio tracks instead of selecting a single best track. Audio streams are mapped directly from source with `-c:a copy` (no intermediate extraction, no transcoding, no temp files). Controlled by two new config variables:
   - `AUDIO_MULTI_TRACK` — `1` = keep all tracks that pass filters, `0` = single-track scoring (default, unchanged for all other profiles).
   - `AUDIO_KEEP_COMMENTARY` — `1` = keep commentary/descriptive tracks, `0` = drop them. Uses the existing `_audio_is_commentary()` heuristic.
-- **`dv-archival` profile updated** — Now sets `AUDIO_MULTI_TRACK=1` and `AUDIO_KEEP_COMMENTARY=0`. Language filtering uses the existing `AUDIO_LANG_PREF` variable: when empty (the dv-archival default), all languages pass; when set (e.g., `eng,jpn`), only matching tracks are kept.
-- **Graceful demotion** — If `--audio-track` or `--audio-force-codec` is set alongside `AUDIO_MULTI_TRACK=1`, multi-track mode is automatically demoted to single-track with an informational note. The explicit CLI flag always wins.
-- **Conflict warnings** (Section 13) for `dv-archival` + `--audio-track`, `--audio-force-codec`, and `--stereo-fallback` when multi-track mode is active.
-- **`skip-if-ideal` updated** — When `AUDIO_MULTI_TRACK=1`, the ideal check verifies that every source audio track would survive the filter. If any would be dropped, the source is not ideal and remuxing proceeds.
-- **Shared source input in `mux_final`** — `VIDEO_COPY_FROM_SOURCE`, `AUDIO_COPY_FROM_SOURCE`, and direct subtitle mapping now share a single `-i "$SRC_ABS"` ffmpeg input via `_src_input_idx`, eliminating duplicate source file inputs.
-- New man page subsection "Multi-Track Audio (Archival)" under AUDIO OPTIONS, documenting filter behavior, config variables, and demotion rules.
-- `AUDIO_MULTI_TRACK` and `AUDIO_KEEP_COMMENTARY` added to `--print-effective-config`, `--create-config` template, and man page CONFIGURATION variable groups.
+- **Multi-track subtitle pipeline** (`SUB_MULTI_TRACK=1`) — New subtitle mode that keeps all matching subtitle tracks instead of selecting one per type (forced/full/SDH). Subtitle streams are mapped directly from source with `-c:s copy` (no OCR, no format conversion, no intermediate files). Controlled by one new config variable:
+  - `SUB_MULTI_TRACK` — `1` = keep all tracks that pass filters, `0` = single-track per-type selection (default, unchanged for all other profiles).
+  - Uses existing `SUB_INCLUDE_FORCED`, `SUB_INCLUDE_FULL`, `SUB_INCLUDE_SDH` as type filters and `SUB_LANG_PREF` as language filter. `SUB_MAX_TRACKS` is respected as a cap.
+  - Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target container are silently skipped. MKV handles all formats.
+- **`dv-archival` profile updated** — Now sets `AUDIO_MULTI_TRACK=1`, `AUDIO_KEEP_COMMENTARY=0`, and `SUB_MULTI_TRACK=1`. Language filtering uses the existing `AUDIO_LANG_PREF` and `SUB_LANG_PREF` variables: when empty (the dv-archival default), all languages pass; when set (e.g., `eng,jpn`), only matching tracks are kept.
+- **Graceful demotion** — If `--audio-track` or `--audio-force-codec` is set alongside `AUDIO_MULTI_TRACK=1`, multi-track audio mode is automatically demoted to single-track with an informational note. If `--sub-burn-forced` is set alongside `SUB_MULTI_TRACK=1`, multi-track subtitle mode is demoted to single-track. The explicit CLI flag always wins.
+- **Conflict warnings** (Section 13) for `dv-archival` + `--audio-track`, `--audio-force-codec`, `--stereo-fallback`, `--sub-burn-forced`, and `--sub-export-external` when multi-track modes are active.
+- **`skip-if-ideal` updated** — When `AUDIO_MULTI_TRACK=1` or `SUB_MULTI_TRACK=1`, the ideal check verifies that every source audio/subtitle track would survive the respective filter. If any would be dropped, the source is not ideal and remuxing proceeds.
+- **Shared source input in `mux_final`** — `VIDEO_COPY_FROM_SOURCE`, `AUDIO_COPY_FROM_SOURCE`, `SUB_COPY_FROM_SOURCE`, and direct subtitle mapping now share a single `-i "$SRC_ABS"` ffmpeg input via `_src_input_idx`, eliminating duplicate source file inputs.
+- New man page subsections "Multi-Track Audio (Archival)" and "Multi-Track Subtitles (Archival)" under AUDIO OPTIONS and SUBTITLE OPTIONS, documenting filter behavior, config variables, and demotion rules.
+- `AUDIO_MULTI_TRACK`, `AUDIO_KEEP_COMMENTARY`, and `SUB_MULTI_TRACK` added to `--print-effective-config`, `--create-config` template, and man page CONFIGURATION variable groups.
 
 ### Changed
 
-- `dv-archival` profile description updated in man page, usage text, and `--help` output to reflect multi-track audio behavior.
+- `dv-archival` profile description updated in man page, usage text, and `--help` output to reflect multi-track audio and subtitle behavior.
 
 ## [1.0.2] - 2026-03-20
 

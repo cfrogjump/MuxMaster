@@ -155,6 +155,12 @@ SUB_OCR_LANG="eng"
 # Only effective when the output container supports it (MKV). Ignored for MP4/MOV.
 declare -i SUB_PRESERVE_TEXT_FORMAT=0
 
+# ---- Multi-track subtitles (dv-archival)
+# Keep all matching subtitle tracks instead of selecting one per type.
+# When enabled, build_subtitle_plan skips single-track selection; subtitle streams
+# are filtered and mapped directly from source in mux_final with -c:s copy.
+declare -i SUB_MULTI_TRACK=0
+
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
 TAG_LANGUAGE_DEFAULT="und"
@@ -1013,9 +1019,12 @@ Apply a named format profile.
 Available profiles:
 .TP
 .B dv\-archival
-Preserve DV + HDR10 + all audio tracks (multi\-track, copy only). MKV.
-Commentary/descriptive tracks dropped by default. Filterable via
-.BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY .
+Preserve DV + HDR10 + all audio and subtitle tracks (multi\-track, copy
+only). MKV. Commentary/descriptive audio tracks dropped by default.
+Audio filterable via
+.BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY ;
+subtitles filterable via
+.BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED / FULL / SDH ", and " SUB_MAX_TRACKS .
 Skip if already ideal. JSON report.
 .TP
 .B hdr10\-hq
@@ -1270,6 +1279,42 @@ OCR backend: pgsrip or sub2srt.
 .TP
 .BR \-\-ocr\-lang " " \fILANG\fR
 OCR language (default: eng).
+.SS Multi\-Track Subtitles (Archival)
+The
+.B dv\-archival
+profile uses multi\-track subtitle mode
+.RB ( SUB_MULTI_TRACK=1 ),
+which keeps all subtitle tracks that pass a subtractive filter instead of
+selecting one per type. All surviving tracks are stream\-copied from
+source (no OCR, no format conversion, no intermediate files).
+.PP
+Filters (configured via
+.IR .muxmrc ):
+.TP
+.B SUB_LANG_PREF
+When non\-empty, only tracks whose language matches the comma\-separated
+list are kept. When empty (the default for
+.BR dv\-archival ),
+all languages pass.
+.TP
+.B SUB_INCLUDE_FORCED / SUB_INCLUDE_FULL / SUB_INCLUDE_SDH
+Type filters. When 0, tracks of that type are excluded. All three
+default to 1 in
+.BR dv\-archival .
+.TP
+.B SUB_MAX_TRACKS
+Maximum number of subtitle tracks to keep (applied after all other
+filters as a cap).
+.PP
+Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target
+container (e.g., PGS into MP4) are silently skipped.
+.B dv\-archival
+uses MKV, which handles all subtitle formats.
+.PP
+Multi\-track subtitle mode is automatically demoted to single\-track if
+.B \-\-sub\-burn\-forced
+is set on the CLI (burn\-in requires extracting and processing a single
+forced track).
 .SH OUTPUT OPTIONS
 .TP
 .BR \-\-output\-ext " " \fIEXT\fR
@@ -1457,6 +1502,9 @@ Major variable groups:
 .BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
 .BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
 .BR SUB_OCR_LANG .
+.TP
+.B Multi\-track subtitles (archival)
+.BR SUB_MULTI_TRACK .
 .TP
 .B Output / operational
 .BR OUTPUT_EXT ", " KEEP_CHAPTERS ", " STRIP_METADATA ", "
@@ -2046,6 +2094,7 @@ _create_config_emit() {
       _active+="SKIP_IF_IDEAL REPORT_JSON "
       _active+="AUDIO_CODEC_PREFERENCE "
       _active+="AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY "
+      _active+="SUB_MULTI_TRACK SUB_MAX_TRACKS "
       ;;
     hdr10-hq)
       _active+="CRF_VALUE PRESET_VALUE "
@@ -2383,6 +2432,19 @@ HEADER
 
   echo ""
   echo "# ========================="
+  echo "# Multi-track subtitles (archival)"
+  echo "# ========================="
+  echo ""
+  echo "# Keep ALL matching subtitle tracks instead of selecting one per type."
+  echo "# All tracks are stream-copied from source (no OCR, no format conversion)."
+  echo "# Filtering is subtractive: everything passes unless excluded by"
+  echo "# SUB_LANG_PREF, SUB_INCLUDE_FORCED/FULL/SDH, or capped by SUB_MAX_TRACKS."
+  echo "#   1 = multi-track (filter + copy all)  |  0 = single-track (pick one per type)"
+  _V SUB_MULTI_TRACK
+  echo ""
+
+  echo ""
+  echo "# ========================="
   echo "# Mux / output container"
   echo "# ========================="
   echo ""
@@ -2597,10 +2659,14 @@ apply_profile_dv_archival() {
   AUDIO_LOSSLESS_PASSTHROUGH=1
   ADD_STEREO_IF_MULTICH=0
   AUDIO_CODEC_PREFERENCE="truehd,dts,flac,eac3,ac3,aac,alac,other"
-  # Subs: keep all; no burn
+  # Subs: multi-track, keep all; no burn
+  # Empty SUB_LANG_PREF = keep all languages (archival default).
+  SUB_MULTI_TRACK=1
+  SUB_LANG_PREF=""
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
+  SUB_MAX_TRACKS=99
   SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
   # Chapters/metadata: keep
@@ -2856,7 +2922,7 @@ ${APP_NAME} v${VERSION} — ${CLI_NAME}
 $USAGE_SHORT
 
 Profiles (--profile NAME):
-  dv-archival          Preserve DV + HDR10 + all audio tracks. MKV.
+  dv-archival          Preserve DV + HDR10 + all audio/subtitle tracks. MKV.
   hdr10-hq             Strip DV, keep HDR10. HEVC CRF 17. MKV.
   atv-directplay-hq    Apple TV Direct Play. MP4, DV P8.1, E-AC-3.
   streaming            HEVC streaming for Plex/Jellyfin. MP4.
@@ -3063,6 +3129,17 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
         (( ADD_STEREO_IF_MULTICH )) && \
           _warn_conflict "$PROFILE_NAME" "--stereo-fallback" \
             "Multi-track archival preserves all source tracks. Stereo fallback is redundant."
+      fi
+
+      # Multi-track subtitle conflicts: flags that force single-track behavior
+      if (( SUB_MULTI_TRACK )); then
+        (( SUB_BURN_FORCED )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
+            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
+
+        (( SUB_EXPORT_EXTERNAL )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
+            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
       fi
       ;;
 
@@ -3291,6 +3368,7 @@ Effective config (post config-files + profile + CLI):
   SUB_OCR_TOOL              = $SUB_OCR_TOOL
   SUB_OCR_LANG              = $SUB_OCR_LANG
   SUB_PRESERVE_TEXT_FORMAT  = $SUB_PRESERVE_TEXT_FORMAT
+  SUB_MULTI_TRACK          = $SUB_MULTI_TRACK
 
   [Output / Muxing]
   OUTPUT_EXT                = $OUTPUT_EXT
@@ -3712,6 +3790,21 @@ check_skip_if_ideal() {
       elif ! audio_is_direct_play_copyable "$a_codec"; then
         ideal=0; reason="audio codec $a_codec not Direct Play compatible"
       fi
+    fi
+  fi
+
+  # ---- Subtitle compliance (skip-if-ideal only) ----
+  if (( ideal )) && (( SUB_MULTI_TRACK )); then
+    # Multi-track: source is ideal only if every subtitle track survives the filter.
+    # If any track would be dropped (wrong language, excluded type, cap), we need to remux.
+    local _ideal_sub_keep
+    _ideal_sub_keep="$(_build_subtitle_keep_list)"
+    local _ideal_sub_n_keep _ideal_sub_n_total
+    # shellcheck disable=SC2086  # intentional word-splitting for count
+    _ideal_sub_n_keep=$(echo $_ideal_sub_keep | wc -w | tr -d ' ')
+    _ideal_sub_n_total="$(_sub_count)"
+    if [[ "$_ideal_sub_n_keep" != "$_ideal_sub_n_total" ]]; then
+      ideal=0; reason="subtitle filter would drop $(( _ideal_sub_n_total - _ideal_sub_n_keep )) of $_ideal_sub_n_total tracks"
     fi
   fi
 
@@ -4202,6 +4295,16 @@ declare -a AUDIO_MT_CODECS=()     # codec per kept track (e.g., truehd, ac3)
 declare -a AUDIO_MT_CHANNELS=()   # channel count per kept track
 declare -a AUDIO_MT_LANGS=()      # language tag per kept track
 declare -a AUDIO_MT_TITLES=()     # title tag per kept track (empty if unset)
+
+# Multi-track subtitles: when SUB_MULTI_TRACK=1, subtitle streams are mapped
+# directly from source in mux_final (no extraction, OCR, or conversion).
+# SUB_COPY_FROM_SOURCE is the runtime flag set by run_subtitle_pipeline_multi.
+declare -i SUB_COPY_FROM_SOURCE=0
+declare -a SUB_MT_INDICES=()      # 0-based subtitle-relative indices to keep
+declare -a SUB_MT_CODECS=()       # codec per kept track (e.g., subrip, hdmv_pgs_subtitle)
+declare -a SUB_MT_LANGS=()        # language tag per kept track
+declare -a SUB_MT_TITLES=()       # title tag per kept track (empty if unset)
+declare -a SUB_MT_TYPES=()        # "forced" | "full" | "sdh" per kept track
 
 # ===== Section 26: Video pipeline =============================================================
 
@@ -6033,6 +6136,215 @@ _export_or_embed_sub(){
   fi
 }
 
+# _build_subtitle_keep_list — Subtractive filter for multi-track subtitle mode.
+#
+# Enumerates all subtitle streams and applies keep-filters:
+#   1. SUB_LANG_PREF (if non-empty) — only keep tracks whose language matches
+#   2. Type classification (forced/SDH/full) against SUB_INCLUDE_* flags
+#   3. Container compatibility — bitmap subs in non-MKV containers are skipped
+#
+# Unlike build_subtitle_plan (which picks ONE of each type), this keeps ALL
+# tracks that pass the filters. No scoring, no ranking — just pass/fail.
+# The result is capped by SUB_MAX_TRACKS.
+#
+# Output: space-separated list of 0-based subtitle-relative indices on stdout.
+#         Empty string if no tracks survive the filter.
+# Globals: SUB_LANG_PREF (read), SUB_INCLUDE_FORCED (read), SUB_INCLUDE_FULL (read),
+#          SUB_INCLUDE_SDH (read), SUB_MAX_TRACKS (read), MUX_FORMAT (read),
+#          METADATA_CACHE (read), TAG_LANGUAGE_DEFAULT (read)
+_build_subtitle_keep_list(){
+  local n i
+  n="$(_sub_count)"
+  (( n > 0 )) || { echo ""; return 0; }
+
+  local -a kept=()
+  local -a dropped_reasons=()
+
+  for (( i=0; i<n; i++ )); do
+    local info codec lang title forced
+    info="$(_sub_stream_info "$i")"
+    IFS=$'\t' read -r codec lang title forced <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    # Filter 1: language
+    if [[ -n "${SUB_LANG_PREF:-}" ]]; then
+      if [[ ",$SUB_LANG_PREF," != *",$lang,"* ]]; then
+        dropped_reasons+=("#$i: ${codec} [$lang] — language not in SUB_LANG_PREF")
+        continue
+      fi
+    fi
+
+    # Classify type (same priority as build_subtitle_plan: forced > SDH > full)
+    local stype=""
+    if (( forced )) || _is_forced_title "$title"; then
+      stype="forced"
+    elif _is_sdh_title "$title"; then
+      stype="sdh"
+    else
+      stype="full"
+    fi
+
+    # Filter 2: type inclusion flags
+    case "$stype" in
+      forced) if (( ! SUB_INCLUDE_FORCED )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — forced tracks excluded (SUB_INCLUDE_FORCED=0)")
+                continue
+              fi ;;
+      sdh)    if (( ! SUB_INCLUDE_SDH )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — SDH tracks excluded (SUB_INCLUDE_SDH=0)")
+                continue
+              fi ;;
+      full)   if (( ! SUB_INCLUDE_FULL )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — full tracks excluded (SUB_INCLUDE_FULL=0)")
+                continue
+              fi ;;
+    esac
+
+    # Filter 3: container compatibility — bitmap subs can't go into MP4/MOV
+    if [[ "$MUX_FORMAT" != "matroska" ]] && ! _is_text_sub_codec "$codec"; then
+      dropped_reasons+=("#$i: ${codec} [$lang] — bitmap subtitle incompatible with ${OUTPUT_EXT} container")
+      continue
+    fi
+
+    kept+=("$i")
+  done
+
+  # Log filter results
+  if (( ${#dropped_reasons[@]} > 0 )); then
+    local reason
+    for reason in "${dropped_reasons[@]}"; do
+      log "  [multi-track subs] Dropped $reason"
+    done
+  fi
+
+  # Apply SUB_MAX_TRACKS cap
+  if (( ${#kept[@]} > SUB_MAX_TRACKS )); then
+    log "  [multi-track subs] Capping from ${#kept[@]} to $SUB_MAX_TRACKS tracks (SUB_MAX_TRACKS)"
+    kept=("${kept[@]:0:$SUB_MAX_TRACKS}")
+  fi
+
+  echo "${kept[*]}"
+}
+
+# run_subtitle_pipeline_multi — Multi-track subtitles: filter and defer to mux_final.
+#
+# Called instead of the single-track pipeline when SUB_MULTI_TRACK=1.
+# No ffmpeg calls, no intermediate files, no OCR, no format conversion.
+# Populates metadata arrays that mux_final uses to map subtitle streams
+# directly from source with -c:s copy.
+#
+# Sets: SUB_COPY_FROM_SOURCE, SUB_MT_INDICES, SUB_MT_CODECS, SUB_MT_LANGS,
+#       SUB_MT_TITLES, SUB_MT_TYPES, SRT_FORCED (cleared), SRT_FULL (cleared),
+#       SRT_SDH (cleared), SRT_DIRECT_MAP (cleared), DIRECT_SUB_RELIDX (cleared)
+# Globals: SUB_MULTI_TRACK (read), METADATA_CACHE (read)
+run_subtitle_pipeline_multi(){
+  local keep_list
+  keep_list="$(_build_subtitle_keep_list)"
+
+  if [[ -z "$keep_list" ]]; then
+    note "[Subs] Multi-track filter: no subtitle tracks survived filtering."
+    SUB_COPY_FROM_SOURCE=0
+    return 0
+  fi
+
+  # Reset single-track vars (not used in multi-track mode)
+  SRT_FORCED=""
+  SRT_FULL=""
+  SRT_SDH=""
+  SRT_FORCED_BURN_PATH=""
+  SRT_DIRECT_MAP=0
+  DIRECT_SUB_RELIDX=""
+
+  # Populate parallel metadata arrays
+  SUB_MT_INDICES=()
+  SUB_MT_CODECS=()
+  SUB_MT_LANGS=()
+  SUB_MT_TITLES=()
+  SUB_MT_TYPES=()
+
+  local idx
+  for idx in $keep_list; do
+    local info codec lang title forced
+    info="$(_sub_stream_info "$idx")"
+    IFS=$'\t' read -r codec lang title forced <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    # Classify type (same priority as _build_subtitle_keep_list: forced > SDH > full)
+    local stype="full"
+    if (( forced )) || _is_forced_title "$title"; then
+      stype="forced"
+    elif _is_sdh_title "$title"; then
+      stype="sdh"
+    fi
+
+    SUB_MT_INDICES+=("$idx")
+    SUB_MT_CODECS+=("$codec")
+    SUB_MT_LANGS+=("$lang")
+    SUB_MT_TITLES+=("${title:-}")
+    SUB_MT_TYPES+=("$stype")
+  done
+
+  SUB_COPY_FROM_SOURCE=1
+
+  # Log summary
+  local n_total n_kept n_dropped
+  n_total="$(_sub_count)"
+  n_kept="${#SUB_MT_INDICES[@]}"
+  n_dropped=$(( n_total - n_kept ))
+
+  say "→ Scanning subtitle streams (multi-track mode):"
+  local i
+  for (( i=0; i<n_total; i++ )); do
+    local _sinfo _c _l _t _f pretty marker=""
+    _sinfo="$(_sub_stream_info "$i")"
+    IFS=$'\t' read -r _c _l _t _f <<< "$_sinfo"
+    _c="${_c,,}"
+    _l="${_l,,}"
+    [[ -z "$_l" ]] && _l="$TAG_LANGUAGE_DEFAULT"
+
+    # Check if this index is in the keep list
+    local _is_kept=0
+    for idx in "${SUB_MT_INDICES[@]}"; do
+      (( idx == i )) && { _is_kept=1; break; }
+    done
+
+    pretty="#$i: $_c [$_l]"
+    [[ -n "$_t" ]] && pretty="$pretty — $_t"
+    (( _f )) && pretty="$pretty (forced)"
+    _is_sdh_title "$_t" && pretty="$pretty [SDH]"
+
+    if (( _is_kept )); then
+      marker=" ✓"
+    else
+      marker=" ✗"
+    fi
+    say "  $pretty$marker"
+  done
+
+  note "[Subs] Multi-track: keeping ${n_kept} of ${n_total} tracks (${n_dropped} filtered out)"
+  report_add "sub_mode" "multi-track"
+  report_add "sub_multi_track_kept" "$n_kept"
+  report_add "sub_multi_track_dropped" "$n_dropped"
+
+  # Report kept tracks
+  local track_summary=""
+  for (( i=0; i<n_kept; i++ )); do
+    local _idx="${SUB_MT_INDICES[$i]}"
+    local _codec="${SUB_MT_CODECS[$i]}"
+    local _lang="${SUB_MT_LANGS[$i]}"
+    local _stype="${SUB_MT_TYPES[$i]}"
+    track_summary+="#${_idx}: ${_codec} [${_lang}] (${_stype})"
+    (( i < n_kept - 1 )) && track_summary+=", "
+  done
+  report_add "sub_kept_tracks" "$track_summary"
+
+  mark_done "Subtitle filter plan (multi-track, ${n_kept} tracks)"
+}
+
 # build_subtitle_plan — Scan, categorize, and prepare subtitle tracks.
 #
 # Scans all subtitle streams for language/forced/SDH classification, selects
@@ -6063,6 +6375,24 @@ build_subtitle_plan(){
     SRT_DIRECT_MAP=0
     return 0
   fi
+
+  # ── Multi-track mode: filter and defer to mux_final ──
+  # When SUB_MULTI_TRACK=1, skip single-track selection entirely.
+  # Demote to single-track if the user set overrides that are incompatible.
+  if (( SUB_MULTI_TRACK )); then
+    if (( SUB_BURN_FORCED )); then
+      note "[Subs] SUB_MULTI_TRACK demoted to single-track: --sub-burn-forced is set."
+    elif (( SUB_EXPORT_EXTERNAL )); then
+      note "[Subs] Multi-track mode: --sub-export-external ignored (all subs embedded via stream-copy)."
+      run_subtitle_pipeline_multi
+      return $?
+    else
+      run_subtitle_pipeline_multi
+      return $?
+    fi
+  fi
+
+  # ── Single-track mode (existing behavior) ──
 
   say "→ Scanning subtitle streams:"
   local i
@@ -6275,8 +6605,18 @@ mux_final() {
     fi
   fi
 
-  # Add subtitle streams
-  if (( ! SKIP_SUBS )); then
+  # Add subtitle streams — multi-track or single-track
+  if (( ! SKIP_SUBS )) && (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    # Multi-track: map subtitle streams directly from source.
+    # Reuse the source input if VIDEO_COPY_FROM_SOURCE or AUDIO_COPY_FROM_SOURCE already added it.
+    if [[ -z "$_src_input_idx" ]]; then
+      ff_in+=( -i "$SRC_ABS" )
+      _src_input_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
+    # Mapping and tagging handled below in the multi-track subtitle section.
+  elif (( ! SKIP_SUBS )); then
+    # Single-track: use prepared subtitle files
     if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
       ff_in+=( -i "$SRT_FORCED" )
       s_forced_idx=$next_idx
@@ -6299,8 +6639,8 @@ mux_final() {
     fi
   fi
 
-  # Add source for direct subtitle mapping if needed
-  if (( ! SKIP_SUBS )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
+  # Add source for direct subtitle mapping if needed (single-track fallback only)
+  if (( ! SKIP_SUBS )) && (( ! SUB_COPY_FROM_SOURCE )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
     if [[ -z "$_src_input_idx" ]]; then
       ff_in+=( -i "$SRC_ABS" )
       _src_input_idx=$next_idx
@@ -6325,12 +6665,20 @@ mux_final() {
     [[ -n "$a_stereo_idx"  ]] && ff_map+=( -map "$a_stereo_idx":a:0 )
   fi
 
-  (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
-  (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
-  (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
+  # Subtitle mapping: multi-track from source or single-track from files
+  if (( SUB_COPY_FROM_SOURCE )) && [[ -n "$_src_input_idx" ]] && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    local _mt_s
+    for _mt_s in "${SUB_MT_INDICES[@]}"; do
+      ff_map+=( -map "${_src_input_idx}:s:${_mt_s}" )
+    done
+  else
+    (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
+    (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
+    (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
 
-  if [[ -n "$src_sub_idx" ]]; then
-    ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
+    if [[ -n "$src_sub_idx" ]]; then
+      ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
+    fi
   fi
 
   # Codec settings: copy everything; subtitle codecs are assigned per-stream below
@@ -6355,42 +6703,81 @@ mux_final() {
   # Subtitle metadata: language, title, disposition, and per-stream codec tagging.
   # Output subtitle index tracks which output stream we're tagging.
   local -i out_s_idx=0
-  if (( forced_present )); then
-    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FORCED")" )
-    [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
-    [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" forced )
-    out_s_idx=$(( out_s_idx + 1 ))
-  fi
-  if (( full_present )); then
-    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FULL")" )
-    [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
-    [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
-    out_s_idx=$(( out_s_idx + 1 ))
-  fi
-  if (( sdh_present )); then
-    ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_SDH")" )
-    [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
-    [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
-    out_s_idx=$(( out_s_idx + 1 ))
-  fi
-  if [[ -n "$src_sub_idx" ]]; then
-    # Direct-mapped subtitle from source: check if we should preserve native format
-    local _dm_codec
-    _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
-    if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
-      case "$_dm_codec" in
-        ass|ssa) ff_codec+=( "-c:s:${out_s_idx}" copy ) ;;
-        *)       ff_codec+=( "-c:s:${out_s_idx}" srt ) ;;
+  if (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    # Multi-track: tag each kept subtitle stream copied from source
+    local _mt_si
+    for (( _mt_si=0; _mt_si<${#SUB_MT_INDICES[@]}; _mt_si++ )); do
+      local _mt_slang="${SUB_MT_LANGS[$_mt_si]}"
+      local _mt_stitle="${SUB_MT_TITLES[$_mt_si]}"
+      local _mt_stype="${SUB_MT_TYPES[$_mt_si]}"
+
+      # Codec: copy (stream-copy from source, no conversion)
+      ff_codec+=( "-c:s:${out_s_idx}" copy )
+
+      # Language
+      [[ -n "$_mt_slang" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$_mt_slang" )
+
+      # Title: preserve source title if present, otherwise use type label
+      if [[ -n "$_mt_stitle" ]]; then
+        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_stitle" )
+      else
+        # Capitalize first letter: forced→Forced, full→Full, sdh→SDH
+        local _mt_type_label
+        case "$_mt_stype" in
+          sdh) _mt_type_label="SDH" ;;
+          *)   _mt_type_label="${_mt_stype^}" ;;
+        esac
+        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_type_label" )
+      fi
+
+      # Disposition from type
+      case "$_mt_stype" in
+        forced) ff_codec+=( "-disposition:s:${out_s_idx}" forced ) ;;
+        sdh)    ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired ) ;;
+        *)      ff_codec+=( "-disposition:s:${out_s_idx}" 0 ) ;;
       esac
-    elif [[ "$MUX_FORMAT" == "matroska" ]]; then
-      ff_codec+=( "-c:s:${out_s_idx}" srt )
-    else
-      ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+
+      out_s_idx=$(( out_s_idx + 1 ))
+    done
+  else
+    # Single-track: hardcoded forced/full/sdh slots
+    if (( forced_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FORCED")" )
+      [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
+      [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" forced )
+      out_s_idx=$(( out_s_idx + 1 ))
     fi
-    out_s_idx=$(( out_s_idx + 1 ))
+    if (( full_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FULL")" )
+      [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
+      [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
+    if (( sdh_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_SDH")" )
+      [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
+      [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
+    if [[ -n "$src_sub_idx" ]]; then
+      # Direct-mapped subtitle from source: check if we should preserve native format
+      local _dm_codec
+      _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
+      if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+        case "$_dm_codec" in
+          ass|ssa) ff_codec+=( "-c:s:${out_s_idx}" copy ) ;;
+          *)       ff_codec+=( "-c:s:${out_s_idx}" srt ) ;;
+        esac
+      elif [[ "$MUX_FORMAT" == "matroska" ]]; then
+        ff_codec+=( "-c:s:${out_s_idx}" srt )
+      else
+        ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+      fi
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
   fi
 
   # Audio metadata: language, title, and disposition tagging.

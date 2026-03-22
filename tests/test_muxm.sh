@@ -5,11 +5,13 @@
 #  CLI parsing, config precedence, profile behavior, and pipeline outputs.
 #
 #  Usage:
-#    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
+#    ./test_muxm.sh                                        # show help
+#    ./test_muxm.sh --suite all                            # run everything
+#    ./test_muxm.sh --suite subs                           # run one suite
+#    ./test_muxm.sh --muxm /path/to/muxm --suite e2e      # custom binary
 #
-#  Suites: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun, video,
-#          audio, subs, output, edge, e2e, hdr, containers, metadata
-#  Default: all
+#  Run with -h or --help for the full suite list.
+#  Default: no arguments shows help.
 # =============================================================================
 set -euo pipefail
 
@@ -38,18 +40,65 @@ readonly EXIT_VALIDATION=11
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
+# ---- Help ----
+show_help() {
+  cat <<'EOF'
+
+  muxm Test Harness v2.0
+
+  Usage: test_muxm.sh [--muxm PATH] [--suite SUITE] [--verbose]
+         test_muxm.sh --suite all          # run everything
+
+  Suites (--suite NAME):
+
+    Fast (config-only, no media generation, ~2s):
+      profiles     Profile variable assignment (--print-effective-config)
+      conflicts    Conflict warnings (profile + contradictory flag)
+      toggles      CLI toggle/flag parsing (--flag / --no-flag pairs)
+      config       Config file precedence (.muxmrc layering)
+      unit         Pure unit tests (helpers, codec maps, heuristics)
+      completions  Tab-completion installer/uninstaller
+      setup        --install-dependencies, --install-man, etc.
+
+    Medium (core fixture only, ~5s):
+      cli          CLI parsing, --help, --version, error codes
+      dryrun       --dry-run mode (profiles, skip flags, multi-track)
+      collision    Source/output collision and auto-versioning
+      edge         Edge cases (empty files, missing streams, etc.)
+
+    Full (all fixtures, real encodes, ~30s+):
+      video        Video pipeline (HEVC, H.264, copy-if-compliant)
+      hdr          HDR detection, color space, tone-mapping
+      audio        Audio selection, scoring, multi-track, lossless
+      subs         Subtitle pipeline, multi-track, ASS, OCR config
+      output       Chapters, checksum, JSON report, skip-if-ideal
+      containers   MP4, MKV, MOV container handling
+      metadata     Metadata stripping and preservation
+      e2e          Full profile end-to-end encodes
+
+    all            Run every suite above (default when --suite given)
+
+  Options:
+    --muxm PATH    Path to muxm binary (default: ./muxm)
+    --suite NAME   Run a specific suite (see above)
+    --verbose      Show output snippets on failure
+    -h, --help     Show this help
+
+EOF
+  exit 0
+}
+
 # ---- Parse args ----
+# No arguments → show help (use --suite all to run everything)
+[[ $# -eq 0 ]] && show_help
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --muxm)   MUXM="$2"; shift 2 ;;
     --suite)  SUITE="$2"; shift 2 ;;
     --verbose) VERBOSE=1; shift ;;
-    -h|--help)
-      echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, toggles, unit, completions, config, profiles, conflicts, collision, dryrun, video, hdr,"
-      echo "        audio, subs, output, containers, metadata, edge, e2e"
-      exit 0 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    -h|--help) show_help ;;
+    *) echo "Unknown option: $1 (try --help)"; exit 1 ;;
   esac
 done
 
@@ -564,6 +613,57 @@ CHAP
     "$TESTDIR/hevc_multi_audio.mkv"
   pass "hevc_multi_audio.mkv created"
 
+  # 8d) HEVC multi-subtitle fixture for dv-archival multi-track subtitle testing.
+  #     HEVC video (copy-if-compliant) + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full.
+  #     5 SRT inputs require explicit maps — raw ffmpeg.
+  log "Creating hevc_multi_subs.mkv (HEVC + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full)"
+  cat > "$TESTDIR/mt_forced.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:01,000
+[Foreign dialogue]
+SRT
+  cat > "$TESTDIR/mt_full_eng.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Full English subtitle
+SRT
+  cat > "$TESTDIR/mt_sdh_eng.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+[Music] SDH English subtitle
+SRT
+  cat > "$TESTDIR/mt_full_spa.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Subtítulo español
+SRT
+  cat > "$TESTDIR/mt_full_fra.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Sous-titre français
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=olive:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/mt_forced.srt" \
+    -i "$TESTDIR/mt_full_eng.srt" \
+    -i "$TESTDIR/mt_sdh_eng.srt" \
+    -i "$TESTDIR/mt_full_spa.srt" \
+    -i "$TESTDIR/mt_full_fra.srt" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -map 0:v -map 1:a -map 2 -map 3 -map 4 -map 5 -map 6 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="Forced" \
+    -metadata:s:s:1 language=eng -metadata:s:s:1 title="English" \
+    -metadata:s:s:2 language=eng -metadata:s:s:2 title="English SDH" \
+    -metadata:s:s:3 language=spa -metadata:s:s:3 title="Spanish" \
+    -metadata:s:s:4 language=fra -metadata:s:s:4 title="French" \
+    -disposition:s:0 forced \
+    "$TESTDIR/hevc_multi_subs.mkv"
+  pass "hevc_multi_subs.mkv created"
+
   # 9) File with rich metadata (encoder, title, etc.) for strip-metadata tests
   log "Creating rich_metadata.mkv (with extra metadata tags)"
   gen_media "$TESTDIR/rich_metadata.mkv" gray \
@@ -1019,6 +1119,7 @@ test_profiles() {
   assert_contains "truehd,dts,flac" "dv-archival: lossless-first codec preference" "$out"
   assert_contains "AUDIO_MULTI_TRACK         = 1" "dv-archival: multi-track audio enabled" "$out"
   assert_contains "AUDIO_KEEP_COMMENTARY     = 0" "dv-archival: commentary excluded by default" "$out"
+  assert_contains "SUB_MULTI_TRACK          = 1" "dv-archival: multi-track subtitles enabled" "$out"
 
   # hdr10-hq specifics
   out="$(run_muxm --profile hdr10-hq --print-effective-config)"
@@ -1026,6 +1127,7 @@ test_profiles() {
   assert_contains "CRF_VALUE                 = 17" "hdr10-hq: CRF 17" "$out"
   assert_contains "OUTPUT_EXT                = mkv" "hdr10-hq: MKV container" "$out"
   assert_contains "AUDIO_MULTI_TRACK         = 0" "hdr10-hq: multi-track audio off (no bleed)" "$out"
+  assert_contains "SUB_MULTI_TRACK          = 0" "hdr10-hq: multi-track subs off (no bleed)" "$out"
 
   # atv-directplay-hq specifics
   out="$(run_muxm --profile atv-directplay-hq --print-effective-config)"
@@ -1097,6 +1199,15 @@ test_conflicts() {
   out="$(run_muxm --profile dv-archival --stereo-fallback --print-effective-config)"
   assert_contains "⚠" "dv-archival + --stereo-fallback warns (multi-track conflict)" "$out"
   assert_contains "Multi-track" "dv-archival + --stereo-fallback: warning mentions multi-track" "$out"
+
+  # dv-archival multi-track subtitle conflicts
+  out="$(run_muxm --profile dv-archival --sub-burn-forced --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --sub-burn-forced warns (multi-track sub conflict)" "$out"
+  assert_contains "Multi-track subtitle" "dv-archival + --sub-burn-forced: warning mentions multi-track subtitle" "$out"
+
+  out="$(run_muxm --profile dv-archival --sub-export-external --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --sub-export-external warns (multi-track sub conflict)" "$out"
+  assert_contains "Multi-track subtitle" "dv-archival + --sub-export-external: warning mentions multi-track subtitle" "$out"
 
   # --- hdr10-hq conflicts ---
   out="$(run_muxm --profile hdr10-hq --tonemap --print-effective-config)"
@@ -1203,6 +1314,13 @@ test_dryrun() {
   out="$(run_muxm --dry-run --profile dv-archival "$TESTDIR/hevc_multi_audio.mkv")"
   assert_contains "DRY-RUN" "Dry-run dv-archival + multi-audio completes" "$out"
   assert_contains "multi-track" "Dry-run dv-archival: announces multi-track mode" "$out"
+
+  # Dry-run with dv-archival multi-track subtitles
+  # --no-skip-if-ideal: fixture is fully compliant, would skip before pipelines run.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "DRY-RUN" "Dry-run dv-archival + multi-subs completes" "$out"
+  assert_contains "multi-track" "Dry-run dv-archival multi-subs: announces multi-track mode" "$out"
+  assert_contains "keeping" "Dry-run dv-archival multi-subs: subtitle filter summary logged" "$out"
 }
 
 # === Suite: Video Pipeline (real encodes) ===
@@ -1822,6 +1940,66 @@ EOF
       fail "Pipe in sub title: subtitle codec not readable"
     fi
   fi
+
+  # ---- Multi-track subtitle tests (dv-archival SUB_MULTI_TRACK=1) ----
+  # hevc_multi_subs.mkv: 5 subs — eng forced, eng full, eng SDH, spa full, fra full
+
+  # Multi-track dry-run: shows ✓/✗ markers and announces multi-track mode
+  # --no-skip-if-ideal: this fixture is fully compliant (HEVC+MKV+all subs pass),
+  # so skip-if-ideal would short-circuit before the subtitle pipeline runs.
+  log "Testing multi-track subtitle dry-run..."
+  local mt_sub_dry
+  mt_sub_dry="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "Multi-track sub dry-run: announces multi-track mode" "$mt_sub_dry"
+  assert_contains "✓" "Multi-track sub dry-run: shows ✓ keep marker" "$mt_sub_dry"
+  assert_contains "keeping 5 of 5" "Multi-track sub dry-run: all 5 tracks kept (no filters)" "$mt_sub_dry"
+
+  # Multi-track language filter: --sub-lang-pref eng keeps only English tracks
+  log "Testing multi-track subtitle language filter..."
+  local mt_sub_lang
+  mt_sub_lang="$(run_muxm --dry-run --profile dv-archival \
+    --sub-lang-pref eng "$TESTDIR/hevc_multi_subs.mkv")"
+  # eng forced + eng full + eng SDH kept, spa + fra dropped = keeping 3 of 5
+  assert_contains "keeping 3 of 5" "Multi-track sub + --sub-lang-pref eng: 3 of 5 kept" "$mt_sub_lang"
+  assert_contains "✗" "Multi-track sub + --sub-lang-pref eng: shows ✗ drop marker" "$mt_sub_lang"
+
+  # Multi-track type filter: SUB_INCLUDE_SDH=0 drops SDH tracks
+  log "Testing multi-track subtitle type filter (no SDH)..."
+  local mt_sub_nosdh
+  mt_sub_nosdh="$(run_muxm --dry-run --profile dv-archival \
+    --no-sub-sdh "$TESTDIR/hevc_multi_subs.mkv")"
+  # eng forced + eng full + spa full + fra full kept, eng SDH dropped = keeping 4 of 5
+  assert_contains "keeping 4 of 5" "Multi-track sub + --no-sub-sdh: 4 of 5 kept (SDH dropped)" "$mt_sub_nosdh"
+
+  # Multi-track + SUB_MAX_TRACKS cap
+  # Uses .muxmrc instead of --profile dv-archival because profiles override config values.
+  log "Testing multi-track subtitle SUB_MAX_TRACKS cap..."
+  local mt_sub_cap_home="$TESTDIR/sub_mt_cap_home"
+  mkdir -p "$mt_sub_cap_home"
+  cat > "$mt_sub_cap_home/.muxmrc" <<'EOF'
+SUB_MULTI_TRACK=1
+SUB_LANG_PREF=
+SUB_MAX_TRACKS=2
+EOF
+  local mt_sub_cap
+  mt_sub_cap="$(MUXM_HOME="$mt_sub_cap_home" run_muxm_in "$TESTDIR" --dry-run \
+    "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "keeping 2 of 5" "Multi-track sub + SUB_MAX_TRACKS=2: capped at 2" "$mt_sub_cap"
+
+  # Multi-track demotion: --sub-burn-forced forces single-track
+  # --no-skip-if-ideal: source is ideal, would skip before demotion message is printed.
+  log "Testing multi-track subtitle demotion on --sub-burn-forced..."
+  local mt_sub_demote
+  mt_sub_demote="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "demoted" "Multi-track sub + --sub-burn-forced: demoted to single-track" "$mt_sub_demote"
+
+  # Multi-track + --sub-export-external: stays in multi-track, logs note
+  # --no-skip-if-ideal: source is ideal, would skip before export note is printed.
+  log "Testing multi-track subtitle with --sub-export-external..."
+  local mt_sub_export
+  mt_sub_export="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival --sub-export-external "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "Multi-track sub + --sub-export-external: stays in multi-track" "$mt_sub_export"
+  assert_contains "export-external ignored" "Multi-track sub + --sub-export-external: notes export ignored" "$mt_sub_export"
 }
 
 # === Suite: Output Features ===
@@ -2927,6 +3105,77 @@ test_profile_e2e() {
       fail "dv-archival multi-track e2e: expected spa, got lang='$mt_e2e_lang1'"
     fi
   fi
+
+  # ---- dv-archival multi-track subtitles: verify all subs kept, dispositions correct ----
+  # hevc_multi_subs.mkv: 5 subs — eng forced, eng full, eng SDH, spa full, fra full
+  # dv-archival defaults: SUB_MULTI_TRACK=1, all SUB_INCLUDE_*=1, SUB_LANG_PREF="" (keep all)
+  # Expected: all 5 subtitle tracks preserved in output
+  local mt_sub_e2e_home="$TESTDIR/e2e_mt_sub_home"
+  mkdir -p "$mt_sub_e2e_home"
+
+  local mt_sub_e2e_out="$TESTDIR/e2e_dv_archival_multi_subs.mkv"
+  log "Full encode: dv-archival profile multi-track subtitles..."
+  # --no-skip-if-ideal: fixture is fully compliant; without this, muxm skips processing.
+  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "dv-archival multi-track subs: e2e output produced" "$mt_sub_e2e_out" \
+       --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv"; then
+    # Should have 5 subtitle tracks (all kept)
+    local mt_sub_e2e_scount
+    mt_sub_e2e_scount="$(count_streams "$mt_sub_e2e_out" s)"
+    if [[ "$mt_sub_e2e_scount" -eq 5 ]]; then
+      pass "dv-archival multi-track sub e2e: 5 subtitle tracks preserved"
+    else
+      fail "dv-archival multi-track sub e2e: expected 5 subtitle tracks, got $mt_sub_e2e_scount"
+    fi
+    # Video should be copy (HEVC)
+    assert_probe "dv-archival multi-track sub e2e: video is HEVC (copy)" "$mt_sub_e2e_out" codec_name hevc
+    # First sub should have eng language
+    local mt_sub_e2e_lang0
+    mt_sub_e2e_lang0="$(probe_stream_tag "$mt_sub_e2e_out" s:0 language)"
+    if [[ "$mt_sub_e2e_lang0" == "eng" ]]; then
+      pass "dv-archival multi-track sub e2e: first subtitle is English"
+    else
+      fail "dv-archival multi-track sub e2e: expected eng, got lang='$mt_sub_e2e_lang0'"
+    fi
+    # Fourth sub (s:3) should have spa language
+    local mt_sub_e2e_lang3
+    mt_sub_e2e_lang3="$(probe_stream_tag "$mt_sub_e2e_out" s:3 language)"
+    if [[ "$mt_sub_e2e_lang3" == "spa" ]]; then
+      pass "dv-archival multi-track sub e2e: fourth subtitle is Spanish"
+    else
+      fail "dv-archival multi-track sub e2e: expected spa, got lang='$mt_sub_e2e_lang3'"
+    fi
+    # Fifth sub (s:4) should have fra language
+    local mt_sub_e2e_lang4
+    mt_sub_e2e_lang4="$(probe_stream_tag "$mt_sub_e2e_out" s:4 language)"
+    if [[ "$mt_sub_e2e_lang4" == "fra" ]]; then
+      pass "dv-archival multi-track sub e2e: fifth subtitle is French"
+    else
+      fail "dv-archival multi-track sub e2e: expected fra, got lang='$mt_sub_e2e_lang4'"
+    fi
+    # Verify first sub has forced disposition
+    local mt_sub_e2e_dispo0
+    mt_sub_e2e_dispo0="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=forced -of csv=p=0 "$mt_sub_e2e_out" 2>/dev/null | head -1)"
+    if [[ "$mt_sub_e2e_dispo0" == "1" ]]; then
+      pass "dv-archival multi-track sub e2e: first subtitle has forced disposition"
+    else
+      fail "dv-archival multi-track sub e2e: first subtitle forced disposition expected 1, got '$mt_sub_e2e_dispo0'"
+    fi
+  fi
+
+  # ---- dv-archival multi-track subtitles with language filter ----
+  # --sub-lang-pref eng should keep only eng tracks (3 of 5)
+  local mt_sub_lang_e2e_out="$TESTDIR/e2e_dv_archival_multi_subs_eng.mkv"
+  log "Full encode: dv-archival multi-track subs with --sub-lang-pref eng..."
+  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "dv-archival multi-track subs eng: e2e output produced" "$mt_sub_lang_e2e_out" \
+       --profile dv-archival --sub-lang-pref eng "$TESTDIR/hevc_multi_subs.mkv"; then
+    local mt_sub_lang_scount
+    mt_sub_lang_scount="$(count_streams "$mt_sub_lang_e2e_out" s)"
+    if [[ "$mt_sub_lang_scount" -eq 3 ]]; then
+      pass "dv-archival multi-track sub eng e2e: 3 subtitle tracks (eng only)"
+    else
+      fail "dv-archival multi-track sub eng e2e: expected 3 subtitle tracks, got $mt_sub_lang_scount"
+    fi
+  fi
 }
 
 # === Suite: Completions Installer ===
@@ -3079,8 +3328,8 @@ test_setup() {
 
 # ---- Run Suites ----
 # NOTE: Suite names are listed in three places that must stay in sync:
-#   1. File header comment (lines 10-11)
-#   2. --help output in arg parser (lines 41-42)
+#   1. File header comment (top of file)
+#   2. show_help() function
 #   3. This case statement
 run_suites() {
   case "$SUITE" in
@@ -3125,9 +3374,7 @@ run_suites() {
     edge)         test_edge ;;
     e2e)          test_profile_e2e ;;
     *)
-      echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun,"
-      echo "       video, hdr, audio, subs, output, containers, metadata, edge, e2e"
+      echo "Unknown suite: $SUITE (run with --help to see available suites)"
       exit 1
       ;;
   esac
