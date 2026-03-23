@@ -9,7 +9,7 @@
 # =============================================================================
 #
 # Requires:
-#   - ffmpeg, ffprobe, bc
+#   - ffmpeg, ffprobe, jq, bc
 #   - dovi_tool (optional for Dolby Vision RPU extraction/injection; script will fallback)
 #
 # Optional (for PGS subtitle OCR):
@@ -51,7 +51,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.0.1"
+readonly VERSION="1.1.0"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -105,6 +105,13 @@ HWACCEL_TYPE=""                # nvidia|intel|apple|cpu (detected at runtime)
 declare -i HWACCEL_ENABLED=0   # 1 if hardware acceleration is available and enabled
 HWACCEL_DECODE=1               # Enable hardware decode when available
 HWACCEL_ENCODE=1               # Enable hardware encode when available
+declare -i PROFILE_ALLOW_HW=1  # Per-profile hardware encode allowlist (1=allow, 0=disable)
+
+# Skip-if-ideal stream keep-lists (populated by check_skip_if_ideal).
+# Used by the metadata remux in main() to build explicit -map flags instead
+# of -map 0, ensuring only container-compatible streams reach the output.
+declare -a SII_AUDIO_INDICES=()
+declare -a SII_SUB_INDICES=()
 
 # ===== Section 4: Opinionated defaults ========================================================
 # ---- Video encode (x265)
@@ -157,6 +164,15 @@ declare -i SUB_MAX_TRACKS=3
 declare -i SUB_ENABLE_OCR=1
 SUB_OCR_TOOL="sub2srt"
 SUB_OCR_LANG="eng"
+# Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT.
+# Only effective when the output container supports it (MKV). Ignored for MP4/MOV.
+declare -i SUB_PRESERVE_TEXT_FORMAT=0
+
+# ---- Multi-track subtitles (dv-archival)
+# Keep all matching subtitle tracks instead of selecting one per type.
+# When enabled, build_subtitle_plan skips single-track selection; subtitle streams
+# are filtered and mapped directly from source in mux_final with -c:s copy.
+declare -i SUB_MULTI_TRACK=0
 
 # ---- Muxing / output
 OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
@@ -190,6 +206,14 @@ declare -i SKIP_SUBS=0
 # ---- Overrides
 AUDIO_TRACK_OVERRIDE=""
 
+# ---- Multi-track audio (dv-archival)
+# Keep all matching audio tracks instead of selecting one.
+# When enabled, run_audio_pipeline skips single-track scoring; audio streams
+# are filtered and mapped directly from source in mux_final with -c:a copy.
+declare -i AUDIO_MULTI_TRACK=0
+# Filter: exclude commentary/descriptive audio tracks (multi-track mode only)
+declare -i AUDIO_KEEP_COMMENTARY=1
+
 # ---- Profile-introduced variables (safe defaults preserve current behavior)
 # Video codec: libx265 (default) or libx264 (universal)
 VIDEO_CODEC="libx265"
@@ -212,6 +236,8 @@ declare -i SUB_EXPORT_EXTERNAL=0
 declare -i KEEP_CHAPTERS=1
 # Strip non-essential metadata from output
 declare -i STRIP_METADATA=0
+# Embed profile tagline in container comment metadata (when a profile is active)
+declare -i PROFILE_COMMENT=1
 # Skip processing entirely if source already matches profile (dv-archival, atv-directplay-hq)
 declare -i SKIP_IF_IDEAL=0
 # Generate JSON report alongside output (dv-archival)
@@ -537,7 +563,10 @@ write_checksum(){
     warn "Checksum tool not found"; return 0
   fi
   note "Writing checksum → ${p}.sha256"
-  "${cmd[@]}" "$p" > "${p}.sha256"
+  "${cmd[@]}" "$p" > "${p}.sha256" &
+  local _cksum_pid=$!
+  spinner "$_cksum_pid" "Computing SHA-256 checksum"
+  wait "$_cksum_pid" 2>/dev/null
 }
 
 # Validate that a media file exists, is non-empty, and is parseable by ffprobe.
@@ -1194,7 +1223,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   cat <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-03-02" "MuxMaster v1.0.1" "User Commands"
+.TH MUXM 1 "2026-03-22" "MuxMaster v1.1.0" "User Commands"
 .SH NAME
 muxm \- Universal DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -1232,7 +1261,12 @@ Apply a named format profile.
 Available profiles:
 .TP
 .B dv\-archival
-Preserve DV + HDR10 + lossless audio. Copy video (no re\-encode). MKV.
+Preserve DV + HDR10 + all audio and subtitle tracks (multi\-track, copy
+only). MKV. Commentary/descriptive audio tracks dropped by default.
+Audio filterable via
+.BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY ;
+subtitles filterable via
+.BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED / FULL / SDH ", and " SUB_MAX_TRACKS .
 Skip if already ideal. JSON report.
 .TP
 .B hdr10\-hq
@@ -1250,7 +1284,7 @@ MP4. Targets Plex/Jellyfin on Shield, Fire TV, Roku, smart TVs, web.
 .B animation
 Anime/cartoon optimized. HEVC CRF 16, 10\-bit (even SDR),
 animation\-tuned x265 (low psy\-rd, adjusted deblock, extra b\-frames),
-lossless audio, preserve all subs (ASS/SSA). MKV.
+lossless audio, multi\-track subs (ASS/SSA + PGS bitmap). MKV.
 .TP
 .B universal
 Play anywhere. H.264 SDR (tone\-map HDR), AAC stereo, burn forced subs,
@@ -1354,8 +1388,9 @@ Format: number with k suffix (e.g.,
 .BR 50000k ).
 Empty (default) disables the check.
 .TP
-.BR \-\-no\-dv
-Disable Dolby Vision extraction/injection.
+.BR \-\-dv " , " \-\-no\-dv
+Enable or disable Dolby Vision extraction/injection. Use \fB\-\-dv\fR to
+re\-enable DV handling after a profile disables it (e.g., \fBanimation\fR).
 .TP
 .BR \-\-allow\-dv\-fallback " , " \-\-no\-allow\-dv\-fallback
 If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
@@ -1364,8 +1399,9 @@ If DV handling fails, fall back to non\-DV output (default) or hard\-fail.
 Enable/disable automatic conversion to DV Profile 8.1 when native DV
 injection fails. Default: enabled.
 .TP
-.BR \-\-no\-conservative\-vbv
-Disable VBV guardrails.
+.BR \-\-conservative\-vbv " , " \-\-no\-conservative\-vbv
+Enable/disable VBV guardrails that cap bitrate and buffer size per x265
+level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
 Number of threads for ffmpeg encoding.
@@ -1412,6 +1448,35 @@ Language preference is the strongest signal by default, ensuring that a
 preferred\-language stereo track beats a foreign surround track. Reduce
 .B AUDIO_SCORE_LANG_BONUS
 to ~25 to prefer higher channel counts regardless of language.
+.SS Multi\-Track Audio (Archival)
+The
+.B dv\-archival
+profile uses multi\-track mode
+.RB ( AUDIO_MULTI_TRACK=1 ),
+which keeps all audio tracks that pass a subtractive filter instead of
+scoring and selecting one. All surviving tracks are stream\-copied from
+source (never transcoded). No stereo fallback is created.
+.PP
+Filters (configured via
+.IR .muxmrc ):
+.TP
+.B AUDIO_LANG_PREF
+When non\-empty, only tracks whose language matches the comma\-separated
+list are kept. When empty (the default for
+.BR dv\-archival ),
+all languages pass.
+.TP
+.B AUDIO_KEEP_COMMENTARY
+When 0 (the
+.B dv\-archival
+default), tracks whose title matches commentary or audio\-description
+keywords are dropped. Set to 1 to keep them.
+.PP
+Multi\-track mode is automatically demoted to single\-track if
+.B \-\-audio\-track
+or
+.B \-\-audio\-force\-codec
+is set on the CLI (the explicit flag wins).
 .SH SUBTITLE OPTIONS
 .TP
 .BR \-\-no\-subtitles
@@ -1442,11 +1507,71 @@ Exclude SDH/HI subtitle tracks.
 .BR \-\-no\-ocr
 Disable PGS\(->SRT OCR.
 .TP
+.BR \-\-sub\-preserve\-format " , " \-\-no\-sub\-preserve\-format
+Preserve/convert native text subtitle formats (ASS/SSA).
+When enabled and the output container is MKV, ASS/SSA subtitles are
+stream\-copied in their native format, preserving positioning, fonts,
+and typesetting. When disabled (or when the output container is MP4/MOV),
+ASS/SSA subtitles are converted to plain\-text SRT.
+The
+.B animation
+profile enables this by default.
+.TP
 .BR \-\-ocr\-tool " " \fITOOL\fR
 OCR backend: pgsrip or sub2srt.
 .TP
 .BR \-\-ocr\-lang " " \fILANG\fR
 OCR language (default: eng).
+.SS Multi\-Track Subtitles
+The
+.B dv\-archival
+and
+.B animation
+profiles use multi\-track subtitle mode
+.RB ( SUB_MULTI_TRACK=1 ),
+which keeps all subtitle tracks that pass a subtractive filter instead of
+selecting one per type. Surviving tracks are stream\-copied from
+source (no OCR, no intermediate files). The one exception is ASS/SSA
+tracks when
+.B SUB_PRESERVE_TEXT_FORMAT
+is 0 (or the output container is MP4/MOV): these are converted inline
+to SRT or mov_text respectively. All other codecs (PGS, SRT, VobSub)
+are always stream\-copied.
+.PP
+Filters (configured via
+.IR .muxmrc ):
+.TP
+.B SUB_LANG_PREF
+When non\-empty, only tracks whose language matches the comma\-separated
+list are kept. When empty (the default for
+.BR dv\-archival ),
+all languages pass.
+.TP
+.B SUB_INCLUDE_FORCED / SUB_INCLUDE_FULL / SUB_INCLUDE_SDH
+Type filters. When 0, tracks of that type are excluded. All three
+default to 1 in both
+.B dv\-archival
+and
+.BR animation .
+.TP
+.B SUB_MAX_TRACKS
+Maximum number of subtitle tracks to keep (applied after all other
+filters as a cap). Defaults to 99 for
+.BR dv\-archival ,
+6 for
+.BR animation .
+.PP
+Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target
+container (e.g., PGS into MP4) are silently skipped. Both
+.B dv\-archival
+and
+.B animation
+use MKV, which handles all subtitle formats.
+.PP
+Multi\-track subtitle mode is automatically demoted to single\-track if
+.B \-\-sub\-burn\-forced
+is set on the CLI (burn\-in requires extracting and processing a single
+forced track).
 .SH OUTPUT OPTIONS
 .TP
 .BR \-\-output\-ext " " \fIEXT\fR
@@ -1457,6 +1582,11 @@ Keep/strip chapter markers.
 .TP
 .BR \-\-strip\-metadata " , " \-\-no\-strip\-metadata
 Strip/keep non\-essential metadata.
+.TP
+.BR \-\-profile\-comment " , " \-\-no\-profile\-comment
+Embed/suppress profile tagline in container comment metadata. Default: on.
+When a profile is active, a short descriptive comment is written to the
+output container's comment field (MP4 \(cocmt, MKV COMMENT).
 .TP
 .BR \-\-skip\-if\-ideal " , " \-\-no\-skip\-if\-ideal
 Skip processing if source already matches profile requirements.
@@ -1568,6 +1698,42 @@ Install this manual page so \fBman muxm\fR works.
 .TP
 .B muxm \-\-install\-completions
 Install bash/zsh tab completion. Adds a source line to your shell RC files.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error (config write failure, dependency check failure, unhandled runtime error).
+.TP
+.B 10
+Missing required tool (ffmpeg, ffprobe, or jq not found).
+.TP
+.B 11
+Invalid arguments, unknown option or profile, bad input/output path, or security
+check failure (control characters in filename, source/output collision).
+.TP
+.B 12
+Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
+.TP
+.B 40
+Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
+.TP
+.B 41
+DV RPU injection failure, intermediate file validation failure, or final mux failure.
+.TP
+.B 42
+Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
+or corrupt encoded video stream).
+.TP
+.B 43
+Audio transcode or copy failure.
+.TP
+.B 130
+Interrupted by user (SIGINT / Ctrl\-C).
+.TP
+.B 143
+Terminated by signal (SIGTERM).
 .SH FILES
 .TP
 \fI/etc/.muxmrc\fR
@@ -1620,11 +1786,18 @@ Major variable groups:
 .BR AUDIO_SCORE_LANG_BONUS ", " AUDIO_SCORE_CHANNEL_MULTIPLIER ", "
 .BR AUDIO_SCORE_SURROUND_BONUS ", " AUDIO_SCORE_COMMENTARY_PENALTY .
 .TP
+.B Multi\-track audio (archival)
+.BR AUDIO_MULTI_TRACK ", " AUDIO_KEEP_COMMENTARY .
+.TP
 .B Subtitles
 .BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED ", " SUB_INCLUDE_FULL ", "
 .BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_BURN_FORCED ", "
-.BR SUB_EXPORT_EXTERNAL ", " SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
+.BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
+.BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
 .BR SUB_OCR_LANG .
+.TP
+.B Multi\-track subtitles (archival)
+.BR SUB_MULTI_TRACK .
 .TP
 .B Output / operational
 .BR OUTPUT_EXT ", " KEEP_CHAPTERS ", " STRIP_METADATA ", "
@@ -1712,42 +1885,6 @@ Configurable via \fB\-\-ocr\-tool\fR.
 .PP
 Run \fBmuxm \-\-install\-dependencies\fR to check for and install all
 tools via Homebrew and pipx.
-.SH EXIT STATUS
-.TP
-.B 0
-Success.
-.TP
-.B 1
-General error (config write failure, dependency check failure, unhandled runtime error).
-.TP
-.B 10
-Missing required tool (ffmpeg, ffprobe, or jq not found).
-.TP
-.B 11
-Invalid arguments, unknown option or profile, bad input/output path, or security
-check failure (control characters in filename, source/output collision).
-.TP
-.B 12
-Source file unusable: no video streams, corrupt metadata, or ffprobe JSON parse failure.
-.TP
-.B 40
-Video encode or Dolby Vision RPU extraction/validation failure (with fallback disabled).
-.TP
-.B 41
-DV RPU injection failure, intermediate file validation failure, or final mux failure.
-.TP
-.B 42
-Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
-or corrupt encoded video stream).
-.TP
-.B 43
-Audio transcode or copy failure.
-.TP
-.B 130
-Interrupted by user (SIGINT / Ctrl\-C).
-.TP
-.B 143
-Terminated by signal (SIGTERM).
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
@@ -1761,7 +1898,7 @@ Report bugs at
 .SH COPYRIGHT
 Copyright \(co 2025\(en2026 Jamey Wicklund (theBluWiz).
 .PP
-MuxMaster\(tm Freeware License v1.0.0 \(em
+MuxMaster\(tm Freeware License v1.0.1 \(em
 \(lqDo what you want, just don't pretend I warranty the universe.\(rq
 .SH AUTHOR
 Jamey Wicklund (theBluWiz).
@@ -1917,8 +2054,8 @@ _muxm_completions() {
             --crf -p --preset --x265-params -l --level
             --video-codec --tonemap --no-tonemap
             --sdr-force-10bit --no-sdr-force-10bit
-            --no-conservative-vbv
-            --no-dv --allow-dv-fallback --no-allow-dv-fallback
+            --conservative-vbv --no-conservative-vbv
+            --dv --no-dv --allow-dv-fallback --no-allow-dv-fallback
             --dv-convert-p81 --no-dv-convert-p81
             --video-copy-if-compliant --no-video-copy-if-compliant
             --max-copy-bitrate
@@ -1931,6 +2068,7 @@ _muxm_completions() {
 
             --sub-burn-forced --no-sub-burn-forced
             --sub-export-external --no-sub-export-external
+            --sub-preserve-format --no-sub-preserve-format
             --sub-lang-pref --no-sub-sdh --no-subtitles
             --ocr-lang --no-ocr --ocr-tool
 
@@ -1939,6 +2077,7 @@ _muxm_completions() {
             --output-ext
             --keep-chapters --no-keep-chapters
             --strip-metadata --no-strip-metadata
+            --profile-comment --no-profile-comment
             --skip-if-ideal --no-skip-if-ideal
             --report-json --no-report-json
             --checksum --no-checksum
@@ -2436,13 +2575,15 @@ _create_config_emit() {
   _base+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT "
   _base+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
   _base+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED "
-  _base+="KEEP_CHAPTERS STRIP_METADATA "
+  _base+="KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT "
   _active+="$_base"
 
   case "$profile" in
     dv-archival)
-      _active+="SKIP_IF_IDEAL REPORT_JSON "
-      _active+="AUDIO_CODEC_PREFERENCE "
+      _active+="SKIP_IF_IDEAL REPORT_JSON CHECKSUM "
+      _active+="AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE "
+      _active+="AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY "
+      _active+="SUB_LANG_PREF SUB_MULTI_TRACK SUB_MAX_TRACKS "
       ;;
     hdr10-hq)
       _active+="CRF_VALUE PRESET_VALUE "
@@ -2452,7 +2593,7 @@ _create_config_emit() {
       _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 "
       _active+="EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 "
-      _active+="MAX_COPY_BITRATE "
+      _active+="MAX_COPY_BITRATE LEVEL_VALUE CONSERVATIVE_VBV "
       _active+="SUB_EXPORT_EXTERNAL SKIP_IF_IDEAL "
       ;;
     streaming)
@@ -2465,7 +2606,7 @@ _create_config_emit() {
       _active+="CRF_VALUE PRESET_VALUE "
       _active+="X265_PARAMS_BASE HDR_TARGET_PIXFMT FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT SDR_FORCE_10BIT "
       _active+="AUDIO_CODEC_PREFERENCE "
-      _active+="SUB_MAX_TRACKS SUB_EXPORT_EXTERNAL "
+      _active+="SUB_MULTI_TRACK SUB_MAX_TRACKS SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT "
       ;;
     universal)
       _active+="TONEMAP_HDR_TO_SDR CRF_VALUE PRESET_VALUE "
@@ -2571,11 +2712,11 @@ HEADER
   _V X265_PARAMS_BASE quoted
   echo ""
   echo "# Level/IDR constraint for compatibility (e.g., 5.1). Leave empty to let encoder decide."
-  printf '#LEVEL_VALUE=5.1\n'
+  _V LEVEL_VALUE
   echo ""
   echo "# Conservative VBV guardrails (apply when LEVEL_VALUE is set)"
   echo "#   1 = apply cautious vbv-maxrate/bufsize  |  0 = don't apply additional limits"
-  printf '#CONSERVATIVE_VBV=1\n'
+  _V CONSERVATIVE_VBV
   echo ""
   echo "# VBV guardrails: per-level maxrate/bufsize caps (used when CONSERVATIVE_VBV=1)"
   echo "#   These enforce hardware-decode-safe bitrate ceilings per HEVC level."
@@ -2661,11 +2802,11 @@ HEADER
   echo "# Audio selection strategy"
   echo "# ========================="
   echo ""
-  echo "# Language preference list (comma-separated)"
-  printf '#AUDIO_LANG_PREF=eng\n'
+  echo "# Language preference list (comma-separated, empty = keep all languages)"
+  _V AUDIO_LANG_PREF quoted
   echo ""
   echo "# Codec preference order (leftmost best)"
-  printf '#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,alac,other\n'
+  _V AUDIO_CODEC_PREFERENCE quoted
   echo ""
   echo "# Force a specific audio track by index (0-based). Leave empty for auto."
   printf '#AUDIO_TRACK_OVERRIDE=\n'
@@ -2682,6 +2823,23 @@ HEADER
   echo "# Penalty applied to commentary / audio-description tracks (detected by title tag)."
   echo "# Set to 0 to disable commentary detection."
   printf '#AUDIO_SCORE_COMMENTARY_PENALTY=200\n'
+  echo ""
+
+  echo ""
+  echo "# ========================="
+  echo "# Multi-track audio (archival)"
+  echo "# ========================="
+  echo ""
+  echo "# Keep ALL matching audio tracks instead of selecting one."
+  echo "# All tracks are stream-copied from source (never transcoded)."
+  echo "# Filtering is subtractive: everything passes unless excluded by"
+  echo "# AUDIO_LANG_PREF or AUDIO_KEEP_COMMENTARY."
+  echo "#   1 = multi-track (filter + copy all)  |  0 = single-track (score + select one)"
+  _V AUDIO_MULTI_TRACK
+  echo ""
+  echo "# Include commentary / audio-description tracks in multi-track mode"
+  echo "#   1 = keep commentary  |  0 = drop commentary"
+  _V AUDIO_KEEP_COMMENTARY
   echo ""
 
   echo ""
@@ -2715,8 +2873,8 @@ HEADER
   echo "# Subtitles"
   echo "# ========================="
   echo ""
-  echo "# Language preference for subtitle track selection (comma-separated)"
-  printf '#SUB_LANG_PREF=eng\n'
+  echo "# Language preference for subtitle track selection (comma-separated, empty = keep all)"
+  _V SUB_LANG_PREF quoted
   echo ""
   echo "# Include forced subtitles (foreign dialogue, signs)"
   _V SUB_INCLUDE_FORCED
@@ -2777,6 +2935,25 @@ HEADER
   echo "# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)"
   printf '#SUB_OCR_LANG=eng\n'
   echo ""
+  echo "# Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT"
+  echo "#   1 = keep ASS/SSA styling (positioning, fonts, typesetting)  |  0 = convert to SRT"
+  echo "#   Only effective when output container is MKV; ignored for MP4/MOV."
+  echo "#   The animation profile enables this by default."
+  _V SUB_PRESERVE_TEXT_FORMAT
+  echo ""
+
+  echo ""
+  echo "# ========================="
+  echo "# Multi-track subtitles (archival)"
+  echo "# ========================="
+  echo ""
+  echo "# Keep ALL matching subtitle tracks instead of selecting one per type."
+  echo "# All tracks are stream-copied from source (no OCR, no format conversion)."
+  echo "# Filtering is subtractive: everything passes unless excluded by"
+  echo "# SUB_LANG_PREF, SUB_INCLUDE_FORCED/FULL/SDH, or capped by SUB_MAX_TRACKS."
+  echo "#   1 = multi-track (filter + copy all)  |  0 = single-track (pick one per type)"
+  _V SUB_MULTI_TRACK
+  echo ""
 
   echo ""
   echo "# ========================="
@@ -2792,6 +2969,9 @@ HEADER
   echo "# Strip non-essential metadata from output"
   _V STRIP_METADATA
   echo ""
+  echo "# Embed profile tagline in container comment metadata (on by default when a profile is active)"
+  _V PROFILE_COMMENT
+  echo ""
   echo "# Default language tag for streams missing language metadata"
   printf '#TAG_LANGUAGE_DEFAULT=und\n'
   echo ""
@@ -2805,7 +2985,7 @@ HEADER
   echo "# ========================="
   echo ""
   echo "# Write a SHA-256 checksum next to final output"
-  printf '#CHECKSUM=0\n'
+  _V CHECKSUM
   echo ""
   echo "# Dry-run: plan the steps without generating real outputs"
   printf '#DRY_RUN=0\n'
@@ -2982,13 +3162,23 @@ apply_profile_dv_archival() {
   # Video: copy without re-encoding
   VIDEO_CODEC="copy"
   VIDEO_COPY_IF_COMPLIANT=1
-  # Audio: lossless passthrough
+  # Audio: multi-track, copy all matching tracks from source.
+  # No scoring, no transcoding, no stereo fallback.
+  # Empty AUDIO_LANG_PREF = keep all languages (archival default).
+  AUDIO_MULTI_TRACK=1
+  AUDIO_KEEP_COMMENTARY=0
+  AUDIO_LANG_PREF=""
   AUDIO_LOSSLESS_PASSTHROUGH=1
   ADD_STEREO_IF_MULTICH=0
-  # Subs: keep all
+  AUDIO_CODEC_PREFERENCE="truehd,dts,flac,eac3,ac3,aac,alac,other"
+  # Subs: multi-track, keep all; no burn
+  # Empty SUB_LANG_PREF = keep all languages (archival default).
+  SUB_MULTI_TRACK=1
+  SUB_LANG_PREF=""
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
+  SUB_MAX_TRACKS=99
   SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
   # Chapters/metadata: keep everything
@@ -2998,8 +3188,11 @@ apply_profile_dv_archival() {
   REPORT_JSON=1
   # Skip-if-ideal: on
   SKIP_IF_IDEAL=1
+  # Reporting: JSON + SHA-256 checksum (archival integrity)
+  CHECKSUM=1
   # Hardware acceleration: not applicable (copy mode)
   HWACCEL_ENABLED=0
+  PROFILE_ALLOW_HW=0
 }
 
 apply_profile_hdr10_hq() {
@@ -3046,6 +3239,8 @@ apply_profile_atv_directplay_hq() {
   MAX_COPY_BITRATE="50000k"
   CRF_VALUE=17
   PRESET_VALUE="slower"
+  LEVEL_VALUE="5.1"
+  CONSERVATIVE_VBV=1
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
@@ -3159,18 +3354,34 @@ apply_profile_animation() {
   ADD_STEREO_IF_MULTICH=1
   STEREO_BITRATE="192k"
   AUDIO_CODEC_PREFERENCE="flac,truehd,eac3,ac3,aac,alac,other"
-  # Subs: keep all, never burn (preserve ASS styling)
+  # Subs: multi-track, keep all, never burn (preserve ASS styling + PGS bitmaps)
+  SUB_MULTI_TRACK=1
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
   SUB_MAX_TRACKS=6
   SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
+  SUB_PRESERVE_TEXT_FORMAT=1
   # Chapters/metadata: keep (OP/ED chapter markers)
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
   # Hardware acceleration: enabled for HEVC encode
   HWACCEL_ENABLED=1
+}
+
+# _profile_comment — return the profile tagline for container comment metadata.
+# Returns empty string for unrecognised/absent profiles (no comment written).
+_profile_comment() {
+  case "${PROFILE_NAME:-}" in
+    dv-archival)       echo "Preserved in digital amber." ;;
+    hdr10-hq)          echo "All the nits, none of the drama." ;;
+    atv-directplay-hq) echo "Shaped to please the most demanding rectangle in your living room." ;;
+    streaming)         echo "Lean, mean, streaming machine." ;;
+    animation)         echo "psy-rd turned down, sakuga turned up." ;;
+    universal)         echo "Lowest common denominator, highest common decency." ;;
+    *)                 echo "" ;;
+  esac
 }
 
 # Dispatcher
@@ -3258,7 +3469,7 @@ ${APP_NAME} v${VERSION} — ${CLI_NAME}
 $USAGE_SHORT
 
 Profiles (--profile NAME):
-  dv-archival          Preserve DV + HDR10 + lossless audio. MKV.
+  dv-archival          Preserve DV + HDR10 + all audio/subtitle tracks. MKV.
   hdr10-hq             Strip DV, keep HDR10. HEVC CRF 17. MKV.
   atv-directplay-hq    Apple TV Direct Play. MP4, DV P8.1, E-AC-3.
   streaming            HEVC streaming for Plex/Jellyfin. MP4.
@@ -3336,7 +3547,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --x265-params) X265_PARAMS_BASE="${2:-}"; shift 2 ;;
     -l|--level) LEVEL_VALUE="${2:-}"; shift 2 ;;
+    --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
+    --dv) DISABLE_DV=0; shift ;;
     --no-dv) DISABLE_DV=1; shift ;;
     --allow-dv-fallback) ALLOW_DV_FALLBACK=1; shift ;;
     --no-allow-dv-fallback) ALLOW_DV_FALLBACK=0; shift ;;
@@ -3379,6 +3592,8 @@ while [[ $# -gt 0 ]]; do
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
     --no-sub-export-external) SUB_EXPORT_EXTERNAL=0; shift ;;
+    --sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=1; shift ;;
+    --no-sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=0; shift ;;
 
     --skip-video) SKIP_VIDEO=1; shift ;;
     --skip-audio) SKIP_AUDIO=1; shift ;;
@@ -3396,6 +3611,8 @@ while [[ $# -gt 0 ]]; do
     --no-keep-chapters) KEEP_CHAPTERS=0; shift ;;
     --strip-metadata) STRIP_METADATA=1; shift ;;
     --no-strip-metadata) STRIP_METADATA=0; shift ;;
+    --profile-comment) PROFILE_COMMENT=1; shift ;;
+    --no-profile-comment) PROFILE_COMMENT=0; shift ;;
     --skip-if-ideal) SKIP_IF_IDEAL=1; shift ;;
     --no-skip-if-ideal) SKIP_IF_IDEAL=0; shift ;;
     --report-json) REPORT_JSON=1; shift ;;
@@ -3453,6 +3670,32 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       (( SUB_BURN_FORCED )) && \
         _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
           "Burning subtitles is irreversible and conflicts with archival goals."
+
+      # Multi-track audio conflicts: flags that force single-track behavior
+      if (( AUDIO_MULTI_TRACK )); then
+        [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]] && \
+          _warn_conflict "$PROFILE_NAME" "--audio-track $AUDIO_TRACK_OVERRIDE" \
+            "Multi-track mode keeps all matching tracks. --audio-track forces single-track selection."
+
+        [[ -n "${AUDIO_FORCE_CODEC:-}" ]] && \
+          _warn_conflict "$PROFILE_NAME" "--audio-force-codec $AUDIO_FORCE_CODEC" \
+            "Multi-track archival copies all audio. --audio-force-codec implies transcoding, which forces single-track."
+
+        (( ADD_STEREO_IF_MULTICH )) && \
+          _warn_conflict "$PROFILE_NAME" "--stereo-fallback" \
+            "Multi-track archival preserves all source tracks. Stereo fallback is redundant."
+      fi
+
+      # Multi-track subtitle conflicts: flags that force single-track behavior
+      if (( SUB_MULTI_TRACK )); then
+        (( SUB_BURN_FORCED )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
+            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
+
+        (( SUB_EXPORT_EXTERNAL )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
+            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
+      fi
       ;;
 
     hdr10-hq)
@@ -3521,20 +3764,36 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     animation)
-      # MP4 cannot carry styled ASS/SSA subtitles
+      # MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles
       [[ "$OUTPUT_EXT" == "mp4" ]] && \
         _warn_conflict "$PROFILE_NAME" "--output-ext mp4" \
-          "MP4 cannot carry styled ASS/SSA subtitles. MKV recommended for animation."
+          "MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
 
       # MOV has similar subtitle limitations
       [[ "$OUTPUT_EXT" == "mov" ]] && \
         _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV cannot carry styled ASS/SSA subtitles. MKV recommended for animation."
+          "MOV cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
 
       # Burning subs destroys ASS styling
       (( SUB_BURN_FORCED )) && \
         _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
           "Burning subs destroys ASS styling (typesetting, signs, karaoke). Soft subs recommended."
+
+      # Multi-track subtitle conflicts: flags that force single-track behavior
+      if (( SUB_MULTI_TRACK )); then
+        (( SUB_BURN_FORCED )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
+            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
+
+        (( SUB_EXPORT_EXTERNAL )) && \
+          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
+            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
+      fi
+
+      # Disabling format preservation converts ASS to plain-text SRT
+      (( ! SUB_PRESERVE_TEXT_FORMAT )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-sub-preserve-format" \
+          "ASS/SSA subtitles will be converted to SRT, losing positioning and styling."
 
       # H.264 8-bit causes banding in animation
       [[ "$VIDEO_CODEC" == "libx264" ]] && \
@@ -3651,6 +3910,8 @@ Effective config (post config-files + profile + CLI):
   AUDIO_LANG_PREF           = $AUDIO_LANG_PREF
   AUDIO_CODEC_PREFERENCE    = $AUDIO_CODEC_PREFERENCE
   AUDIO_TRACK_OVERRIDE      = ${AUDIO_TRACK_OVERRIDE:-<none>}
+  AUDIO_MULTI_TRACK         = $AUDIO_MULTI_TRACK
+  AUDIO_KEEP_COMMENTARY     = $AUDIO_KEEP_COMMENTARY
   AUDIO_SCORE_LANG_BONUS    = $AUDIO_SCORE_LANG_BONUS
   AUDIO_SCORE_CHANNEL_MULTIPLIER = $AUDIO_SCORE_CHANNEL_MULTIPLIER
   AUDIO_SCORE_SURROUND_BONUS = $AUDIO_SCORE_SURROUND_BONUS
@@ -3676,12 +3937,15 @@ Effective config (post config-files + profile + CLI):
   SUB_ENABLE_OCR            = $SUB_ENABLE_OCR
   SUB_OCR_TOOL              = $SUB_OCR_TOOL
   SUB_OCR_LANG              = $SUB_OCR_LANG
+  SUB_PRESERVE_TEXT_FORMAT  = $SUB_PRESERVE_TEXT_FORMAT
+  SUB_MULTI_TRACK          = $SUB_MULTI_TRACK
 
   [Output / Muxing]
   OUTPUT_EXT                = $OUTPUT_EXT
   INCLUDE_AUDIO_TITLES      = $INCLUDE_AUDIO_TITLES
   KEEP_CHAPTERS             = $KEEP_CHAPTERS
   STRIP_METADATA            = $STRIP_METADATA
+  PROFILE_COMMENT           = $PROFILE_COMMENT
 
   [Pipeline Control]
   SKIP_IF_IDEAL             = $SKIP_IF_IDEAL
@@ -3938,9 +4202,6 @@ _print_completed_steps(){
 # Globals read: FAILED, DRY_RUN, TMP_OUT, OUT, CHECKSUM, WORKDIR, DEBUG,
 #               KEEP_TEMP, KEEP_TEMP_ALWAYS, EXIT_CODE, FAIL_MSG, TERM_FD
 on_exit() {
-  # Close the raw-terminal FD if it was opened (Section 17)
-  [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
-
   # Clean up subtitle burn-in temp file (lives outside WORKDIR in /tmp)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
@@ -3992,6 +4253,9 @@ on_exit() {
       note "Build SUCCEEDED."
     fi
 
+    # Close the raw-terminal FD now that spinner output is complete (Section 17)
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+
     _print_completed_steps
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
@@ -4009,6 +4273,9 @@ on_exit() {
   else
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
+
+    # Close the raw-terminal FD (Section 17)
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     
     _print_completed_steps
     echo "See log: $LOGFILE"
@@ -4128,7 +4395,19 @@ check_skip_if_ideal() {
   fi
 
   # ---- Audio compliance (skip-if-ideal only) ----
-  if (( ideal )) && (( ! AUDIO_LOSSLESS_PASSTHROUGH )); then
+  if (( ideal )) && (( AUDIO_MULTI_TRACK )); then
+    # Multi-track: source is ideal only if every audio track survives the filter.
+    # If any track would be dropped (commentary, wrong language), we need to remux.
+    local _ideal_keep
+    _ideal_keep="$(_build_audio_keep_list)"
+    local _ideal_n_keep _ideal_n_total
+    # shellcheck disable=SC2086  # intentional word-splitting for count
+    _ideal_n_keep=$(echo $_ideal_keep | wc -w | tr -d ' ')
+    _ideal_n_total="$(_audio_stream_count)"
+    if [[ "$_ideal_n_keep" != "$_ideal_n_total" ]]; then
+      ideal=0; reason="audio filter would drop $(( _ideal_n_total - _ideal_n_keep )) of $_ideal_n_total tracks"
+    fi
+  elif (( ideal )) && (( ! AUDIO_LOSSLESS_PASSTHROUGH )); then
     local n_audio a_codec
     n_audio="$(_audio_stream_count)"
     if (( n_audio > 0 )); then
@@ -4141,7 +4420,69 @@ check_skip_if_ideal() {
     fi
   fi
 
+  # ---- Subtitle compliance (skip-if-ideal only) ----
+  if (( ideal )) && (( SUB_MULTI_TRACK )); then
+    # Multi-track: source is ideal only if every subtitle track survives the filter.
+    # If any track would be dropped (wrong language, excluded type, cap), we need to remux.
+    local _ideal_sub_keep
+    _ideal_sub_keep="$(_build_subtitle_keep_list)"
+    local _ideal_sub_n_keep _ideal_sub_n_total
+    # shellcheck disable=SC2086  # intentional word-splitting for count
+    _ideal_sub_n_keep=$(echo $_ideal_sub_keep | wc -w | tr -d ' ')
+    _ideal_sub_n_total="$(_sub_count)"
+    if [[ "$_ideal_sub_n_keep" != "$_ideal_sub_n_total" ]]; then
+      ideal=0; reason="subtitle filter would drop $(( _ideal_sub_n_total - _ideal_sub_n_keep )) of $_ideal_sub_n_total tracks"
+    fi
+  fi
+
   if (( ideal )); then
+    # ---- Build validated stream keep-lists for the remux ----
+    # Multi-track profiles reuse their existing filter functions (which already
+    # validated all streams above — ideal=1 means nothing was dropped).
+    # Single-track profiles keep all streams that are container-compatible:
+    # a safety gate that prevents incompatible codecs from reaching the mux
+    # without changing track-selection behavior.
+    SII_AUDIO_INDICES=()
+    SII_SUB_INDICES=()
+
+    if (( AUDIO_MULTI_TRACK )); then
+      local _sii_alist
+      _sii_alist="$(_build_audio_keep_list)"
+      # shellcheck disable=SC2206  # intentional word-splitting of index list
+      SII_AUDIO_INDICES=( $_sii_alist )
+    else
+      local _sii_a_n _sii_a_i _sii_a_codec
+      _sii_a_n="$(_audio_stream_count)"
+      for (( _sii_a_i=0; _sii_a_i<_sii_a_n; _sii_a_i++ )); do
+        _sii_a_codec="$(_audio_codec "$_sii_a_i")"
+        if _sii_audio_is_container_safe "$_sii_a_codec"; then
+          SII_AUDIO_INDICES+=("$_sii_a_i")
+        else
+          log "  [skip-if-ideal] Excluding audio #$_sii_a_i ($_sii_a_codec) — incompatible with $OUTPUT_EXT container"
+        fi
+      done
+    fi
+
+    if (( SUB_MULTI_TRACK )); then
+      local _sii_slist
+      _sii_slist="$(_build_subtitle_keep_list)"
+      # shellcheck disable=SC2206  # intentional word-splitting of index list
+      SII_SUB_INDICES=( $_sii_slist )
+    else
+      local _sii_s_n _sii_s_i _sii_s_codec _sii_s_info
+      _sii_s_n="$(_sub_count)"
+      for (( _sii_s_i=0; _sii_s_i<_sii_s_n; _sii_s_i++ )); do
+        _sii_s_info="$(_sub_stream_info "$_sii_s_i")"
+        IFS=$'\t' read -r _sii_s_codec _ _ _ <<< "$_sii_s_info"
+        _sii_s_codec="${_sii_s_codec,,}"
+        if [[ "$MUX_FORMAT" == "matroska" ]] || _is_text_sub_codec "$_sii_s_codec"; then
+          SII_SUB_INDICES+=("$_sii_s_i")
+        else
+          log "  [skip-if-ideal] Excluding subtitle #$_sii_s_i ($_sii_s_codec) — incompatible with $OUTPUT_EXT container"
+        fi
+      done
+    fi
+
     note "✅ Source already matches profile '${PROFILE_NAME:-}' requirements — skipping processing."
     report_add "skip_if_ideal" "true"
     report_add "skip_reason" "source already compliant"
@@ -4338,10 +4679,10 @@ apply_level_vbv() {
 #      metadata in frame side data (catches cases where container metadata
 #      is missing but RPU NAL units are present).
 #
-# Returns: 0 if DV detected, 1 otherwise.
+# Returns: 0 if DV detected, 1 if not detected, 2 if detection was skipped (DISABLE_DV=1).
 # Globals: DISABLE_DV (read), FFPROBE_FLAGS (read), SRC_ABS (read)
 detect_dv() {
-  (( DISABLE_DV )) && return 1
+  (( DISABLE_DV )) && return 2
   
   local probe_output
   probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || {
@@ -4361,6 +4702,21 @@ detect_dv() {
   
   printf '%s\n' "$probe_output" | grep -m1 -qiE 'DOVI|dolby' && return 0
   return 1
+}
+
+# _source_has_dv_metadata — Lightweight check for DV presence using the metadata cache.
+#
+# Unlike detect_dv, this does NOT honour DISABLE_DV and never probes frames.
+# It only checks the already-populated METADATA_CACHE for a DOVI configuration
+# record. Intended for informational messages when DV detection was skipped.
+#
+# Returns: 0 if DOVI configuration record found in cache, 1 otherwise.
+# Globals: METADATA_CACHE (read)
+_source_has_dv_metadata() {
+  [[ -n "${METADATA_CACHE:-}" ]] || return 1
+  _jq_cache -e '
+    [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]? |
+    select(.side_data_type == "DOVI configuration record")' >/dev/null 2>&1
 }
 
 # Populate DV source metadata from ffprobe side data and container records.
@@ -4592,6 +4948,13 @@ RPU_FINAL="$WORKDIR/rpu_final.bin"
 # based on whether DV injection is needed:
 #   DV path:     .hevc raw ES (dovi_tool requires raw elementary streams)
 #   Non-DV path: .mkv container (preserves timestamps for matroska final mux)
+#
+# NOTE: On non-DV paths and DV fallback paths, V_MIXED is reassigned to alias
+# V_BASE (or V_INJECTED) rather than copying the file.  This avoids multi-GB
+# file copies for no functional gain.  Downstream consumers (mux_final, DV
+# container verification, pre-wrap) only read V_MIXED — they never write to it.
+# Consequence for --keep-temp-always: the workdir will contain only video_base
+# (not a separate video_mixed) on non-DV runs.
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
 
@@ -4615,6 +4978,26 @@ _COPY_REJECT_REASON=""
 A_PRIMARY=""
 AAC_STEREO=""
 declare -i HAS_AUDIO=0
+
+# Multi-track audio: when AUDIO_MULTI_TRACK=1, audio streams are mapped
+# directly from source in mux_final (no intermediate extraction).
+# AUDIO_COPY_FROM_SOURCE is the runtime flag set by run_audio_pipeline_multi.
+declare -i AUDIO_COPY_FROM_SOURCE=0
+declare -a AUDIO_MT_INDICES=()    # 0-based audio-relative indices to keep
+declare -a AUDIO_MT_CODECS=()     # codec per kept track (e.g., truehd, ac3)
+declare -a AUDIO_MT_CHANNELS=()   # channel count per kept track
+declare -a AUDIO_MT_LANGS=()      # language tag per kept track
+declare -a AUDIO_MT_TITLES=()     # title tag per kept track (empty if unset)
+
+# Multi-track subtitles: when SUB_MULTI_TRACK=1, subtitle streams are mapped
+# directly from source in mux_final (no extraction, OCR, or conversion).
+# SUB_COPY_FROM_SOURCE is the runtime flag set by run_subtitle_pipeline_multi.
+declare -i SUB_COPY_FROM_SOURCE=0
+declare -a SUB_MT_INDICES=()      # 0-based subtitle-relative indices to keep
+declare -a SUB_MT_CODECS=()       # codec per kept track (e.g., subrip, hdmv_pgs_subtitle)
+declare -a SUB_MT_LANGS=()        # language tag per kept track
+declare -a SUB_MT_TITLES=()       # title tag per kept track (empty if unset)
+declare -a SUB_MT_TYPES=()        # "forced" | "full" | "sdh" per kept track
 
 # ===== Section 26: Video pipeline =============================================================
 
@@ -5067,7 +5450,7 @@ run_video_pipeline() {
 
   # Default: no DV, or DV disabled, or H.264 (no DV possible) → use base
   if (( IS_DV == 0 || DISABLE_DV == 1 )) || [[ "$VIDEO_CODEC" == "libx264" ]]; then
-    cp -f "$V_BASE" "$V_MIXED"
+    V_MIXED="$V_BASE"
     mark_done "Use base video (non-DV)"
     return 0
   fi
@@ -5132,7 +5515,7 @@ run_video_pipeline() {
   if (( ! rpu_extracted && ! DRY_RUN )); then
     warn "All DV RPU extraction methods failed; using base video."
     if (( ALLOW_DV_FALLBACK )); then
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV extract failed)"
       return 0
     fi
@@ -5211,7 +5594,7 @@ run_video_pipeline() {
     warn "RPU validation failed — RPU may be corrupt or incompatible."
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (RPU validation failed)"
       return 0
     fi
@@ -5233,7 +5616,7 @@ run_video_pipeline() {
     warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV inject failed)"
       return 0
     fi
@@ -5245,7 +5628,7 @@ run_video_pipeline() {
     warn "DV injection produced empty file."
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
-      cp -f "$V_BASE" "$V_MIXED"
+      V_MIXED="$V_BASE"
       mark_done "Use base video (DV inject empty)"
       return 0
     fi
@@ -5271,7 +5654,7 @@ run_video_pipeline() {
       warn "  doesn't exist in the re-encoded single-layer output."
       report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
       # Fall back to the unconverted injected file
-      cp -f "$V_INJECTED" "$V_MIXED"
+      V_MIXED="$V_INJECTED"
     fi
   fi
 
@@ -5572,13 +5955,13 @@ _audio_is_commentary(){
 
 # _audio_stream_info — Fetch all scoring-relevant fields for one audio stream
 # in a single jq call (replaces 5 separate jq forks per stream).
-# Returns: codec|channels|language|bit_rate|title  (pipe-delimited)
+# Returns: codec\tchannels\tlanguage\tbit_rate\ttitle  (tab-delimited)
 # Args: $1 — audio stream index (0-based, relative to audio streams)
 # Globals: METADATA_CACHE (read)
 _audio_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
-    \"\(.codec_name // \"unknown\")|\(.channels // 0)|\(.tags.language // \"\")|\(.bit_rate // \"0\")|\(.tags.title // \"\")\"" | head -n1 || echo "unknown|0||0|"
+    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\")\"" | head -n1 || printf 'unknown\t0\t\t0\t\n'
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -5590,10 +5973,13 @@ _audio_stream_info(){
 #      More channels = higher fidelity; 7.1 scores higher than 5.1.
 #   3. Surround bonus        — +AUDIO_SCORE_SURROUND_BONUS (30) if ≥ 6ch
 #      Discrete jump to prefer surround over stereo.
-#   4. Codec preference      — (120 − rank) from AUDIO_CODEC_PREFERENCE list
+#   4. Codec preference      — (10 − rank) × 10 from AUDIO_CODEC_PREFERENCE list
+#      10 points per rank position. Ensures codec ordering dominates bitrate.
 #      eac3 > ac3 > aac > alac > other by default.
-#   5. Bitrate (tie-break)   — br / 50000
+#   5. Bitrate (tie-break)   — br / 50000  (capped at 8)
 #      Small bonus for higher-bitrate tracks when all else is equal.
+#      Lossless codecs with unreported bitrate get a synthetic floor so they
+#      are not penalised for VBR / missing bit_rate metadata.
 #   6. Commentary penalty    — −AUDIO_SCORE_COMMENTARY_PENALTY (200) if title matches
 #      Demotes commentary/descriptive tracks so the main feature wins.
 #
@@ -5604,7 +5990,7 @@ _score_audio_stream(){
   # Single jq call fetches all fields at once
   local info codec lang ch br title rank score
   info="$(_audio_stream_info "$idx")"
-  IFS='|' read -r codec ch lang br title <<< "$info"
+  IFS=$'\t' read -r codec ch lang br title <<< "$info"
 
   codec="${codec,,}"
   lang="${lang,,}"
@@ -5624,13 +6010,24 @@ _score_audio_stream(){
   # Surround bonus (>=6ch)
   (( ch >= 6 )) && score=$(( score + AUDIO_SCORE_SURROUND_BONUS ))
   # Codec preference: better rank -> higher score
-  local inv=$(( 120 - rank ))
+  # 10 points per rank position ensures codec ordering dominates the bitrate
+  # tie-breaker (max ~8 pts) while staying below language/channel signals.
+  local inv=$(( (10 - rank) * 10 ))
   (( inv < 0 )) && inv=0
   score=$(( score + inv ))
 
-  # Bitrate small tie-breaker (scaled)
+  # Lossless codecs (TrueHD, DTS-HD MA, FLAC, etc.) often report bit_rate=0
+  # because they are VBR. Give them a synthetic floor so they are not penalised
+  # relative to lossy codecs that do report bitrate.
+  if (( br == 0 )) && audio_is_lossless "$codec"; then
+    br=1536000   # ~1.5 Mbps — conservative TrueHD 5.1 average
+  fi
+
+  # Bitrate small tie-breaker (scaled, capped so it cannot overpower codec rank)
   if (( br > 0 )); then
-    score=$(( score + (br / 50000) ))
+    local br_bonus=$(( br / 50000 ))
+    (( br_bonus > 8 )) && br_bonus=8
+    score=$(( score + br_bonus ))
   fi
 
   # Commentary/descriptive track penalty
@@ -5638,7 +6035,7 @@ _score_audio_stream(){
     score=$(( score - AUDIO_SCORE_COMMENTARY_PENALTY ))
   fi
 
-  printf "%s|%s|%s|%s|%s|%s\n" "$score" "$idx" "$codec" "$ch" "$lang" "${title:-}"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$score" "$idx" "$codec" "$ch" "$lang" "${title:-}"
 }
 
 # Select best audio track based on scoring algorithm
@@ -5670,7 +6067,7 @@ select_best_audio(){
     local line score
     line="$(_score_audio_stream "$i")"
     score_lines+=("$line")
-    score="${line%%|*}"
+    score="${line%%$'\t'*}"
     if [[ "$score" =~ ^-?[0-9]+$ ]] && (( score > best_score )); then
       best_score="$score"
       best_line="$line"
@@ -5680,13 +6077,13 @@ select_best_audio(){
   # Log score breakdown when multiple tracks exist (aids debugging)
   if (( n >= 2 )); then
     local best_idx
-    best_idx="${best_line#*|}"; best_idx="${best_idx%%|*}"
+    best_idx="${best_line#*$'\t'}"; best_idx="${best_idx%%$'\t'*}"
     local score_summary=""
     for (( i=0; i<n; i++ )); do
       local sl="${score_lines[$i]}"
       local s_score s_idx s_codec s_ch s_lang s_title
       # shellcheck disable=SC2034  # s_title completes the IFS destructure
-      IFS='|' read -r s_score s_idx s_codec s_ch s_lang s_title <<< "$sl"
+      IFS=$'\t' read -r s_score s_idx s_codec s_ch s_lang s_title <<< "$sl"
       local marker=""
       [[ "$s_idx" == "$best_idx" ]] && marker=" ★"
       score_summary+="#${s_idx}: ${s_codec} ${s_ch}ch [${s_lang}] = ${s_score}${marker}  "
@@ -5694,11 +6091,14 @@ select_best_audio(){
     log "• Score: ${score_summary% }"
   fi
 
-  # Extract index from best_line (format: score|idx|codec|ch|lang|title)
-  echo "${best_line#*|}" | cut -d'|' -f1
+  # Extract index from best_line (format: score\tidx\tcodec\tch\tlang\ttitle)
+  echo "${best_line#*$'\t'}" | cut -d$'\t' -f1
 }
 
 # Check if audio codec can be direct-play copied to MP4
+# SYNC: Codecs listed here can reach do_copy=1 in run_audio_pipeline.
+#   Any codec added here MUST have a valid ffmpeg muxer extension — if not,
+#   add a mapping in _audio_copy_ext().  See also: audio_is_lossless().
 audio_is_direct_play_copyable(){
   local codec="$1"
   case "$codec" in
@@ -5708,6 +6108,10 @@ audio_is_direct_play_copyable(){
 }
 
 # Check if audio codec is lossless (for AUDIO_LOSSLESS_PASSTHROUGH)
+# SYNC: Codecs listed here can reach do_copy=1 via the lossless passthrough
+#   path in run_audio_pipeline.  Any codec added here MUST have a valid ffmpeg
+#   muxer extension — if not, add a mapping in _audio_copy_ext().
+#   See also: audio_is_direct_play_copyable(), audio_lossless_muxable().
 audio_is_lossless(){
   local codec="$1"
   case "$codec" in
@@ -5732,6 +6136,44 @@ audio_lossless_muxable(){
       ;;
   esac
   return 1
+}
+
+# Check if an audio codec can be muxed into the current target container.
+# Used by the skip-if-ideal remux to gate streams that would fail the mux.
+# Conservative: rejects known-incompatible codecs, allows everything else
+# (ffmpeg will catch any edge cases during remux as a safe failure mode).
+# Args: $1 — codec name (lowercase)
+# Globals: MUX_FORMAT (read)
+_sii_audio_is_container_safe() {
+  local codec="$1"
+  [[ "$MUX_FORMAT" == "matroska" ]] && return 0
+  # MP4/MOV cannot mux TrueHD, DTS/DTS-HD MA, or raw PCM
+  case "$codec" in
+    truehd|dts|dca|pcm_*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Map ffprobe codec name to a file extension ffmpeg can mux when stream-copying.
+# ffmpeg auto-detects the muxer from the output filename extension. Some codecs
+# (notably TrueHD and ALAC) use an ffprobe name that doesn't match any registered
+# muxer extension, causing "Unable to choose an output format" errors during copy.
+# This function returns a safe extension for the intermediate copy file.
+# SYNC: Every codec that can reach do_copy=1 in run_audio_pipeline must produce
+#   a valid extension here.  When adding codecs to audio_is_lossless() or
+#   audio_is_direct_play_copyable(), verify the ffprobe name has a matching
+#   ffmpeg muxer — if not, add an explicit mapping below.
+# Args: $1 — codec name (lowercased, from ffprobe)
+# Stdout: file extension (without dot) suitable for ffmpeg -c copy output
+_audio_copy_ext(){
+  local codec="$1"
+  case "$codec" in
+    truehd)                       echo "thd" ;;   # ffmpeg truehd muxer recognizes .thd
+    alac)                         echo "m4a" ;;   # ffmpeg has no .alac muxer; .m4a (ipod) works
+    pcm_s16le|pcm_s24le|pcm_s32le) echo "wav" ;;  # raw PCM needs a container
+    dca)                          echo "dts" ;;    # ffprobe reports dca, muxer expects .dts
+    *)                            echo "$codec" ;; # aac, ac3, eac3, flac, dts, etc. work as-is
+  esac
 }
 
 # Determine target codec and bitrate for audio transcode based on channel count.
@@ -5768,6 +6210,169 @@ _codec_max_channels(){
   esac
 }
 
+# _build_audio_keep_list — Subtractive filter for multi-track audio mode.
+#
+# Enumerates all audio streams and applies keep-filters:
+#   1. AUDIO_LANG_PREF (if non-empty) — only keep tracks whose language matches
+#   2. AUDIO_KEEP_COMMENTARY — drop commentary/descriptive tracks when 0
+#
+# Unlike select_best_audio (which scores and picks ONE), this keeps ALL tracks
+# that pass the filters. No scoring, no ranking — just pass/fail.
+#
+# Output: space-separated list of 0-based audio-relative indices on stdout.
+#         Empty string if no tracks survive the filter.
+# Globals: AUDIO_LANG_PREF (read), AUDIO_KEEP_COMMENTARY (read),
+#          METADATA_CACHE (read), TAG_LANGUAGE_DEFAULT (read)
+_build_audio_keep_list(){
+  local n i
+  n="$(_audio_stream_count)"
+  (( n > 0 )) || { echo ""; return 0; }
+
+  local -a kept=()
+  local -a dropped_reasons=()
+
+  for (( i=0; i<n; i++ )); do
+    local info codec lang ch br title
+    info="$(_audio_stream_info "$i")"
+    IFS=$'\t' read -r codec ch lang br title <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    # Filter 1: language
+    if [[ -n "${AUDIO_LANG_PREF:-}" ]]; then
+      if ! _audio_lang_matches "$lang"; then
+        dropped_reasons+=("#$i: ${codec} ${ch}ch [$lang] — language not in AUDIO_LANG_PREF")
+        continue
+      fi
+    fi
+
+    # Filter 2: commentary
+    if (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$title"; then
+      dropped_reasons+=("#$i: ${codec} ${ch}ch [$lang] — commentary/descriptive")
+      continue
+    fi
+
+    kept+=("$i")
+  done
+
+  # Log filter results
+  if (( ${#dropped_reasons[@]} > 0 )); then
+    local reason
+    for reason in "${dropped_reasons[@]}"; do
+      log "  [multi-track] Dropped $reason"
+    done
+  fi
+
+  echo "${kept[*]}"
+}
+
+# run_audio_pipeline_multi — Multi-track audio: filter and defer to mux_final.
+#
+# Called instead of the single-track pipeline when AUDIO_MULTI_TRACK=1.
+# No ffmpeg calls, no intermediate files. Populates metadata arrays that
+# mux_final uses to map audio streams directly from source with -c:a copy.
+#
+# Sets: AUDIO_COPY_FROM_SOURCE, AUDIO_MT_INDICES, AUDIO_MT_CODECS,
+#       AUDIO_MT_CHANNELS, AUDIO_MT_LANGS, AUDIO_MT_TITLES,
+#       HAS_AUDIO, A_PRIMARY (cleared), AAC_STEREO (cleared)
+# Globals: AUDIO_MULTI_TRACK (read), METADATA_CACHE (read)
+run_audio_pipeline_multi(){
+  local keep_list
+  keep_list="$(_build_audio_keep_list)"
+
+  if [[ -z "$keep_list" ]]; then
+    note "[Audio] Multi-track filter: no audio tracks survived filtering."
+    HAS_AUDIO=0
+    return 0
+  fi
+
+  # Reset single-track vars (not used in multi-track mode)
+  A_PRIMARY=""
+  AAC_STEREO=""
+
+  # Populate parallel metadata arrays
+  AUDIO_MT_INDICES=()
+  AUDIO_MT_CODECS=()
+  AUDIO_MT_CHANNELS=()
+  AUDIO_MT_LANGS=()
+  AUDIO_MT_TITLES=()
+
+  local idx
+  for idx in $keep_list; do
+    local info codec ch lang br title
+    info="$(_audio_stream_info "$idx")"
+    IFS=$'\t' read -r codec ch lang br title <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    AUDIO_MT_INDICES+=("$idx")
+    AUDIO_MT_CODECS+=("$codec")
+    AUDIO_MT_CHANNELS+=("$ch")
+    AUDIO_MT_LANGS+=("$lang")
+    AUDIO_MT_TITLES+=("${title:-}")
+  done
+
+  AUDIO_COPY_FROM_SOURCE=1
+  HAS_AUDIO=1
+
+  # Log summary
+  local n_total n_kept n_dropped
+  n_total="$(_audio_stream_count)"
+  n_kept="${#AUDIO_MT_INDICES[@]}"
+  n_dropped=$(( n_total - n_kept ))
+
+  say "→ Scanning audio streams (multi-track mode):"
+  local i
+  for (( i=0; i<n_total; i++ )); do
+    local _ainfo _c _ch_i _l _br_i _t pretty marker=""
+    _ainfo="$(_audio_stream_info "$i")"
+    IFS=$'\t' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
+    _c="${_c,,}"
+    _l="${_l,,}"
+    [[ -z "$_l" ]] && _l="$TAG_LANGUAGE_DEFAULT"
+    [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
+
+    # Check if this index is in the keep list
+    local _is_kept=0
+    for idx in "${AUDIO_MT_INDICES[@]}"; do
+      (( idx == i )) && { _is_kept=1; break; }
+    done
+
+    pretty="#$i: $_c ${_ch_i}ch [$_l]"
+    [[ -n "$_t" ]] && pretty="$pretty — $_t"
+    _audio_is_commentary "$_t" && pretty="$pretty [commentary]"
+    (( _br_i > 0 )) && pretty="$pretty, $((_br_i/1000))kbps"
+
+    if (( _is_kept )); then
+      marker=" ✓"
+    else
+      marker=" ✗"
+    fi
+    say "  $pretty$marker"
+  done
+
+  note "[Audio] Multi-track: keeping ${n_kept} of ${n_total} tracks (${n_dropped} filtered out)"
+  report_add "audio_mode" "multi-track"
+  report_add "audio_multi_track_kept" "$n_kept"
+  report_add "audio_multi_track_dropped" "$n_dropped"
+
+  # Report kept tracks
+  local track_summary=""
+  for (( i=0; i<n_kept; i++ )); do
+    local _idx="${AUDIO_MT_INDICES[$i]}"
+    local _codec="${AUDIO_MT_CODECS[$i]}"
+    local _ch="${AUDIO_MT_CHANNELS[$i]}"
+    local _lang="${AUDIO_MT_LANGS[$i]}"
+    track_summary+="#${_idx}: ${_codec} ${_ch}ch [${_lang}]"
+    (( i < n_kept - 1 )) && track_summary+=", "
+  done
+  report_add "audio_kept_tracks" "$track_summary"
+
+  mark_done "Audio filter plan (multi-track, ${n_kept} tracks)"
+}
+
 # run_audio_pipeline — Select, copy or transcode the best audio track.
 #
 # Decision tree:
@@ -5792,6 +6397,21 @@ run_audio_pipeline(){
     return 0
   fi
 
+  # ── Multi-track mode: filter and defer to mux_final ──
+  # When AUDIO_MULTI_TRACK=1, skip single-track scoring entirely.
+  # Demote to single-track if the user set overrides that are incompatible.
+  if (( AUDIO_MULTI_TRACK )); then
+    if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
+      note "[Audio] AUDIO_MULTI_TRACK demoted to single-track: --audio-track override is set."
+    elif [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then
+      note "[Audio] AUDIO_MULTI_TRACK demoted to single-track: --audio-force-codec is set."
+    else
+      run_audio_pipeline_multi
+      return $?
+    fi
+  fi
+
+  # ── Single-track mode (score, select, copy/transcode) ──
   idx="$(select_best_audio)"
   [[ -n "$idx" ]] || { HAS_AUDIO=0; return 0; }
 
@@ -5806,7 +6426,7 @@ run_audio_pipeline(){
   for (( i=0; i<n; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty
     _ainfo="$(_audio_stream_info "$i")"
-    IFS='|' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
+    IFS=$'\t' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
     _c="${_c,,}"
     _l="${_l,,}"
     [[ -z "$_l" ]] && _l="$TAG_LANGUAGE_DEFAULT"
@@ -5822,7 +6442,7 @@ run_audio_pipeline(){
   note "[Audio] Selected track #$idx: $codec ${ch}ch [$lang]${title:+ — $title}${br:+, $((br/1000))kbps}"
   report_add "audio_source" "track #$idx: $codec ${ch}ch [$lang]"
 
-  A_PRIMARY="$WORKDIR/audio_primary.${codec}"
+  A_PRIMARY="$WORKDIR/audio_primary.$(_audio_copy_ext "$codec")"
   AAC_STEREO="$WORKDIR/audio_stereo.aac"
   HAS_AUDIO=1
 
@@ -6149,10 +6769,12 @@ _pick_direct_text_sub_relidx(){
   echo ""
 }
 
-# Prepare subtitle to SRT format (with OCR if needed)
+# Prepare subtitle for output (extract, convert, or OCR as needed).
+# When SUB_PRESERVE_TEXT_FORMAT=1 and the output container is MKV,
+# ASS/SSA subtitles are extracted in native format instead of converting to SRT.
 # Args: subtitle_stream_index
-# Returns: path to SRT file or empty string if failed
-_prepare_sub_to_srt(){
+# Returns: path to prepared subtitle file or empty string if failed
+_prepare_subtitle(){
   local idx="$1" codec srt sup vob_base
 
   if [[ ! -d "$WORKDIR" ]]; then
@@ -6163,9 +6785,25 @@ _prepare_sub_to_srt(){
   codec="$(_sp_sub_field "$idx" codec_name)"; codec="${codec,,}"
   srt="$WORKDIR/sub.${idx}.srt"
 
+  # Check if we should preserve native text format (ASS/SSA) for this run.
+  # Conditions: SUB_PRESERVE_TEXT_FORMAT=1, output container is MKV, and codec is ASS/SSA.
+  local _preserve_native=0
+  if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+    case "$codec" in
+      ass|ssa) _preserve_native=1 ;;
+    esac
+  fi
+
   if (( DRY_RUN )); then
-    printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run)\n" >"$srt" 2>/dev/null || true
-    echo "$srt"
+    if (( _preserve_native )); then
+      local dry_out="$WORKDIR/sub.${idx}.${codec}"
+      printf "[Script Info]\n; dry-run\n" >"$dry_out" 2>/dev/null || true
+      note "[Subs] DRY-RUN: would extract subtitle #${idx} as native ${codec} (preserving styling)"
+      echo "$dry_out"
+    else
+      printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run)\n" >"$srt" 2>/dev/null || true
+      echo "$srt"
+    fi
     return 0
   fi
 
@@ -6182,14 +6820,28 @@ _prepare_sub_to_srt(){
       ;;
       
     ass|ssa|webvtt|vtt)
-      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
-      local sub_pid=$!
-      spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
-      if wait "$sub_pid" 2>/dev/null; then
-        echo "$srt"
-        return 0
+      if (( _preserve_native )); then
+        # Extract in native format (copy, no conversion)
+        local native_out="$WORKDIR/sub.${idx}.${codec}"
+        ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$native_out" 2>"$WORKDIR/sub_${idx}.err" &
+        local sub_pid=$!
+        spinner "$sub_pid" "Extracting subtitle #${idx} (${codec} native copy)"
+        if wait "$sub_pid" 2>/dev/null; then
+          echo "$native_out"
+          return 0
+        fi
+        warn "Failed to extract native ${codec} subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
+      else
+        # Convert to SRT (legacy behavior)
+        ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
+        local sub_pid=$!
+        spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
+        if wait "$sub_pid" 2>/dev/null; then
+          echo "$srt"
+          return 0
+        fi
+        warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       fi
-      warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       ;;
       
     hdmv_pgs_subtitle|pgs)
@@ -6311,40 +6963,267 @@ A_PRIMARY_CHANNELS=""
 A_PRIMARY_CODEC=""
 A_STEREO_LANG=""
 
-# Process a prepared subtitle: either export as external SRT or embed.
-# Sets _SUB_EMBED_PATH to the SRT path if embedded, empty if exported externally.
-# Args: $1 — SRT file path, $2 — label (full|sdh)
+# Process a prepared subtitle: either export as external file or embed.
+# Sets _SUB_EMBED_PATH to the subtitle path if embedded, empty if exported externally.
+# Args: $1 — subtitle file path (may be .srt, .ass, .ssa), $2 — label (full|sdh)
 # Globals: SUB_EXPORT_EXTERNAL, OUT, OUTPUT_EXT, DRY_RUN, EXTERNAL_SRT_PATHS (modified)
 _SUB_EMBED_PATH=""
 _export_or_embed_sub(){
-  local srt_path="$1" label="$2"
+  local sub_path="$1" label="$2"
   _SUB_EMBED_PATH=""
+  # Derive extension from the prepared subtitle file
+  local sub_ext="${sub_path##*.}"
   if (( SUB_EXPORT_EXTERNAL )); then
-    local ext_srt="${OUT%."${OUTPUT_EXT}"}.${label}.srt"
+    local ext_sub="${OUT%."${OUTPUT_EXT}"}.${label}.${sub_ext}"
     if (( ! DRY_RUN )); then
-      cp -f "$srt_path" "$ext_srt" 2>/dev/null || true
+      cp -f "$sub_path" "$ext_sub" 2>/dev/null || true
     fi
-    EXTERNAL_SRT_PATHS+=("$ext_srt")
-    note "[Subs] Exported $label → external $ext_srt"
-    report_add "sub_${label}" "external srt"
+    EXTERNAL_SRT_PATHS+=("$ext_sub")
+    note "[Subs] Exported $label → external $ext_sub"
+    report_add "sub_${label}" "external ${sub_ext}"
   else
-    _SUB_EMBED_PATH="$srt_path"
-    note "[Subs] Prepared $label → $srt_path"
-    report_add "sub_${label}" "embedded"
+    _SUB_EMBED_PATH="$sub_path"
+    note "[Subs] Prepared $label → $sub_path"
+    report_add "sub_${label}" "embedded (${sub_ext})"
   fi
+}
+
+# _build_subtitle_keep_list — Subtractive filter for multi-track subtitle mode.
+#
+# Enumerates all subtitle streams and applies keep-filters:
+#   1. SUB_LANG_PREF (if non-empty) — only keep tracks whose language matches
+#   2. Type classification (forced/SDH/full) against SUB_INCLUDE_* flags
+#   3. Container compatibility — bitmap subs in non-MKV containers are skipped
+#
+# Unlike build_subtitle_plan (which picks ONE of each type), this keeps ALL
+# tracks that pass the filters. No scoring, no ranking — just pass/fail.
+# The result is capped by SUB_MAX_TRACKS.
+#
+# Output: space-separated list of 0-based subtitle-relative indices on stdout.
+#         Empty string if no tracks survive the filter.
+# Globals: SUB_LANG_PREF (read), SUB_INCLUDE_FORCED (read), SUB_INCLUDE_FULL (read),
+#          SUB_INCLUDE_SDH (read), SUB_MAX_TRACKS (read), MUX_FORMAT (read),
+#          METADATA_CACHE (read), TAG_LANGUAGE_DEFAULT (read)
+_build_subtitle_keep_list(){
+  local n i
+  n="$(_sub_count)"
+  (( n > 0 )) || { echo ""; return 0; }
+
+  local -a kept=()
+  local -a dropped_reasons=()
+
+  for (( i=0; i<n; i++ )); do
+    local info codec lang title forced
+    info="$(_sub_stream_info "$i")"
+    IFS=$'\t' read -r codec lang title forced <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    # Filter 1: language
+    if [[ -n "${SUB_LANG_PREF:-}" ]]; then
+      if [[ ",$SUB_LANG_PREF," != *",$lang,"* ]]; then
+        dropped_reasons+=("#$i: ${codec} [$lang] — language not in SUB_LANG_PREF")
+        continue
+      fi
+    fi
+
+    # Classify type (same priority as build_subtitle_plan: forced > SDH > full)
+    local stype=""
+    if (( forced )) || _is_forced_title "$title"; then
+      stype="forced"
+    elif _is_sdh_title "$title"; then
+      stype="sdh"
+    else
+      stype="full"
+    fi
+
+    # Filter 2: type inclusion flags
+    case "$stype" in
+      forced) if (( ! SUB_INCLUDE_FORCED )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — forced tracks excluded (SUB_INCLUDE_FORCED=0)")
+                continue
+              fi ;;
+      sdh)    if (( ! SUB_INCLUDE_SDH )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — SDH tracks excluded (SUB_INCLUDE_SDH=0)")
+                continue
+              fi ;;
+      full)   if (( ! SUB_INCLUDE_FULL )); then
+                dropped_reasons+=("#$i: ${codec} [$lang] — full tracks excluded (SUB_INCLUDE_FULL=0)")
+                continue
+              fi ;;
+    esac
+
+    # Filter 3: container compatibility — bitmap subs can't go into MP4/MOV
+    if [[ "$MUX_FORMAT" != "matroska" ]] && ! _is_text_sub_codec "$codec"; then
+      dropped_reasons+=("#$i: ${codec} [$lang] — bitmap subtitle incompatible with ${OUTPUT_EXT} container")
+      continue
+    fi
+
+    kept+=("$i")
+  done
+
+  # Log filter results
+  if (( ${#dropped_reasons[@]} > 0 )); then
+    local reason
+    for reason in "${dropped_reasons[@]}"; do
+      log "  [multi-track subs] Dropped $reason"
+    done
+  fi
+
+  # Apply SUB_MAX_TRACKS cap
+  if (( ${#kept[@]} > SUB_MAX_TRACKS )); then
+    log "  [multi-track subs] Capping from ${#kept[@]} to $SUB_MAX_TRACKS tracks (SUB_MAX_TRACKS)"
+    kept=("${kept[@]:0:$SUB_MAX_TRACKS}")
+  fi
+
+  echo "${kept[*]}"
+}
+
+# run_subtitle_pipeline_multi — Multi-track subtitles: filter and defer to mux_final.
+#
+# Called instead of the single-track pipeline when SUB_MULTI_TRACK=1.
+# No ffmpeg calls, no intermediate files, no OCR, no format conversion.
+# Populates metadata arrays that mux_final uses to map subtitle streams
+# directly from source with -c:s copy.
+#
+# Sets: SUB_COPY_FROM_SOURCE, SUB_MT_INDICES, SUB_MT_CODECS, SUB_MT_LANGS,
+#       SUB_MT_TITLES, SUB_MT_TYPES, SRT_FORCED (cleared), SRT_FULL (cleared),
+#       SRT_SDH (cleared), SRT_DIRECT_MAP (cleared), DIRECT_SUB_RELIDX (cleared)
+# Globals: SUB_MULTI_TRACK (read), METADATA_CACHE (read)
+run_subtitle_pipeline_multi(){
+  local keep_list
+  keep_list="$(_build_subtitle_keep_list)"
+
+  if [[ -z "$keep_list" ]]; then
+    note "[Subs] Multi-track filter: no subtitle tracks survived filtering."
+    SUB_COPY_FROM_SOURCE=0
+    return 0
+  fi
+
+  # Reset single-track vars (not used in multi-track mode)
+  SRT_FORCED=""
+  SRT_FULL=""
+  SRT_SDH=""
+  SRT_FORCED_BURN_PATH=""
+  SRT_DIRECT_MAP=0
+  DIRECT_SUB_RELIDX=""
+
+  # Populate parallel metadata arrays
+  SUB_MT_INDICES=()
+  SUB_MT_CODECS=()
+  SUB_MT_LANGS=()
+  SUB_MT_TITLES=()
+  SUB_MT_TYPES=()
+
+  local idx
+  for idx in $keep_list; do
+    local info codec lang title forced
+    info="$(_sub_stream_info "$idx")"
+    IFS=$'\t' read -r codec lang title forced <<< "$info"
+    codec="${codec,,}"
+    lang="${lang,,}"
+    [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
+
+    # Classify type (same priority as _build_subtitle_keep_list: forced > SDH > full)
+    local stype="full"
+    if (( forced )) || _is_forced_title "$title"; then
+      stype="forced"
+    elif _is_sdh_title "$title"; then
+      stype="sdh"
+    fi
+
+    SUB_MT_INDICES+=("$idx")
+    SUB_MT_CODECS+=("$codec")
+    SUB_MT_LANGS+=("$lang")
+    SUB_MT_TITLES+=("${title:-}")
+    SUB_MT_TYPES+=("$stype")
+  done
+
+  SUB_COPY_FROM_SOURCE=1
+
+  # Log summary
+  local n_total n_kept n_dropped
+  n_total="$(_sub_count)"
+  n_kept="${#SUB_MT_INDICES[@]}"
+  n_dropped=$(( n_total - n_kept ))
+
+  say "→ Scanning subtitle streams (multi-track mode):"
+  local i
+  for (( i=0; i<n_total; i++ )); do
+    local _sinfo _c _l _t _f pretty marker=""
+    _sinfo="$(_sub_stream_info "$i")"
+    IFS=$'\t' read -r _c _l _t _f <<< "$_sinfo"
+    _c="${_c,,}"
+    _l="${_l,,}"
+    [[ -z "$_l" ]] && _l="$TAG_LANGUAGE_DEFAULT"
+
+    # Check if this index is in the keep list
+    local _is_kept=0
+    for idx in "${SUB_MT_INDICES[@]}"; do
+      (( idx == i )) && { _is_kept=1; break; }
+    done
+
+    pretty="#$i: $_c [$_l]"
+    [[ -n "$_t" ]] && pretty="$pretty — $_t"
+    (( _f )) && pretty="$pretty (forced)"
+    _is_sdh_title "$_t" && pretty="$pretty [SDH]"
+
+    if (( _is_kept )); then
+      marker=" ✓"
+    else
+      marker=" ✗"
+    fi
+    say "  $pretty$marker"
+  done
+
+  note "[Subs] Multi-track: keeping ${n_kept} of ${n_total} tracks (${n_dropped} filtered out)"
+  report_add "sub_mode" "multi-track"
+  report_add "sub_multi_track_kept" "$n_kept"
+  report_add "sub_multi_track_dropped" "$n_dropped"
+
+  # Report kept tracks
+  local track_summary=""
+  for (( i=0; i<n_kept; i++ )); do
+    local _idx="${SUB_MT_INDICES[$i]}"
+    local _codec="${SUB_MT_CODECS[$i]}"
+    local _lang="${SUB_MT_LANGS[$i]}"
+    local _stype="${SUB_MT_TYPES[$i]}"
+    track_summary+="#${_idx}: ${_codec} [${_lang}] (${_stype})"
+    (( i < n_kept - 1 )) && track_summary+=", "
+  done
+  report_add "sub_kept_tracks" "$track_summary"
+
+  # Note when ASS/SSA tracks will be converted (SUB_PRESERVE_TEXT_FORMAT=0)
+  if (( ! SUB_PRESERVE_TEXT_FORMAT )); then
+    local _ass_convert_count=0
+    for (( i=0; i<n_kept; i++ )); do
+      case "${SUB_MT_CODECS[$i]}" in
+        ass|ssa) _ass_convert_count=$(( _ass_convert_count + 1 )) ;;
+      esac
+    done
+    if (( _ass_convert_count > 0 )); then
+      note "[Subs] Multi-track: ${_ass_convert_count} ASS/SSA track(s) will be converted to SRT (SUB_PRESERVE_TEXT_FORMAT=0)"
+      report_add "sub_ass_convert" "$_ass_convert_count"
+    fi
+  fi
+
+  mark_done "Subtitle filter plan (multi-track, ${n_kept} tracks)"
 }
 
 # build_subtitle_plan — Scan, categorize, and prepare subtitle tracks.
 #
 # Scans all subtitle streams for language/forced/SDH classification, selects
-# the best candidates (up to SUB_MAX_TRACKS), and prepares them as SRT files
-# via extraction, conversion, or OCR. Routes forced subtitles to either the
+# the best candidates (up to SUB_MAX_TRACKS), and prepares them as subtitle
+# files via extraction, conversion, or OCR. When SUB_PRESERVE_TEXT_FORMAT=1
+# and the output is MKV, ASS/SSA tracks are extracted in native format;
+# otherwise they are converted to SRT. Routes forced subtitles to either the
 # burn-in path (SRT_FORCED_BURN_PATH) or embed path (SRT_FORCED) based on
 # SUB_BURN_FORCED. Non-forced subtitles are either embedded or exported as
-# external .srt files based on SUB_EXPORT_EXTERNAL.
+# external files based on SUB_EXPORT_EXTERNAL.
 #
-# Falls back to direct-mapping a text subtitle from source if no SRTs were
-# prepared and at least one SUB_INCLUDE_* flag is enabled.
+# Falls back to direct-mapping a text subtitle from source if no prepared
+# subtitles were produced and at least one SUB_INCLUDE_* flag is enabled.
 #
 # Sets: SRT_FORCED, SRT_FULL, SRT_SDH, SRT_FORCED_BURN_PATH, SRT_DIRECT_MAP,
 #       DIRECT_SUB_RELIDX, EXTERNAL_SRT_PATHS[], and associated *_LANG/*_TITLE vars
@@ -6362,6 +7241,24 @@ build_subtitle_plan(){
     SRT_DIRECT_MAP=0
     return 0
   fi
+
+  # ── Multi-track mode: filter and defer to mux_final ──
+  # When SUB_MULTI_TRACK=1, skip single-track selection entirely.
+  # Demote to single-track if the user set overrides that are incompatible.
+  if (( SUB_MULTI_TRACK )); then
+    if (( SUB_BURN_FORCED )); then
+      note "[Subs] SUB_MULTI_TRACK demoted to single-track: --sub-burn-forced is set."
+    elif (( SUB_EXPORT_EXTERNAL )); then
+      note "[Subs] Multi-track mode: --sub-export-external ignored (all subs embedded via stream-copy)."
+      run_subtitle_pipeline_multi
+      return $?
+    else
+      run_subtitle_pipeline_multi
+      return $?
+    fi
+  fi
+
+  # ── Single-track mode (existing behavior) ──
 
   say "→ Scanning subtitle streams:"
   local i
@@ -6410,7 +7307,7 @@ build_subtitle_plan(){
   # Prepare selected subtitles (up to SUB_MAX_TRACKS)
   local p pick_count=0
   if [[ -n "$forced_idx" ]]; then
-    p="$(_prepare_sub_to_srt "$forced_idx")"
+    p="$(_prepare_subtitle "$forced_idx")"
     if [[ -n "$p" ]]; then
       SRT_FORCED_LANG="$(_sp_sub_lang "$forced_idx")"
       SRT_FORCED_TITLE="Forced"
@@ -6428,7 +7325,7 @@ build_subtitle_plan(){
     fi
   fi
   if [[ -n "$full_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
-    p="$(_prepare_sub_to_srt "$full_idx")"
+    p="$(_prepare_subtitle "$full_idx")"
     if [[ -n "$p" ]]; then
       SRT_FULL_LANG="$(_sp_sub_lang "$full_idx")"
       local _full_src_title
@@ -6442,7 +7339,7 @@ build_subtitle_plan(){
     fi
   fi
   if [[ -n "$sdh_idx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
-    p="$(_prepare_sub_to_srt "$sdh_idx")"
+    p="$(_prepare_subtitle "$sdh_idx")"
     if [[ -n "$p" ]]; then
       SRT_SDH_LANG="$(_sp_sub_lang "$sdh_idx")"
       SRT_SDH_TITLE="SDH"
@@ -6516,6 +7413,7 @@ mux_final() {
   local s_forced_idx="" s_full_idx="" s_sdh_idx=""
   local forced_present=0 full_present=0 sdh_present=0
   local src_sub_idx=""
+  local _src_input_idx=""   # shared index when source is used as ffmpeg input
 
   # Validate and add video stream
   if (( SKIP_VIDEO )); then
@@ -6526,6 +7424,7 @@ mux_final() {
     # Map video directly from source to preserve container-level metadata
     # (DOVI configuration record, displaymatrix, etc.)
     ff_in+=( -i "$SRC_ABS" )
+    _src_input_idx=$next_idx
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
   elif [[ -n "${V_DV_MP4:-}" && -s "$V_DV_MP4" ]]; then
@@ -6547,21 +7446,43 @@ mux_final() {
     die 42 "No encoded video stream found."
   fi
 
-  # Add audio streams
-  if (( ! SKIP_AUDIO )) && (( HAS_AUDIO )) && [[ -n "${A_PRIMARY:-}" && -s "$A_PRIMARY" ]]; then
-    ff_in+=( -i "$A_PRIMARY" )
-    a_primary_idx=$next_idx
-    next_idx=$(( next_idx + 1 ))
-  fi
-  
-  if (( ! SKIP_AUDIO )) && [[ -n "${AAC_STEREO:-}" && -s "$AAC_STEREO" ]]; then
-    ff_in+=( -i "$AAC_STEREO" )
-    a_stereo_idx=$next_idx
-    next_idx=$(( next_idx + 1 ))
+  # Add audio streams — multi-track or single-track
+  if (( ! SKIP_AUDIO )) && (( HAS_AUDIO )) && (( AUDIO_COPY_FROM_SOURCE )); then
+    # Multi-track: map audio streams directly from source.
+    # Reuse the source input if VIDEO_COPY_FROM_SOURCE already added it.
+    if [[ -z "$_src_input_idx" ]]; then
+      ff_in+=( -i "$SRC_ABS" )
+      _src_input_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
+    # Mapping and tagging handled below in the multi-track section.
+  else
+    # Single-track: use extracted/transcoded intermediate files
+    if (( ! SKIP_AUDIO )) && (( HAS_AUDIO )) && [[ -n "${A_PRIMARY:-}" && -s "$A_PRIMARY" ]]; then
+      ff_in+=( -i "$A_PRIMARY" )
+      a_primary_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
+    
+    if (( ! SKIP_AUDIO )) && [[ -n "${AAC_STEREO:-}" && -s "$AAC_STEREO" ]]; then
+      ff_in+=( -i "$AAC_STEREO" )
+      a_stereo_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
   fi
 
-  # Add subtitle streams
-  if (( ! SKIP_SUBS )); then
+  # Add subtitle streams — multi-track or single-track
+  if (( ! SKIP_SUBS )) && (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    # Multi-track: map subtitle streams directly from source.
+    # Reuse the source input if VIDEO_COPY_FROM_SOURCE or AUDIO_COPY_FROM_SOURCE already added it.
+    if [[ -z "$_src_input_idx" ]]; then
+      ff_in+=( -i "$SRC_ABS" )
+      _src_input_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
+    # Mapping and tagging handled below in the multi-track subtitle section.
+  elif (( ! SKIP_SUBS )); then
+    # Single-track: use prepared subtitle files
     if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
       ff_in+=( -i "$SRT_FORCED" )
       s_forced_idx=$next_idx
@@ -6584,11 +7505,14 @@ mux_final() {
     fi
   fi
 
-  # Add source for direct subtitle mapping if needed
-  if (( ! SKIP_SUBS )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
-    ff_in+=( -i "$SRC_ABS" )
-    src_sub_idx=$next_idx
-    next_idx=$(( next_idx + 1 ))
+  # Add source for direct subtitle mapping if needed (single-track fallback only)
+  if (( ! SKIP_SUBS )) && (( ! SUB_COPY_FROM_SOURCE )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
+    if [[ -z "$_src_input_idx" ]]; then
+      ff_in+=( -i "$SRC_ABS" )
+      _src_input_idx=$next_idx
+      next_idx=$(( next_idx + 1 ))
+    fi
+    src_sub_idx="$_src_input_idx"
   fi
 
   # Build stream mapping
@@ -6596,76 +7520,202 @@ mux_final() {
   # selects only the video stream, excluding audio/subs/data tracks.
   ff_map+=( -map "$vid_idx":v:0 )
 
-  [[ -n "$a_primary_idx" ]] && ff_map+=( -map "$a_primary_idx":a:0 )
-  [[ -n "$a_stereo_idx"  ]] && ff_map+=( -map "$a_stereo_idx":a:0 )
-
-  (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
-  (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
-  (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
-
-  if [[ -n "$src_sub_idx" ]]; then
-    ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
+  # Audio mapping: multi-track from source or single-track from files
+  if (( AUDIO_COPY_FROM_SOURCE )) && [[ -n "$_src_input_idx" ]]; then
+    local _mt_i
+    for _mt_i in "${AUDIO_MT_INDICES[@]}"; do
+      ff_map+=( -map "${_src_input_idx}:a:${_mt_i}" )
+    done
+  else
+    [[ -n "$a_primary_idx" ]] && ff_map+=( -map "$a_primary_idx":a:0 )
+    [[ -n "$a_stereo_idx"  ]] && ff_map+=( -map "$a_stereo_idx":a:0 )
   fi
 
-  # Codec settings: copy everything, convert subs to appropriate codec
-  ff_codec+=( -c copy )
+  # Subtitle mapping: multi-track from source or single-track from files
+  if (( SUB_COPY_FROM_SOURCE )) && [[ -n "$_src_input_idx" ]] && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    local _mt_s
+    for _mt_s in "${SUB_MT_INDICES[@]}"; do
+      ff_map+=( -map "${_src_input_idx}:s:${_mt_s}" )
+    done
+  else
+    (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
+    (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
+    (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
 
-  if (( forced_present || full_present || sdh_present )) || [[ -n "$src_sub_idx" ]]; then
-    if [[ "$MUX_FORMAT" == "matroska" ]]; then
-      # MKV can handle SRT natively (subrip)
-      ff_codec+=( -c:s srt )
-    else
-      # MP4/MOV: must use mov_text
-      ff_codec+=( -c:s mov_text )
+    if [[ -n "$src_sub_idx" ]]; then
+      ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
     fi
   fi
 
-  # Subtitle metadata: language, title, and disposition tagging.
+  # Codec settings: copy everything; subtitle codecs are assigned per-stream below
+  ff_codec+=( -c copy )
+
+  # _sub_codec_for_file — Determine the ffmpeg subtitle codec flag for a prepared file.
+  # ASS/SSA files in MKV are stream-copied to preserve styling; all others convert.
+  # Args: $1 — path to prepared subtitle file
+  # Stdout: codec name suitable for -c:s:N (e.g., "copy", "srt", "mov_text")
+  _sub_codec_for_file(){
+    local ext="${1##*.}"
+    if [[ "$MUX_FORMAT" == "matroska" ]]; then
+      case "$ext" in
+        ass|ssa) echo "copy" ;;   # preserve native ASS/SSA in MKV
+        *)       echo "srt" ;;
+      esac
+    else
+      echo "mov_text"
+    fi
+  }
+
+  # Subtitle metadata: language, title, disposition, and per-stream codec tagging.
   # Output subtitle index tracks which output stream we're tagging.
   local -i out_s_idx=0
-  if (( forced_present )); then
-    [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
-    [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" forced )
-    out_s_idx=$(( out_s_idx + 1 ))
-  fi
-  if (( full_present )); then
-    [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
-    [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
-    out_s_idx=$(( out_s_idx + 1 ))
-  fi
-  if (( sdh_present )); then
-    [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
-    [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
-    ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
-    out_s_idx=$(( out_s_idx + 1 ))
+  if (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_INDICES[@]} > 0 )); then
+    # Multi-track: tag each kept subtitle stream copied from source
+    local _mt_si
+    for (( _mt_si=0; _mt_si<${#SUB_MT_INDICES[@]}; _mt_si++ )); do
+      local _mt_slang="${SUB_MT_LANGS[$_mt_si]}"
+      local _mt_stitle="${SUB_MT_TITLES[$_mt_si]}"
+      local _mt_stype="${SUB_MT_TYPES[$_mt_si]}"
+
+      # Codec: copy by default; convert ASS/SSA when SUB_PRESERVE_TEXT_FORMAT=0
+      # or when the container can't carry ASS (MP4/MOV).
+      local _mt_scodec="${SUB_MT_CODECS[$_mt_si]}"
+      case "$_mt_scodec" in
+        ass|ssa)
+          if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+            ff_codec+=( "-c:s:${out_s_idx}" copy )
+          elif [[ "$MUX_FORMAT" == "matroska" ]]; then
+            ff_codec+=( "-c:s:${out_s_idx}" srt )
+          else
+            ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+          fi
+          ;;
+        *)
+          ff_codec+=( "-c:s:${out_s_idx}" copy )
+          ;;
+      esac
+
+      # Language
+      [[ -n "$_mt_slang" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$_mt_slang" )
+
+      # Title: preserve source title if present, otherwise use type label
+      if [[ -n "$_mt_stitle" ]]; then
+        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_stitle" )
+      else
+        # Capitalize first letter: forced→Forced, full→Full, sdh→SDH
+        local _mt_type_label
+        case "$_mt_stype" in
+          sdh) _mt_type_label="SDH" ;;
+          *)   _mt_type_label="${_mt_stype^}" ;;
+        esac
+        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_type_label" )
+      fi
+
+      # Disposition from type
+      case "$_mt_stype" in
+        forced) ff_codec+=( "-disposition:s:${out_s_idx}" forced ) ;;
+        sdh)    ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired ) ;;
+        *)      ff_codec+=( "-disposition:s:${out_s_idx}" 0 ) ;;
+      esac
+
+      out_s_idx=$(( out_s_idx + 1 ))
+    done
+  else
+    # Single-track: hardcoded forced/full/sdh slots
+    if (( forced_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FORCED")" )
+      [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
+      [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" forced )
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
+    if (( full_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FULL")" )
+      [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
+      [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
+    if (( sdh_present )); then
+      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_SDH")" )
+      [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
+      [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
+      ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
+    if [[ -n "$src_sub_idx" ]]; then
+      # Direct-mapped subtitle from source: check if we should preserve native format
+      local _dm_codec
+      _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
+      if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+        case "$_dm_codec" in
+          ass|ssa) ff_codec+=( "-c:s:${out_s_idx}" copy ) ;;
+          *)       ff_codec+=( "-c:s:${out_s_idx}" srt ) ;;
+        esac
+      elif [[ "$MUX_FORMAT" == "matroska" ]]; then
+        ff_codec+=( "-c:s:${out_s_idx}" srt )
+      else
+        ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+      fi
+      out_s_idx=$(( out_s_idx + 1 ))
+    fi
   fi
 
   # Audio metadata: language, title, and disposition tagging.
   # Output audio index tracks which output stream we're tagging.
   local -i out_a_idx=0
-  if [[ -n "$a_primary_idx" ]]; then
-    [[ -n "${A_PRIMARY_LANG:-}" ]]  && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_PRIMARY_LANG" )
-    if (( INCLUDE_AUDIO_TITLES )) && [[ -n "${A_PRIMARY_CODEC:-}" ]]; then
-      local _desc_title
-      _desc_title="$(_audio_descriptive_title "$A_PRIMARY_CODEC" "${A_PRIMARY_CHANNELS:-0}")"
-      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_desc_title" )
-    elif [[ -n "${A_PRIMARY_TITLE:-}" ]]; then
-      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$A_PRIMARY_TITLE" )
+  if (( AUDIO_COPY_FROM_SOURCE )) && (( ${#AUDIO_MT_INDICES[@]} > 0 )); then
+    # Multi-track: tag each kept audio stream copied from source
+    local _mt_i
+    for (( _mt_i=0; _mt_i<${#AUDIO_MT_INDICES[@]}; _mt_i++ )); do
+      local _mt_lang="${AUDIO_MT_LANGS[$_mt_i]}"
+      local _mt_codec="${AUDIO_MT_CODECS[$_mt_i]}"
+      local _mt_ch="${AUDIO_MT_CHANNELS[$_mt_i]}"
+      local _mt_title="${AUDIO_MT_TITLES[$_mt_i]}"
+
+      [[ -n "$_mt_lang" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$_mt_lang" )
+
+      if (( INCLUDE_AUDIO_TITLES )); then
+        local _mt_desc
+        _mt_desc="$(_audio_descriptive_title "$_mt_codec" "$_mt_ch")"
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_mt_desc" )
+      elif [[ -n "$_mt_title" ]]; then
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_mt_title" )
+      fi
+
+      # First track gets default disposition; rest get none
+      if (( out_a_idx == 0 )); then
+        ff_codec+=( "-disposition:a:${out_a_idx}" default )
+      else
+        ff_codec+=( "-disposition:a:${out_a_idx}" 0 )
+      fi
+
+      out_a_idx=$(( out_a_idx + 1 ))
+    done
+  else
+    # Single-track: primary + optional stereo fallback
+    if [[ -n "$a_primary_idx" ]]; then
+      [[ -n "${A_PRIMARY_LANG:-}" ]]  && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_PRIMARY_LANG" )
+      if (( INCLUDE_AUDIO_TITLES )) && [[ -n "${A_PRIMARY_CODEC:-}" ]]; then
+        local _desc_title
+        _desc_title="$(_audio_descriptive_title "$A_PRIMARY_CODEC" "${A_PRIMARY_CHANNELS:-0}")"
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_desc_title" )
+      elif [[ -n "${A_PRIMARY_TITLE:-}" ]]; then
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$A_PRIMARY_TITLE" )
+      fi
+      ff_codec+=( "-disposition:a:${out_a_idx}" default )
+      out_a_idx=$(( out_a_idx + 1 ))
     fi
-    ff_codec+=( "-disposition:a:${out_a_idx}" default )
-    out_a_idx=$(( out_a_idx + 1 ))
-  fi
-  if [[ -n "$a_stereo_idx" ]]; then
-    [[ -n "${A_STEREO_LANG:-}" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_STEREO_LANG" )
-    if (( INCLUDE_AUDIO_TITLES )); then
-      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$(_audio_descriptive_title aac 2)" )
-    else
-      ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=Stereo" )
+    if [[ -n "$a_stereo_idx" ]]; then
+      [[ -n "${A_STEREO_LANG:-}" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_STEREO_LANG" )
+      if (( INCLUDE_AUDIO_TITLES )); then
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$(_audio_descriptive_title aac 2)" )
+      else
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=Stereo" )
+      fi
+      ff_codec+=( "-disposition:a:${out_a_idx}" 0 )
+      out_a_idx=$(( out_a_idx + 1 ))
     fi
-    ff_codec+=( "-disposition:a:${out_a_idx}" 0 )
-    out_a_idx=$(( out_a_idx + 1 ))
   fi
 
   # MP4/MOV optimization
@@ -6701,6 +7751,19 @@ mux_final() {
     report_add "metadata" "stripped"
   else
     report_add "metadata" "preserved"
+  fi
+
+  # Profile comment metadata (tagline identifying the encode profile).
+  # Applied after -map_metadata so it survives STRIP_METADATA — this is our
+  # metadata, not inherited source junk.
+  if (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]]; then
+    local _pcomment
+    _pcomment="$(_profile_comment)"
+    if [[ -n "$_pcomment" ]]; then
+      ff_codec+=( -metadata "comment=$_pcomment" )
+      note "Metadata comment: $_pcomment"
+      report_add "comment" "$_pcomment"
+    fi
   fi
 
   # Execute final mux
@@ -6750,26 +7813,77 @@ main() {
       # Source is ideal — write report and exit clean
       write_json_report
       if (( ! DRY_RUN )); then
-        if (( INCLUDE_AUDIO_TITLES )) && (( $(_audio_stream_count) > 0 )); then
-          # Stamp descriptive audio titles via instant -c copy remux
-          local -a _sii_meta=( "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -c copy )
-          local _sii_n _sii_i _sii_codec _sii_ch _sii_title
-          _sii_n="$(_audio_stream_count)"
-          for (( _sii_i=0; _sii_i<_sii_n; _sii_i++ )); do
-            _sii_codec="$(_audio_codec "$_sii_i")"
-            _sii_ch="$(_audio_channels "$_sii_i")"
-            _sii_title="$(_audio_descriptive_title "$_sii_codec" "$_sii_ch")"
-            _sii_meta+=( "-metadata:s:a:${_sii_i}" "title=$_sii_title" )
+        # Determine if a remux is needed (metadata stamping or stream filtering)
+        local _sii_needs_remux=0
+        (( INCLUDE_AUDIO_TITLES && ${#SII_AUDIO_INDICES[@]} > 0 )) && _sii_needs_remux=1
+        (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]] && _sii_needs_remux=1
+        # Stream filtering: if keep-lists exclude any streams, we must remux
+        local _sii_total_a _sii_total_s
+        _sii_total_a="$(_audio_stream_count)"
+        _sii_total_s="$(_sub_count)"
+        (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) && _sii_needs_remux=1
+        (( ${#SII_SUB_INDICES[@]} < _sii_total_s )) && _sii_needs_remux=1
+
+        if (( _sii_needs_remux )); then
+          # Build explicit per-stream maps from validated keep-lists
+          local -a _sii_meta=( "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" )
+
+          # Video: always map
+          _sii_meta+=( -map 0:v:0 )
+
+          # Audio: map only validated streams
+          local _sii_a_idx
+          for _sii_a_idx in "${SII_AUDIO_INDICES[@]}"; do
+            _sii_meta+=( -map "0:a:${_sii_a_idx}" )
           done
+
+          # Subtitles: map only validated streams
+          local _sii_s_idx
+          for _sii_s_idx in "${SII_SUB_INDICES[@]}"; do
+            _sii_meta+=( -map "0:s:${_sii_s_idx}" )
+          done
+
+          _sii_meta+=( -c copy )
+
+          # Audio titles: use output indices (sequential) not source indices
+          if (( INCLUDE_AUDIO_TITLES )) && (( ${#SII_AUDIO_INDICES[@]} > 0 )); then
+            local _sii_out_a=0 _sii_src_a _sii_codec _sii_ch _sii_title
+            for _sii_src_a in "${SII_AUDIO_INDICES[@]}"; do
+              _sii_codec="$(_audio_codec "$_sii_src_a")"
+              _sii_ch="$(_audio_channels "$_sii_src_a")"
+              _sii_title="$(_audio_descriptive_title "$_sii_codec" "$_sii_ch")"
+              _sii_meta+=( "-metadata:s:a:${_sii_out_a}" "title=$_sii_title" )
+              _sii_out_a=$(( _sii_out_a + 1 ))
+            done
+          fi
+
+          # Profile comment
+          if (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]]; then
+            local _sii_comment
+            _sii_comment="$(_profile_comment)"
+            [[ -n "$_sii_comment" ]] && _sii_meta+=( -metadata "comment=$_sii_comment" )
+          fi
           [[ "$MUX_FORMAT" != "matroska" ]] && _sii_meta+=( -movflags +faststart )
           _sii_meta+=( -f "$MUX_FORMAT" "$TMP_OUT" )
-          ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" \
-            || die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
-          note "Applied audio titles via copy-remux (already ideal)."
+          ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" &
+          local _sii_pid=$!
+          spinner "$_sii_pid" "Applying metadata (copy-remux)"
+          if ! wait "$_sii_pid" 2>/dev/null; then
+            die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
+          fi
+
+          # Log stream counts if filtering occurred
+          if (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) || (( ${#SII_SUB_INDICES[@]} < _sii_total_s )); then
+            note "Streams: ${#SII_AUDIO_INDICES[@]}/${_sii_total_a} audio, ${#SII_SUB_INDICES[@]}/${_sii_total_s} subtitle (container-filtered)."
+          fi
+          note "Applied metadata via copy-remux (already ideal)."
         else
-          # No titles needed — hardlink (instant on same FS); fall back to copy
+          # No titles, no comment, no filtering — hardlink (instant on same FS); fall back to copy
           if ! ln -f "$SRC_ABS" "$TMP_OUT" 2>/dev/null; then
-            cp -f "$SRC_ABS" "$TMP_OUT"
+            cp -f "$SRC_ABS" "$TMP_OUT" &
+            local _sii_cp_pid=$!
+            spinner "$_sii_cp_pid" "Copying source to output"
+            wait "$_sii_cp_pid" 2>/dev/null
           fi
           note "Linked/copied source to output (already ideal)."
         fi
@@ -6781,7 +7895,12 @@ main() {
   fi
   
   # Detect Dolby Vision
-  if detect_dv; then
+  # detect_dv returns: 0=detected, 1=not found, 2=skipped (DISABLE_DV).
+  # Use || to capture non-zero returns without triggering errexit.
+  local _dv_rc=0
+  detect_dv || _dv_rc=$?
+
+  if (( _dv_rc == 0 )); then
     IS_DV=1
     note "Dolby Vision detected — extraction/injection will be attempted in the video pipeline."
     report_add "dv_detected" "true"
@@ -6795,12 +7914,24 @@ main() {
     if (( DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "hdr10-hq" ]]; then
       _check_hdr10_static_metadata
     fi
+  elif (( _dv_rc == 2 )); then
+    # Detection was skipped because DISABLE_DV=1. Check the metadata cache
+    # so we can tell the user if the source actually contains DV.
+    IS_DV=0
+    local _dv_skip_source="--no-dv"
+    [[ -n "${PROFILE_NAME:-}" ]] && _dv_skip_source="profile '${PROFILE_NAME}'"
+    if _source_has_dv_metadata; then
+      warn "Source contains Dolby Vision but DV handling is disabled (${_dv_skip_source}). Use --dv to override."
+      report_add "dv_detected" "skipped (present in source)"
+    else
+      note "DV detection skipped (disabled by ${_dv_skip_source})."
+      report_add "dv_detected" "skipped"
+    fi
   else
     IS_DV=0
     note "No Dolby Vision detected."
     report_add "dv_detected" "false"
   fi
-  (( DISABLE_DV )) && note "DV handling explicitly disabled via --no-dv."
 
   # Decide color space and build x265 params
   decide_color_and_pixfmt
@@ -6876,10 +8007,10 @@ main() {
       _v_summary="$(printf '%s\n' "$verify_json" | jq -r '
         ([.streams[] | select(.codec_type=="video")][0] |
           "\(.codec_name // "?") \(.profile // "")"
-          + "|" + "\(.width)x\(.height)"
-          + "|" + (.r_frame_rate // "?"))
-        + "|" + ([.streams[] | select(.codec_type=="subtitle")] | length | tostring)' 2>/dev/null)"
-      IFS='|' read -r v_codec v_res v_fps s_count <<< "$_v_summary"
+          + "\t" + "\(.width)x\(.height)"
+          + "\t" + (.r_frame_rate // "?"))
+        + "\t" + ([.streams[] | select(.codec_type=="subtitle")] | length | tostring)' 2>/dev/null)"
+      IFS=$'\t' read -r v_codec v_res v_fps s_count <<< "$_v_summary"
       v_codec="${v_codec% }"
       # Convert fractional fps like 24000/1001 to decimal
       if [[ "$v_fps" == */* ]]; then
@@ -6889,7 +8020,7 @@ main() {
       say "  Video : ${v_codec:-?} ${v_res:-?} @ ${v_fps:-?} fps"
 
       # Audio: rich per-track metadata (codec, channels, language, bitrate, title)
-      # Single jq call extracts all fields per track as pipe-delimited lines.
+      # Single jq call extracts all fields per track as tab-delimited lines.
       local a_track_count
       a_track_count="$(printf '%s\n' "$verify_json" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null)"
       if [[ "${a_track_count:-0}" != "0" ]]; then
@@ -6899,8 +8030,8 @@ main() {
           # Batch: fetch all audio fields in one jq call per track
           _vinfo="$(printf '%s\n' "$verify_json" | jq -r "
             [.streams[] | select(.codec_type==\"audio\")][$a_idx] |
-            \"\(.codec_name // \"?\")|\(.channels // 0)|\(.tags.language // \"und\")|\(.bit_rate // \"\")|\(.tags.title // \"\")|\(.channel_layout // \"\")\"" 2>/dev/null)"
-          IFS='|' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_vinfo"
+            \"\(.codec_name // \"?\")\t\(.channels // 0)\t\(.tags.language // \"und\")\t\(.bit_rate // \"\")\t\(.tags.title // \"\")\t\(.channel_layout // \"\")\"" 2>/dev/null)"
+          IFS=$'\t' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_vinfo"
 
           # Descriptive channel label
           a_ch_label="$(_channel_label "${a_ch:-0}")"

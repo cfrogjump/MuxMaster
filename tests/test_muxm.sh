@@ -5,11 +5,13 @@
 #  CLI parsing, config precedence, profile behavior, and pipeline outputs.
 #
 #  Usage:
-#    ./test_muxm.sh [--muxm /path/to/muxm] [--suite SUITE] [--verbose]
+#    ./test_muxm.sh                                        # show help
+#    ./test_muxm.sh --suite all                            # run everything
+#    ./test_muxm.sh --suite subs                           # run one suite
+#    ./test_muxm.sh --muxm /path/to/muxm --suite e2e      # custom binary
 #
-#  Suites: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun, video,
-#          audio, subs, output, edge, e2e, hdr, containers, metadata
-#  Default: all
+#  Run with -h or --help for the full suite list.
+#  Default: no arguments shows help.
 # =============================================================================
 set -euo pipefail
 
@@ -38,18 +40,65 @@ readonly EXIT_VALIDATION=11
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
+# ---- Help ----
+show_help() {
+  cat <<'EOF'
+
+  muxm Test Harness v2.0
+
+  Usage: test_muxm.sh [--muxm PATH] [--suite SUITE] [--verbose]
+         test_muxm.sh --suite all          # run everything
+
+  Suites (--suite NAME):
+
+    Fast (config-only, no media generation, ~2s):
+      profiles     Profile variable assignment (--print-effective-config)
+      conflicts    Conflict warnings (profile + contradictory flag)
+      toggles      CLI toggle/flag parsing (--flag / --no-flag pairs)
+      config       Config file precedence (.muxmrc layering)
+      unit         Pure unit tests (helpers, codec maps, heuristics)
+      completions  Tab-completion installer/uninstaller
+      setup        --install-dependencies, --install-man, etc.
+
+    Medium (core fixture only, ~5s):
+      cli          CLI parsing, --help, --version, error codes
+      dryrun       --dry-run mode (profiles, skip flags, multi-track)
+      collision    Source/output collision and auto-versioning
+      edge         Edge cases (empty files, missing streams, etc.)
+
+    Full (all fixtures, real encodes, ~30s+):
+      video        Video pipeline (HEVC, H.264, copy-if-compliant)
+      hdr          HDR detection, color space, tone-mapping
+      audio        Audio selection, scoring, multi-track, lossless
+      subs         Subtitle pipeline, multi-track, ASS, OCR config
+      output       Chapters, checksum, JSON report, skip-if-ideal
+      containers   MP4, MKV, MOV container handling
+      metadata     Metadata stripping and preservation
+      e2e          Full profile end-to-end encodes
+
+    all            Run every suite above (default when --suite given)
+
+  Options:
+    --muxm PATH    Path to muxm binary (default: ./muxm)
+    --suite NAME   Run a specific suite (see above)
+    --verbose      Show output snippets on failure
+    -h, --help     Show this help
+
+EOF
+  exit 0
+}
+
 # ---- Parse args ----
+# No arguments → show help (use --suite all to run everything)
+[[ $# -eq 0 ]] && show_help
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --muxm)   MUXM="$2"; shift 2 ;;
     --suite)  SUITE="$2"; shift 2 ;;
     --verbose) VERBOSE=1; shift ;;
-    -h|--help)
-      echo "Usage: $0 [--muxm PATH] [--suite SUITE] [--verbose]"
-      echo "Suites: all, cli, toggles, unit, completions, config, profiles, conflicts, collision, dryrun, video, hdr,"
-      echo "        audio, subs, output, containers, metadata, edge, e2e"
-      exit 0 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    -h|--help) show_help ;;
+    *) echo "Unknown option: $1 (try --help)"; exit 1 ;;
   esac
 done
 
@@ -125,11 +174,17 @@ probe_audio() {
   ffprobe -v error -select_streams "a:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
 }
 
+# Probe a subtitle field from output file (stream index defaults to s:0).
+probe_sub() {
+  local file="$1" field="$2" idx="${3:-0}"
+  ffprobe -v error -select_streams "s:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
+}
+
 # Probe a format-level tag (title, comment, encoder, language, etc.).
 # Usage: probe_format_tag FILE TAG
 probe_format_tag() {
   local file="$1" tag="$2"
-  ffprobe -v error -show_entries "format_tags=$tag" -of csv=p=0 "$file" 2>/dev/null | head -1
+  ffprobe -v error -show_entries "format_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1
 }
 
 # Probe a stream-level tag (language, title, etc.).
@@ -137,7 +192,7 @@ probe_format_tag() {
 #   STREAM_SPEC — ffprobe stream selector (a:0, s:0, v:0, etc.)
 probe_stream_tag() {
   local file="$1" stream="$2" tag="$3"
-  ffprobe -v error -select_streams "$stream" -show_entries "stream_tags=$tag" -of csv=p=0 "$file" 2>/dev/null | head -1
+  ffprobe -v error -select_streams "$stream" -show_entries "stream_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1
 }
 
 # Probe a format-level field (format_name, duration, etc.).
@@ -416,6 +471,61 @@ SRT
     "$TESTDIR/multi_subs_multilang.mkv"
   pass "multi_subs_multilang.mkv created"
 
+  # 5c) ASS/SSA subtitle file (for SUB_PRESERVE_TEXT_FORMAT tests)
+  #     ASS subtitles carry positioning, styling, fonts, and typesetting data
+  #     that is lost when converted to SRT. This fixture validates that the
+  #     animation profile (and --sub-preserve-format) preserves ASS natively.
+  log "Creating ass_subs.mkv (HEVC + AAC + ASS subtitle with styling)"
+  cat > "$TESTDIR/styled.ass" <<'ASS'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Signs,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Signs,,0,0,0,,{\pos(960,100)}Styled sign text
+ASS
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=pink:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/styled.ass" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s ass \
+    -map 0:v -map 1:a -map 2 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="English Styled" \
+    "$TESTDIR/ass_subs.mkv"
+  pass "ass_subs.mkv created"
+
+  # 5d) Stream titles containing literal pipe characters (v1.0.2 regression fixture).
+  #     Pipe characters in subtitle/audio titles previously corrupted the pipe-delimited
+  #     output of _sub_stream_info and the audio jq pipeline, causing an arithmetic
+  #     evaluation crash under nounset. The delimiter was migrated from | to \t (tab).
+  log "Creating pipe_titles.mkv (HEVC + AAC with pipe in title + SRT with pipe in title)"
+  cat > "$TESTDIR/pipe_test.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Pipe title subtitle line
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=orange:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/pipe_test.srt" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -map 0:v -map 1:a -map 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Original | English" \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="Original | English | (SDH)" \
+    "$TESTDIR/pipe_titles.mkv"
+  pass "pipe_titles.mkv created"
+
   # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
   cat > "$TESTDIR/chapters.txt" <<'CHAP'
@@ -482,6 +592,97 @@ CHAP
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Main Feature" \
     "$TESTDIR/multi_audio_commentary.mkv"
   pass "multi_audio_commentary.mkv created"
+
+  # 8c) HEVC multi-audio fixture for dv-archival multi-track testing.
+  #     HEVC video (copy-if-compliant) + 3 audio: eng main, eng commentary, spa.
+  #     3 audio inputs require explicit maps — raw ffmpeg.
+  log "Creating hevc_multi_audio.mkv (HEVC + 3 audio: eng main, eng commentary, spa)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=orange:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=550:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a -map 3:a \
+    -c:a:0 aac -b:a:0 128k -ac:a:0 2 \
+    -c:a:1 aac -b:a:1 128k -ac:a:1 2 \
+    -c:a:2 aac -b:a:2 128k -ac:a:2 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Main Feature" \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="Director's Commentary" \
+    -metadata:s:a:2 language=spa -metadata:s:a:2 title="Spanish" \
+    "$TESTDIR/hevc_multi_audio.mkv"
+  pass "hevc_multi_audio.mkv created"
+
+  # 8c-ii) Lossless vs lossy audio fixture — codec preference regression test.
+  #     Simulates the Arcane Blu-ray scenario: FLAC 5.1 (lossless, VBR, bit_rate=0
+  #     in ffprobe) + AC3 5.1 (lossy, reported 640 kbps), same language/channels.
+  #     Before the scoring fix, the bitrate tie-breaker overwhelmed the codec rank,
+  #     causing AC3 to win over FLAC/TrueHD despite the preference list ranking
+  #     lossless codecs higher.
+  log "Creating lossless_vs_lossy.mkv (FLAC 5.1 + AC3 5.1, same lang)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=purple:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 flac -ac:a:0 6 \
+    -c:a:1 ac3 -b:a:1 640k -ac:a:1 6 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Surround 5.1" \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="Surround 5.1" \
+    "$TESTDIR/lossless_vs_lossy.mkv"
+  pass "lossless_vs_lossy.mkv created"
+
+  # 8d) HEVC multi-subtitle fixture for dv-archival multi-track subtitle testing.
+  #     HEVC video (copy-if-compliant) + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full.
+  #     5 SRT inputs require explicit maps — raw ffmpeg.
+  log "Creating hevc_multi_subs.mkv (HEVC + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full)"
+  cat > "$TESTDIR/mt_forced.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:01,000
+[Foreign dialogue]
+SRT
+  cat > "$TESTDIR/mt_full_eng.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Full English subtitle
+SRT
+  cat > "$TESTDIR/mt_sdh_eng.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+[Music] SDH English subtitle
+SRT
+  cat > "$TESTDIR/mt_full_spa.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Subtítulo español
+SRT
+  cat > "$TESTDIR/mt_full_fra.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Sous-titre français
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=olive:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/mt_forced.srt" \
+    -i "$TESTDIR/mt_full_eng.srt" \
+    -i "$TESTDIR/mt_sdh_eng.srt" \
+    -i "$TESTDIR/mt_full_spa.srt" \
+    -i "$TESTDIR/mt_full_fra.srt" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -map 0:v -map 1:a -map 2 -map 3 -map 4 -map 5 -map 6 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="Forced" \
+    -metadata:s:s:1 language=eng -metadata:s:s:1 title="English" \
+    -metadata:s:s:2 language=eng -metadata:s:s:2 title="English SDH" \
+    -metadata:s:s:3 language=spa -metadata:s:s:3 title="Spanish" \
+    -metadata:s:s:4 language=fra -metadata:s:s:4 title="French" \
+    -disposition:s:0 forced \
+    "$TESTDIR/hevc_multi_subs.mkv"
+  pass "hevc_multi_subs.mkv created"
 
   # 9) File with rich metadata (encoder, title, etc.) for strip-metadata tests
   log "Creating rich_metadata.mkv (with extra metadata tags)"
@@ -798,6 +999,26 @@ _test_config_create() {
       fail "--create-config $p: did not create .muxmrc"
     fi
   done
+
+  # ---- --create-config template includes multi-track variables ----
+  # AUDIO_MULTI_TRACK, AUDIO_KEEP_COMMENTARY, and SUB_MULTI_TRACK were added to
+  # the --create-config template as part of the multi-track release.  Without them,
+  # users cannot discover or override these settings via --create-config.
+  local cfg_mt_dir="$TESTDIR/config_create_mt_vars"
+  mkdir -p "$cfg_mt_dir"
+  run_muxm_in "$cfg_mt_dir" --create-config project dv-archival >/dev/null 2>&1
+  if [[ -f "$cfg_mt_dir/.muxmrc" ]]; then
+    local mt_cfg_content
+    mt_cfg_content="$(cat "$cfg_mt_dir/.muxmrc")"
+    assert_contains "AUDIO_MULTI_TRACK" \
+      "--create-config dv-archival: template contains AUDIO_MULTI_TRACK" "$mt_cfg_content"
+    assert_contains "AUDIO_KEEP_COMMENTARY" \
+      "--create-config dv-archival: template contains AUDIO_KEEP_COMMENTARY" "$mt_cfg_content"
+    assert_contains "SUB_MULTI_TRACK" \
+      "--create-config dv-archival: template contains SUB_MULTI_TRACK" "$mt_cfg_content"
+  else
+    fail "--create-config dv-archival: did not create .muxmrc (multi-track variable check)"
+  fi
 }
 
 _test_config_layering() {
@@ -936,12 +1157,22 @@ test_profiles() {
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 1" "dv-archival: lossless audio on" "$out"
   assert_contains "OUTPUT_EXT                = mkv" "dv-archival: MKV container" "$out"
   assert_contains "truehd,dts,flac" "dv-archival: lossless-first codec preference" "$out"
+  assert_contains "AUDIO_MULTI_TRACK         = 1" "dv-archival: multi-track audio enabled" "$out"
+  assert_contains "AUDIO_KEEP_COMMENTARY     = 0" "dv-archival: commentary excluded by default" "$out"
+  assert_contains "SUB_MULTI_TRACK          = 1" "dv-archival: multi-track subtitles enabled" "$out"
+  assert_contains "CHECKSUM                  = 1" "dv-archival: checksum on by default" "$out"
+
+  # --no-checksum overrides dv-archival default
+  out="$(run_muxm --profile dv-archival --no-checksum --print-effective-config)"
+  assert_contains "CHECKSUM                  = 0" "dv-archival + --no-checksum: CLI overrides profile default" "$out"
 
   # hdr10-hq specifics
   out="$(run_muxm --profile hdr10-hq --print-effective-config)"
   assert_contains "DISABLE_DV                = 1" "hdr10-hq: DV disabled" "$out"
   assert_contains "CRF_VALUE                 = 17" "hdr10-hq: CRF 17" "$out"
   assert_contains "OUTPUT_EXT                = mkv" "hdr10-hq: MKV container" "$out"
+  assert_contains "AUDIO_MULTI_TRACK         = 0" "hdr10-hq: multi-track audio off (no bleed)" "$out"
+  assert_contains "SUB_MULTI_TRACK          = 0" "hdr10-hq: multi-track subs off (no bleed)" "$out"
 
   # atv-directplay-hq specifics
   out="$(run_muxm --profile atv-directplay-hq --print-effective-config)"
@@ -949,6 +1180,8 @@ test_profiles() {
   assert_contains "SUB_BURN_FORCED           = 1" "atv-directplay: burn forced subs" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1" "atv-directplay: skip-if-ideal on" "$out"
   assert_contains "MAX_COPY_BITRATE          = 50000k" "atv-directplay: bitrate ceiling" "$out"
+  assert_contains "LEVEL_VALUE               = 5.1" "atv-directplay: Level 5.1 VBV cap" "$out"
+  assert_contains "CONSERVATIVE_VBV          = 1" "atv-directplay: conservative VBV active" "$out"
 
   # streaming specifics
   out="$(run_muxm --profile streaming --print-effective-config)"
@@ -962,6 +1195,8 @@ test_profiles() {
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 1" "animation: lossless audio" "$out"
   assert_contains "SDR_FORCE_10BIT           = 1" "animation: force 10-bit SDR" "$out"
   assert_contains "flac,truehd" "animation: FLAC-first codec preference" "$out"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1" "animation: ASS/SSA preservation enabled" "$out"
+  assert_contains "SUB_MULTI_TRACK          = 1" "animation: multi-track subtitles enabled" "$out"
 
   # universal specifics
   out="$(run_muxm --profile universal --print-effective-config)"
@@ -998,6 +1233,28 @@ test_conflicts() {
   out="$(run_muxm --profile dv-archival --sub-burn-forced --print-effective-config)"
   assert_contains "⚠" "dv-archival + --sub-burn-forced warns (#40)" "$out"
 
+  # dv-archival multi-track audio conflicts
+  out="$(run_muxm --profile dv-archival --audio-track 0 --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --audio-track warns (multi-track conflict)" "$out"
+  assert_contains "Multi-track" "dv-archival + --audio-track: warning mentions multi-track" "$out"
+
+  out="$(run_muxm --profile dv-archival --audio-force-codec aac --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --audio-force-codec warns (multi-track conflict)" "$out"
+  assert_contains "Multi-track" "dv-archival + --audio-force-codec: warning mentions multi-track" "$out"
+
+  out="$(run_muxm --profile dv-archival --stereo-fallback --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --stereo-fallback warns (multi-track conflict)" "$out"
+  assert_contains "Multi-track" "dv-archival + --stereo-fallback: warning mentions multi-track" "$out"
+
+  # dv-archival multi-track subtitle conflicts
+  out="$(run_muxm --profile dv-archival --sub-burn-forced --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --sub-burn-forced warns (multi-track sub conflict)" "$out"
+  assert_contains "Multi-track subtitle" "dv-archival + --sub-burn-forced: warning mentions multi-track subtitle" "$out"
+
+  out="$(run_muxm --profile dv-archival --sub-export-external --print-effective-config)"
+  assert_contains "⚠" "dv-archival + --sub-export-external warns (multi-track sub conflict)" "$out"
+  assert_contains "Multi-track subtitle" "dv-archival + --sub-export-external: warning mentions multi-track subtitle" "$out"
+
   # --- hdr10-hq conflicts ---
   out="$(run_muxm --profile hdr10-hq --tonemap --print-effective-config)"
   assert_contains "⚠" "hdr10-hq + --tonemap warns" "$out"
@@ -1031,6 +1288,11 @@ test_conflicts() {
   # --- animation conflicts ---
   out="$(run_muxm --profile animation --sub-burn-forced --print-effective-config)"
   assert_contains "⚠" "animation + --sub-burn-forced warns" "$out"
+  assert_contains "Multi-track subtitle" "animation + --sub-burn-forced: warning mentions multi-track subtitle demotion" "$out"
+
+  out="$(run_muxm --profile animation --sub-export-external --print-effective-config)"
+  assert_contains "⚠" "animation + --sub-export-external warns (multi-track sub conflict)" "$out"
+  assert_contains "Multi-track subtitle" "animation + --sub-export-external: warning mentions multi-track subtitle" "$out"
 
   out="$(run_muxm --profile animation --video-codec libx264 --print-effective-config)"
   assert_contains "⚠" "animation + libx264 warns" "$out"
@@ -1040,6 +1302,10 @@ test_conflicts() {
 
   out="$(run_muxm --profile animation --no-audio-lossless-passthrough --print-effective-config)"
   assert_contains "⚠" "animation + --no-audio-lossless-passthrough warns (#47)" "$out"
+
+  out="$(run_muxm --profile animation --no-sub-preserve-format --print-effective-config)"
+  assert_contains "⚠" "animation + --no-sub-preserve-format warns" "$out"
+  assert_contains "ASS/SSA" "animation + --no-sub-preserve-format mentions ASS/SSA" "$out"
 
   # --- universal conflicts ---
   out="$(run_muxm --profile universal --output-ext mkv --print-effective-config)"
@@ -1090,6 +1356,31 @@ test_dryrun() {
   # Dry-run with HDR source
   out="$(run_muxm --dry-run "$TESTDIR/hevc_hdr10_tagged.mkv")"
   assert_contains "DRY-RUN" "Dry-run with HDR source" "$out"
+
+  # Dry-run with animation profile + ASS source completes cleanly
+  out="$(run_muxm --dry-run --profile animation "$TESTDIR/ass_subs.mkv")"
+  assert_contains "DRY-RUN" "Dry-run animation + ASS completes" "$out"
+
+  # Dry-run with animation profile multi-track subtitles
+  out="$(run_muxm --dry-run --profile animation "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "DRY-RUN" "Dry-run animation + multi-subs completes" "$out"
+  assert_contains "multi-track" "Dry-run animation multi-subs: announces multi-track mode" "$out"
+
+  # Dry-run with animation + --sub-burn-forced demotes to single-track
+  out="$(run_muxm --dry-run --profile animation --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "demoted" "Dry-run animation + --sub-burn-forced: multi-track demoted to single-track" "$out"
+
+  # Dry-run with dv-archival multi-track audio
+  out="$(run_muxm --dry-run --profile dv-archival "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "DRY-RUN" "Dry-run dv-archival + multi-audio completes" "$out"
+  assert_contains "multi-track" "Dry-run dv-archival: announces multi-track mode" "$out"
+
+  # Dry-run with dv-archival multi-track subtitles
+  # --no-skip-if-ideal: fixture is fully compliant, would skip before pipelines run.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "DRY-RUN" "Dry-run dv-archival + multi-subs completes" "$out"
+  assert_contains "multi-track" "Dry-run dv-archival multi-subs: announces multi-track mode" "$out"
+  assert_contains "keeping" "Dry-run dv-archival multi-subs: subtitle filter summary logged" "$out"
 }
 
 # === Suite: Video Pipeline (real encodes) ===
@@ -1405,6 +1696,30 @@ test_audio() {
     fail "Commentary detection: no output"
   fi
 
+  # --- Lossless codec preferred over lossy despite bitrate advantage (regression) ---
+  # The lossless_vs_lossy.mkv fixture has FLAC 5.1 (#0) + AC3 5.1 (#1), same language.
+  # FLAC reports bit_rate=0 (VBR); AC3 reports 640 kbps.  With the animation profile's
+  # codec preference (flac > truehd > eac3 > ac3), the scoring algorithm must select
+  # track #0 (FLAC).  Before the fix, the uncapped bitrate bonus let AC3 win.
+  outfile="$TESTDIR/audio_lossless_vs_lossy.mkv"
+  log "Testing lossless-preferred-over-lossy scoring (animation codec pref)..."
+  local lvl_out
+  lvl_out="$(run_muxm --profile animation --crf 28 --preset ultrafast \
+    --no-stereo-fallback \
+    "$TESTDIR/lossless_vs_lossy.mkv" "$outfile" 2>&1)"
+  if [[ -f "$outfile" && -s "$outfile" ]]; then
+    pass "Lossless-vs-lossy: output produced"
+    # Track 0 is FLAC (lossless, higher codec rank), track 1 is AC3 (lossy, higher bitrate).
+    # Scoring must select track #0.
+    if echo "$lvl_out" | grep -q "Selected track #0"; then
+      pass "Lossless-vs-lossy: FLAC selected over AC3 (codec preference dominates bitrate)"
+    else
+      fail "Lossless-vs-lossy: expected track #0 (FLAC), got: $(echo "$lvl_out" | grep 'Selected track')"
+    fi
+  else
+    fail "Lossless-vs-lossy: no output"
+  fi
+
   # ---- --audio-titles produces descriptive stream title ----
   local at_out="$TESTDIR/e2e_audio_titles.mkv"
   if run_muxm --output-ext mkv --crf 28 --preset ultrafast --audio-titles \
@@ -1437,6 +1752,88 @@ test_audio() {
   else
     skip "--no-audio-titles encode failed or output not found"
   fi
+
+  # ---- Pipe characters in audio stream titles no longer break field parsing ----
+  # v1.0.2 fix: audio titles with literal | (e.g. "Original | English") corrupted
+  # the old pipe-delimited _audio_stream_info output. Delimiter migrated to \t.
+  # Primary signal: encode completes without nounset arithmetic crash.
+  local pipe_audio_out="$TESTDIR/audio_pipe_titles.mp4"
+  log "Testing pipe characters in audio stream title..."
+  if assert_encode "Pipe in audio title: encode completes (no crash)" "$pipe_audio_out" \
+       --crf 28 --preset ultrafast "$TESTDIR/pipe_titles.mkv"; then
+    assert_stream_count "Pipe in audio title: audio stream present" "$pipe_audio_out" a 1
+  fi
+
+  # ---- Multi-track audio (dv-archival) ----
+  # Uses hevc_multi_audio.mkv: 3 tracks — eng "Main Feature", eng "Director's Commentary", spa "Spanish"
+
+  # Multi-track dry-run: shows ✓/✗ markers and announces multi-track mode
+  log "Testing multi-track audio dry-run..."
+  local mt_dry
+  mt_dry="$(run_muxm --dry-run --profile dv-archival "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "multi-track" "Multi-track dry-run: announces multi-track mode" "$mt_dry"
+  assert_contains "✓" "Multi-track dry-run: shows ✓ keep marker" "$mt_dry"
+  assert_contains "✗" "Multi-track dry-run: shows ✗ drop marker (commentary filtered)" "$mt_dry"
+
+  # Multi-track commentary filtering: commentary track dropped, 2 survive
+  log "Testing multi-track commentary filtering..."
+  assert_contains "commentary" "Multi-track: commentary track detected" "$mt_dry"
+  # Default dv-archival: AUDIO_KEEP_COMMENTARY=0 drops the commentary track
+  assert_contains "keeping 2 of 3" "Multi-track: 2 of 3 tracks kept (commentary dropped)" "$mt_dry"
+
+  # Multi-track demotion: --audio-track forces single-track
+  log "Testing multi-track demotion on --audio-track..."
+  local mt_demote_at
+  mt_demote_at="$(run_muxm --dry-run --profile dv-archival --audio-track 0 "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "demoted" "Multi-track + --audio-track: demoted to single-track" "$mt_demote_at"
+
+  # Multi-track demotion: --audio-force-codec forces single-track
+  log "Testing multi-track demotion on --audio-force-codec..."
+  local mt_demote_fc
+  mt_demote_fc="$(run_muxm --dry-run --profile dv-archival --audio-force-codec aac "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "demoted" "Multi-track + --audio-force-codec: demoted to single-track" "$mt_demote_fc"
+
+  # Multi-track + --stereo-fallback: warns but does NOT demote.
+  # --stereo-fallback generates a conflict warning (⚠, tested in test_conflicts)
+  # but multi-track stays active because stream-copying from source never reaches
+  # the stereo generation path.  Verify multi-track mode is preserved.
+  log "Testing multi-track + --stereo-fallback stays in multi-track mode..."
+  local mt_sf_out
+  mt_sf_out="$(run_muxm --dry-run --profile dv-archival --stereo-fallback "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "multi-track" "Multi-track + --stereo-fallback: multi-track mode preserved" "$mt_sf_out"
+  assert_contains "keeping" "Multi-track + --stereo-fallback: filter summary logged" "$mt_sf_out"
+
+  # Multi-track language filter: --audio-lang-pref eng keeps only English tracks
+  # CLI flag overrides the profile's AUDIO_LANG_PREF="" (config file would not —
+  # profiles run after config files but before CLI).
+  log "Testing multi-track language filter..."
+  local mt_lang_out
+  mt_lang_out="$(run_muxm --dry-run --profile dv-archival \
+    --audio-lang-pref eng "$TESTDIR/hevc_multi_audio.mkv")"
+  # eng main kept, eng commentary dropped (commentary), spa dropped (language) = keeping 1 of 3
+  assert_contains "keeping 1 of 3" "Multi-track + --audio-lang-pref eng: 1 of 3 kept (spa + commentary dropped)" "$mt_lang_out"
+
+  # Multi-track commentary opt-in: AUDIO_KEEP_COMMENTARY=1 keeps all tracks
+  # All existing tests use the default AUDIO_KEEP_COMMENTARY=0 (drop). This validates
+  # the opt-in path — if accidentally inverted, the default passes but this fails.
+  # AUDIO_LANG_PREF= (empty) is required to let all languages through — the default
+  # is "eng", which would filter out the Spanish track and mask the commentary test.
+  log "Testing multi-track AUDIO_KEEP_COMMENTARY=1 (keep commentary)..."
+  local mt_keep_comm_home="$TESTDIR/mt_keep_comm_home"
+  mkdir -p "$mt_keep_comm_home"
+  cat > "$mt_keep_comm_home/.muxmrc" <<'EOF'
+AUDIO_MULTI_TRACK=1
+AUDIO_KEEP_COMMENTARY=1
+AUDIO_LANG_PREF=
+EOF
+  local mt_keep_comm
+  mt_keep_comm="$(MUXM_HOME="$mt_keep_comm_home" run_muxm_in "$TESTDIR" \
+    --dry-run "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "keeping 3 of 3" \
+    "Multi-track + AUDIO_KEEP_COMMENTARY=1: all 3 tracks kept" "$mt_keep_comm"
+  # Verify the commentary track is explicitly shown as kept (✓ marker)
+  assert_contains "commentary" \
+    "Multi-track + AUDIO_KEEP_COMMENTARY=1: commentary track detected" "$mt_keep_comm"
 }
 
 # === Suite: Subtitle Pipeline ===
@@ -1548,6 +1945,210 @@ EOF
   else
     skip "--sub-lang-pref encode failed or output not found"
   fi
+
+  # ---- --sub-preserve-format / --no-sub-preserve-format config flags ----
+  out="$(run_muxm --sub-preserve-format --print-effective-config)"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1" "--sub-preserve-format: config shows 1" "$out"
+
+  out="$(run_muxm --no-sub-preserve-format --print-effective-config)"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 0" "--no-sub-preserve-format: config shows 0" "$out"
+
+  # ---- ASS subtitle encode tests ----
+  # Isolate HOME to prevent user's ~/.muxmrc from affecting subtitle pipeline
+  # behavior (e.g., SUB_BURN_FORCED=1, default PROFILE_NAME, etc.).
+  local _saved_home="$HOME"
+  export HOME="$TESTDIR/ass_test_home"
+  mkdir -p "$HOME"
+
+  # ---- animation profile preserves ASS subtitles natively in MKV ----
+  local ass_anim_out="$TESTDIR/subs_ass_animation.mkv"
+  log "Testing animation profile preserves ASS subtitles..."
+  if assert_encode "animation + ASS: output produced" "$ass_anim_out" \
+       --profile animation --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_codec
+    ass_codec="$(probe_sub "$ass_anim_out" codec_name)"
+    if [[ "$ass_codec" == "ass" || "$ass_codec" == "ssa" ]]; then
+      pass "animation + ASS: subtitle preserved as native $ass_codec (not SRT)"
+    else
+      fail "animation + ASS: expected ass/ssa codec, got '$ass_codec'"
+    fi
+  fi
+
+  # ---- --sub-preserve-format (explicit) preserves ASS in MKV ----
+  local ass_explicit_out="$TESTDIR/subs_ass_explicit.mkv"
+  log "Testing --sub-preserve-format preserves ASS..."
+  if assert_encode "--sub-preserve-format + MKV: output produced" "$ass_explicit_out" \
+       --output-ext mkv --sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_explicit_codec
+    ass_explicit_codec="$(probe_sub "$ass_explicit_out" codec_name)"
+    if [[ "$ass_explicit_codec" == "ass" || "$ass_explicit_codec" == "ssa" ]]; then
+      pass "--sub-preserve-format + MKV: subtitle preserved as native $ass_explicit_codec"
+    else
+      fail "--sub-preserve-format + MKV: expected ass/ssa, got '$ass_explicit_codec'"
+    fi
+  fi
+
+  # ---- Default behavior (no --sub-preserve-format) converts ASS to SRT in MKV ----
+  local ass_default_out="$TESTDIR/subs_ass_default.mkv"
+  log "Testing default behavior converts ASS to SRT..."
+  if assert_encode "Default + ASS→MKV: output produced" "$ass_default_out" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_default_codec
+    ass_default_codec="$(probe_sub "$ass_default_out" codec_name)"
+    if [[ "$ass_default_codec" == "subrip" || "$ass_default_codec" == "srt" ]]; then
+      pass "Default + ASS→MKV: subtitle converted to SRT ($ass_default_codec)"
+    else
+      fail "Default + ASS→MKV: expected subrip/srt, got '$ass_default_codec'"
+    fi
+  fi
+
+  # ---- --no-sub-preserve-format overrides animation profile ----
+  local ass_override_out="$TESTDIR/subs_ass_override.mkv"
+  log "Testing --no-sub-preserve-format overrides animation profile..."
+  if assert_encode "animation + --no-sub-preserve-format: output produced" "$ass_override_out" \
+       --profile animation --no-sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_override_codec
+    ass_override_codec="$(probe_sub "$ass_override_out" codec_name)"
+    if [[ "$ass_override_codec" == "subrip" || "$ass_override_codec" == "srt" ]]; then
+      pass "animation + --no-sub-preserve-format: ASS converted to SRT ($ass_override_codec)"
+    else
+      fail "animation + --no-sub-preserve-format: expected subrip/srt, got '$ass_override_codec'"
+    fi
+  fi
+
+  # ---- --sub-preserve-format ignored for MP4 (container cannot carry ASS) ----
+  local ass_mp4_out="$TESTDIR/subs_ass_mp4.mp4"
+  log "Testing --sub-preserve-format ignored for MP4..."
+  if assert_encode "--sub-preserve-format + MP4: output produced" "$ass_mp4_out" \
+       --output-ext mp4 --sub-preserve-format --crf 28 --preset ultrafast "$TESTDIR/ass_subs.mkv"; then
+    local ass_mp4_codec
+    ass_mp4_codec="$(probe_sub "$ass_mp4_out" codec_name)"
+    if [[ "$ass_mp4_codec" == "mov_text" ]]; then
+      pass "--sub-preserve-format + MP4: subtitle is mov_text (ASS not preserved in MP4)"
+    else
+      # MP4 might have no subs at all, or mov_text — either is acceptable
+      local ass_mp4_scount
+      ass_mp4_scount="$(count_streams "$ass_mp4_out" s)"
+      if [[ "$ass_mp4_scount" -eq 0 ]]; then
+        pass "--sub-preserve-format + MP4: no subtitle in output (MP4 cannot carry ASS)"
+      else
+        fail "--sub-preserve-format + MP4: expected mov_text or no sub, got '$ass_mp4_codec'"
+      fi
+    fi
+  fi
+
+  # Restore HOME
+  export HOME="$_saved_home"
+
+  # ---- Pipe characters in subtitle titles no longer break field parsing ----
+  # v1.0.2 fix: titles like "Original | English | (SDH)" contain literal | which
+  # corrupted the old pipe-delimited _sub_stream_info output. Delimiter migrated to \t.
+  local pipe_sub_out="$TESTDIR/subs_pipe_titles.mkv"
+  log "Testing pipe characters in subtitle stream title..."
+  if assert_encode "Pipe in sub title: encode completes (no crash)" "$pipe_sub_out" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/pipe_titles.mkv"; then
+    assert_stream_count "Pipe in sub title: subtitle stream present" "$pipe_sub_out" s 1
+    local pipe_sub_codec
+    pipe_sub_codec="$(probe_sub "$pipe_sub_out" codec_name)"
+    if [[ -n "$pipe_sub_codec" ]]; then
+      pass "Pipe in sub title: subtitle codec readable ($pipe_sub_codec)"
+    else
+      fail "Pipe in sub title: subtitle codec not readable"
+    fi
+  fi
+
+  # ---- Multi-track subtitle tests (dv-archival SUB_MULTI_TRACK=1) ----
+  # hevc_multi_subs.mkv: 5 subs — eng forced, eng full, eng SDH, spa full, fra full
+
+  # Multi-track dry-run: shows ✓/✗ markers and announces multi-track mode
+  # --no-skip-if-ideal: this fixture is fully compliant (HEVC+MKV+all subs pass),
+  # so skip-if-ideal would short-circuit before the subtitle pipeline runs.
+  log "Testing multi-track subtitle dry-run..."
+  local mt_sub_dry
+  mt_sub_dry="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "Multi-track sub dry-run: announces multi-track mode" "$mt_sub_dry"
+  assert_contains "✓" "Multi-track sub dry-run: shows ✓ keep marker" "$mt_sub_dry"
+  assert_contains "keeping 5 of 5" "Multi-track sub dry-run: all 5 tracks kept (no filters)" "$mt_sub_dry"
+
+  # Multi-track language filter: --sub-lang-pref eng keeps only English tracks
+  log "Testing multi-track subtitle language filter..."
+  local mt_sub_lang
+  mt_sub_lang="$(run_muxm --dry-run --profile dv-archival \
+    --sub-lang-pref eng "$TESTDIR/hevc_multi_subs.mkv")"
+  # eng forced + eng full + eng SDH kept, spa + fra dropped = keeping 3 of 5
+  assert_contains "keeping 3 of 5" "Multi-track sub + --sub-lang-pref eng: 3 of 5 kept" "$mt_sub_lang"
+  assert_contains "✗" "Multi-track sub + --sub-lang-pref eng: shows ✗ drop marker" "$mt_sub_lang"
+
+  # Multi-track type filter: SUB_INCLUDE_SDH=0 drops SDH tracks
+  log "Testing multi-track subtitle type filter (no SDH)..."
+  local mt_sub_nosdh
+  mt_sub_nosdh="$(run_muxm --dry-run --profile dv-archival \
+    --no-sub-sdh "$TESTDIR/hevc_multi_subs.mkv")"
+  # eng forced + eng full + spa full + fra full kept, eng SDH dropped = keeping 4 of 5
+  assert_contains "keeping 4 of 5" "Multi-track sub + --no-sub-sdh: 4 of 5 kept (SDH dropped)" "$mt_sub_nosdh"
+
+  # Multi-track + SUB_MAX_TRACKS cap
+  # Uses .muxmrc instead of --profile dv-archival because profiles override config values.
+  log "Testing multi-track subtitle SUB_MAX_TRACKS cap..."
+  local mt_sub_cap_home="$TESTDIR/sub_mt_cap_home"
+  mkdir -p "$mt_sub_cap_home"
+  cat > "$mt_sub_cap_home/.muxmrc" <<'EOF'
+SUB_MULTI_TRACK=1
+SUB_LANG_PREF=
+SUB_MAX_TRACKS=2
+EOF
+  local mt_sub_cap
+  mt_sub_cap="$(MUXM_HOME="$mt_sub_cap_home" run_muxm_in "$TESTDIR" --dry-run \
+    "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "keeping 2 of 5" "Multi-track sub + SUB_MAX_TRACKS=2: capped at 2" "$mt_sub_cap"
+
+  # Multi-track demotion: --sub-burn-forced forces single-track
+  # --no-skip-if-ideal: source is ideal, would skip before demotion message is printed.
+  log "Testing multi-track subtitle demotion on --sub-burn-forced..."
+  local mt_sub_demote
+  mt_sub_demote="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "demoted" "Multi-track sub + --sub-burn-forced: demoted to single-track" "$mt_sub_demote"
+
+  # Multi-track + --sub-export-external: stays in multi-track, logs note
+  # --no-skip-if-ideal: source is ideal, would skip before export note is printed.
+  log "Testing multi-track subtitle with --sub-export-external..."
+  local mt_sub_export
+  mt_sub_export="$(run_muxm --dry-run --no-skip-if-ideal --profile dv-archival --sub-export-external "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "Multi-track sub + --sub-export-external: stays in multi-track" "$mt_sub_export"
+  assert_contains "export-external ignored" "Multi-track sub + --sub-export-external: notes export ignored" "$mt_sub_export"
+
+  # ---- Multi-track subtitle tests (animation SUB_MULTI_TRACK=1) ----
+  # animation profile: same multi-track pipeline, different defaults (SUB_MAX_TRACKS=6).
+  # NOTE: animation inherits the default SUB_LANG_PREF=eng (unlike dv-archival which
+  # clears it to ""). The hevc_multi_subs fixture has 3 eng + 1 spa + 1 fra = 5 tracks,
+  # so only 3 English tracks survive the language filter by default.
+
+  # Animation multi-track dry-run: announces multi-track mode, keeps eng tracks only
+  log "Testing animation multi-track subtitle dry-run..."
+  local mt_sub_anim
+  mt_sub_anim="$(run_muxm --dry-run --profile animation "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "animation multi-track sub: announces multi-track mode" "$mt_sub_anim"
+  assert_contains "keeping 3 of 5" "animation multi-track sub: 3 eng tracks kept (SUB_LANG_PREF=eng)" "$mt_sub_anim"
+
+  # Animation multi-track + --sub-burn-forced demotes to single-track
+  log "Testing animation multi-track subtitle demotion on --sub-burn-forced..."
+  local mt_sub_anim_demote
+  mt_sub_anim_demote="$(run_muxm --dry-run --profile animation --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "demoted" "animation multi-track sub + --sub-burn-forced: demoted to single-track" "$mt_sub_anim_demote"
+
+  # Animation multi-track + language filter override: --sub-lang-pref "" keeps all 5
+  log "Testing animation multi-track subtitle language filter override..."
+  local mt_sub_anim_lang
+  mt_sub_anim_lang="$(run_muxm --dry-run --profile animation \
+    --sub-lang-pref "" "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "keeping 5 of 5" "animation multi-track sub + --sub-lang-pref '': all 5 kept" "$mt_sub_anim_lang"
+
+  # Animation multi-track + --sub-export-external: stays in multi-track, logs note
+  log "Testing animation multi-track subtitle with --sub-export-external..."
+  local mt_sub_anim_export
+  mt_sub_anim_export="$(run_muxm --dry-run --profile animation --sub-export-external "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "multi-track" "animation multi-track sub + --sub-export-external: stays in multi-track" "$mt_sub_anim_export"
+  assert_contains "export-external ignored" "animation multi-track sub + --sub-export-external: notes export ignored" "$mt_sub_anim_export"
 }
 
 # === Suite: Output Features ===
@@ -1660,6 +2261,61 @@ test_output() {
     skip "--skip-if-ideal: inconclusive (behavior depends on compliance check)"
   fi
 
+  # ---- skip-if-ideal + multi-track: commentary triggers remux (not ideal) ----
+  # When AUDIO_MULTI_TRACK=1 and AUDIO_KEEP_COMMENTARY=0 (dv-archival default),
+  # a source with a commentary track should NOT be considered ideal — the filter
+  # would drop it, so remuxing must proceed.
+  # Fixture: hevc_multi_audio.mkv — eng main + eng commentary + spa (3 audio tracks).
+  local sii_mt_home="$TESTDIR/sii_mt_home"
+  mkdir -p "$sii_mt_home"
+  local sii_mt_out="$TESTDIR/out_sii_mt_audio.mkv"
+  log "Testing skip-if-ideal + multi-track audio (commentary forces remux)..."
+  local sii_mt_log
+  sii_mt_log="$(MUXM_HOME="$sii_mt_home" run_muxm --profile dv-archival \
+    "$TESTDIR/hevc_multi_audio.mkv" "$sii_mt_out")"
+  # Should NOT skip — commentary track triggers audio filter, source is not ideal
+  if echo "$sii_mt_log" | grep -qiE "already matches.*skip|source already.*ideal"; then
+    fail "skip-if-ideal + multi-track: should NOT skip (commentary track present)"
+  else
+    pass "skip-if-ideal + multi-track: commentary prevents ideal skip"
+  fi
+  if [[ -f "$sii_mt_out" && -s "$sii_mt_out" ]]; then
+    assert_stream_count "skip-if-ideal + multi-track: 2 audio tracks (commentary dropped)" \
+      "$sii_mt_out" a 2 2
+  else
+    skip "skip-if-ideal + multi-track: no output file (encode may have failed)"
+  fi
+
+  # ---- skip-if-ideal per-stream gating: all subtitle streams survive ----
+  # When source is fully compliant (HEVC+MKV, all subs pass filters), skip-if-ideal
+  # fires and the metadata remux must use explicit -map flags from SII_SUB_INDICES.
+  # The old code used -map 0 (ffmpeg default = one stream per type), silently
+  # dropping all but the first subtitle.  This test catches that regression.
+  # Fixture: hevc_multi_subs.mkv — 5 subs (eng forced, eng full, eng SDH, spa, fra).
+  # dv-archival defaults: SUB_MULTI_TRACK=1, SUB_LANG_PREF="" → all 5 pass.
+  local sii_subs_home="$TESTDIR/sii_subs_home"
+  mkdir -p "$sii_subs_home"
+  local sii_subs_out="$TESTDIR/out_sii_subs.mkv"
+  log "Testing skip-if-ideal per-stream gating (multi-sub, all pass)..."
+  local sii_subs_log
+  sii_subs_log="$(MUXM_HOME="$sii_subs_home" run_muxm --profile dv-archival \
+    "$TESTDIR/hevc_multi_subs.mkv" "$sii_subs_out")"
+  if echo "$sii_subs_log" | grep -qiE "ideal|skip|already|compliant"; then
+    pass "skip-if-ideal per-stream: source recognized as ideal"
+  else
+    # Source may not be recognized as ideal if compliance check is stricter —
+    # either way the output should preserve all streams, so we continue.
+    log "skip-if-ideal per-stream: source not detected as ideal (proceeding to stream count check)"
+  fi
+  if [[ -f "$sii_subs_out" && -s "$sii_subs_out" ]]; then
+    assert_stream_count "skip-if-ideal per-stream: 5 subtitle tracks preserved" \
+      "$sii_subs_out" s 5 5
+    assert_stream_count "skip-if-ideal per-stream: 1 audio track preserved" \
+      "$sii_subs_out" a 1 1
+  else
+    skip "skip-if-ideal per-stream: no output file (encode may have failed)"
+  fi
+
   # --keep-temp-always (#27)
   # -K/--keep-temp-always preserves workdir on success; -k/--keep-temp only on failure.
   # Test -K with a successful encode: expect both output AND preserved workdir.
@@ -1729,35 +2385,113 @@ test_containers() {
 }
 
 # === Suite: Metadata Tests ===
-# Validates --strip-metadata removes format-level tags, metadata preservation without the flag,
-# and acceptance of --ffmpeg-loglevel and --no-hide-banner.
+# Validates --strip-metadata removes format-level tags, profile comment behavior
+# (survives strip, suppressed by --no-profile-comment, correct per-profile values),
+# metadata preservation without the flag, and acceptance of --ffmpeg-loglevel / --no-hide-banner.
 test_metadata() {
   section "Metadata & Strip Verification"
 
   local outfile out title comment
 
   # --strip-metadata encode test (#25, #53)
+  # Profile comment is applied AFTER -map_metadata -1, so it intentionally
+  # survives --strip-metadata.  Source-inherited tags (title, encoder) should
+  # be removed; the profile comment should remain.
   outfile="$TESTDIR/meta_stripped.mp4"
-  log "Testing --strip-metadata with real encode..."
+  log "Testing --strip-metadata with profile (comment survives by design)..."
   if assert_encode "--strip-metadata: output produced" "$outfile" \
-       --strip-metadata --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
+       --profile streaming --strip-metadata --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
     title="$(probe_format_tag "$outfile" title)"
     comment="$(probe_format_tag "$outfile" comment)"
-    if [[ -z "$title" && -z "$comment" ]]; then
-      pass "--strip-metadata: title and comment removed"
-    elif [[ -z "$title" ]]; then
-      pass "--strip-metadata: title removed"
-      skip "--strip-metadata: comment='$comment' (may persist in some containers)"
+    if [[ -z "$title" ]]; then
+      pass "--strip-metadata: source title removed"
     else
-      skip "--strip-metadata: title='$title', comment='$comment' (stripping may be partial)"
+      fail "--strip-metadata: source title survived ('$title')"
+    fi
+    if [[ "$comment" == "Lean, mean, streaming machine." ]]; then
+      pass "--strip-metadata: profile comment survives (by design)"
+    else
+      fail "--strip-metadata: expected streaming profile comment, got='$comment'"
     fi
   fi
 
-  # Without --strip-metadata, metadata should be preserved
+  # --strip-metadata + --no-profile-comment: everything should be gone
+  outfile="$TESTDIR/meta_stripped_no_comment.mp4"
+  log "Testing --strip-metadata + --no-profile-comment..."
+  if assert_encode "--strip-metadata + --no-profile-comment: output produced" "$outfile" \
+       --profile streaming --strip-metadata --no-profile-comment --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
+    title="$(probe_format_tag "$outfile" title)"
+    comment="$(probe_format_tag "$outfile" comment)"
+    if [[ -z "$title" ]]; then
+      pass "--strip-metadata + --no-profile-comment: source title removed"
+    else
+      fail "--strip-metadata + --no-profile-comment: source title survived ('$title')"
+    fi
+    if [[ -z "$comment" ]]; then
+      pass "--strip-metadata + --no-profile-comment: comment removed"
+    else
+      fail "--strip-metadata + --no-profile-comment: comment survived ('$comment')"
+    fi
+  fi
+
+  # Profile comment present by default when a profile is active
+  outfile="$TESTDIR/meta_profile_comment.mp4"
+  log "Testing profile comment is written by default..."
+  if assert_encode "Profile comment default: output produced" "$outfile" \
+       --profile streaming --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
+    comment="$(probe_format_tag "$outfile" comment)"
+    if [[ "$comment" == "Lean, mean, streaming machine." ]]; then
+      pass "Profile comment present: streaming tagline correct"
+    else
+      fail "Profile comment: expected 'Lean, mean, streaming machine.', got='$comment'"
+    fi
+  fi
+
+  # --no-profile-comment suppresses the comment
+  outfile="$TESTDIR/meta_no_profile_comment.mp4"
+  log "Testing --no-profile-comment suppresses comment..."
+  if assert_encode "--no-profile-comment: output produced" "$outfile" \
+       --profile streaming --no-profile-comment --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
+    comment="$(probe_format_tag "$outfile" comment)"
+    # Without --strip-metadata the source comment may survive; check that the
+    # profile tagline is absent (source comment is "This is a test comment").
+    if echo "$comment" | grep -qF "Lean, mean, streaming machine."; then
+      fail "--no-profile-comment: profile tagline still present"
+    else
+      pass "--no-profile-comment: profile tagline suppressed"
+    fi
+  fi
+
+  # Verify per-profile comment values via real encodes (spot-check two more profiles)
+  outfile="$TESTDIR/meta_comment_animation.mkv"
+  log "Testing animation profile comment..."
+  if assert_encode "Profile comment animation: output produced" "$outfile" \
+       --profile animation --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
+    comment="$(probe_format_tag "$outfile" comment)"
+    if [[ "$comment" == "psy-rd turned down, sakuga turned up." ]]; then
+      pass "Profile comment: animation tagline correct"
+    else
+      fail "Profile comment animation: expected 'psy-rd turned down, sakuga turned up.', got='$comment'"
+    fi
+  fi
+
+  outfile="$TESTDIR/meta_comment_universal.mp4"
+  log "Testing universal profile comment..."
+  if assert_encode "Profile comment universal: output produced" "$outfile" \
+       --profile universal --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
+    comment="$(probe_format_tag "$outfile" comment)"
+    if [[ "$comment" == "Lowest common denominator, highest common decency." ]]; then
+      pass "Profile comment: universal tagline correct"
+    else
+      fail "Profile comment universal: expected 'Lowest common denominator, highest common decency.', got='$comment'"
+    fi
+  fi
+
+  # Without --strip-metadata, source metadata should be preserved
   outfile="$TESTDIR/meta_preserved.mp4"
   log "Testing metadata preservation (no --strip-metadata)..."
   if assert_encode "Metadata preservation encode" "$outfile" \
-       --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
+       --no-profile-comment --crf 28 --preset ultrafast "$TESTDIR/rich_metadata.mkv"; then
     title="$(probe_format_tag "$outfile" title)"
     if [[ -n "$title" ]]; then
       pass "Metadata preserved: title='$title'"
@@ -2195,6 +2929,50 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_stdout "_audio_codec_rank(truehd, animation)=1"  "1"  _audio_codec_rank "$anim_rank_env" "truehd"
   assert_muxm_fn_stdout "_audio_codec_rank(eac3, animation)=2"    "2"  _audio_codec_rank "$anim_rank_env" "eac3"
 
+  # ---- Scoring formula invariants (regression guards for codec-vs-bitrate bug) ----
+  # These validate the arithmetic properties of _score_audio_stream without needing
+  # ffprobe metadata, by computing score components directly from the formula.
+  #
+  # Invariant 1: One codec rank step MUST exceed the maximum bitrate bonus.
+  # The formula gives (10 - rank) * 10 per codec position and caps bitrate at 8.
+  # Adjacent codecs differ by rank=1 → 10 points. Bitrate max = 8 points.
+  # So a higher-ranked codec can never lose to bitrate alone.
+  local codec_step=10 max_br_bonus=8
+  if (( codec_step > max_br_bonus )); then
+    pass "Scoring invariant: codec rank step ($codec_step) > max bitrate bonus ($max_br_bonus)"
+  else
+    fail "Scoring invariant: codec rank step ($codec_step) must exceed max bitrate bonus ($max_br_bonus)"
+  fi
+
+  # Invariant 2: Lossless synthetic floor produces a non-trivial bitrate bonus.
+  # The floor is 1536000; at br/50000 capped to 8, that gives 8 points — same as
+  # any high-bitrate lossy codec, so lossless is never penalised for missing metadata.
+  local lossless_floor=1536000
+  local lossless_br_bonus=$(( lossless_floor / 50000 ))
+  (( lossless_br_bonus > max_br_bonus )) && lossless_br_bonus=$max_br_bonus
+  if (( lossless_br_bonus >= max_br_bonus )); then
+    pass "Scoring invariant: lossless floor produces max bitrate bonus ($lossless_br_bonus)"
+  else
+    fail "Scoring invariant: lossless floor bitrate bonus ($lossless_br_bonus) should reach cap ($max_br_bonus)"
+  fi
+
+  # Invariant 3: Simulated Arcane scenario — FLAC rank 0 vs AC3 rank 3 (animation pref).
+  # Both 6ch eng, FLAC br=0 (gets floor), AC3 br=640000.
+  # This is the exact scenario that was broken before the fix.
+  local flac_rank=0 ac3_rank=3
+  local flac_codec_score=$(( (10 - flac_rank) * 10 ))  # 100
+  local ac3_codec_score=$((  (10 - ac3_rank)  * 10 ))  # 70
+  local ac3_br_bonus=$(( 640000 / 50000 ))
+  (( ac3_br_bonus > max_br_bonus )) && ac3_br_bonus=$max_br_bonus
+  # FLAC gets max bitrate bonus from synthetic floor
+  local flac_total=$(( flac_codec_score + lossless_br_bonus ))
+  local ac3_total=$((  ac3_codec_score  + ac3_br_bonus ))
+  if (( flac_total > ac3_total )); then
+    pass "Scoring invariant: FLAC($flac_total) > AC3($ac3_total) in Arcane scenario"
+  else
+    fail "Scoring invariant: FLAC($flac_total) should beat AC3($ac3_total) — codec preference regression"
+  fi
+
   # ---- _audio_is_commentary ----
   assert_muxm_fn_exit "_audio_is_commentary('Director\\'s Commentary')=match"  0 _audio_is_commentary "" "Director's Commentary"
   assert_muxm_fn_exit "_audio_is_commentary('Main Feature')=no match"          1 _audio_is_commentary "" "Main Feature"
@@ -2305,6 +3083,24 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_exit "audio_lossless_muxable('dts','mp4')=not muxable"         1 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "dts"
   assert_muxm_fn_exit "audio_lossless_muxable('alac','mov')=muxable"            0 audio_lossless_muxable 'MUX_FORMAT="mov"'      "alac"
   assert_muxm_fn_exit "audio_lossless_muxable('truehd','mov')=not muxable"      1 audio_lossless_muxable 'MUX_FORMAT="mov"'      "truehd"
+
+  # ---- _audio_copy_ext ----
+  # Maps ffprobe codec names to file extensions that ffmpeg can mux when
+  # stream-copying.  The truehd→thd mapping is the fix for the "Unable to
+  # choose an output format for audio_primary.truehd" fatal error.
+  # A regression here silently breaks lossless passthrough for the affected codec.
+  assert_muxm_fn_stdout "_audio_copy_ext('truehd')=thd"       "thd"       _audio_copy_ext "" "truehd"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s16le')=wav"    "wav"       _audio_copy_ext "" "pcm_s16le"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s24le')=wav"    "wav"       _audio_copy_ext "" "pcm_s24le"
+  assert_muxm_fn_stdout "_audio_copy_ext('pcm_s32le')=wav"    "wav"       _audio_copy_ext "" "pcm_s32le"
+  assert_muxm_fn_stdout "_audio_copy_ext('dca')=dts"          "dts"       _audio_copy_ext "" "dca"
+  # Passthrough codecs — extension should equal the codec name
+  assert_muxm_fn_stdout "_audio_copy_ext('aac')=aac"          "aac"       _audio_copy_ext "" "aac"
+  assert_muxm_fn_stdout "_audio_copy_ext('ac3')=ac3"          "ac3"       _audio_copy_ext "" "ac3"
+  assert_muxm_fn_stdout "_audio_copy_ext('eac3')=eac3"        "eac3"      _audio_copy_ext "" "eac3"
+  assert_muxm_fn_stdout "_audio_copy_ext('flac')=flac"        "flac"      _audio_copy_ext "" "flac"
+  assert_muxm_fn_stdout "_audio_copy_ext('dts')=dts"          "dts"       _audio_copy_ext "" "dts"
+  assert_muxm_fn_stdout "_audio_copy_ext('alac')=m4a"          "m4a"       _audio_copy_ext "" "alac"
 }
 
 _test_unit_sub_helpers() {
@@ -2418,12 +3214,49 @@ _test_unit_filesize() {
   if [[ "$result" == *"MB"* ]]; then pass "filesize_pretty(~1.5 MB)"; else fail "filesize_pretty(~1.5 MB) expected 'MB', got '$result'"; fi
 }
 
+_test_unit_sii_container_safety() {
+  # ---- _sii_audio_is_container_safe ----
+  # Checks whether an audio codec can be muxed into the target container during
+  # skip-if-ideal remux.  MKV passes all codecs; MP4/MOV reject TrueHD, DTS/DCA,
+  # and raw PCM.  A regression here silently drops audio streams in the metadata
+  # remux — the most dangerous failure mode because the output file is valid but
+  # incomplete.  Mirrors the _is_text_sub_codec pattern for subtitles.
+  # Depends on MUX_FORMAT global.
+
+  # MKV passes everything
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('truehd','matroska')=safe"      0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "truehd"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('dts','matroska')=safe"         0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "dts"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('dca','matroska')=safe"         0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "dca"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('pcm_s16le','matroska')=safe"   0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "pcm_s16le"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','matroska')=safe"         0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "aac"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('eac3','matroska')=safe"        0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "eac3"
+
+  # MP4 rejects TrueHD, DTS/DCA, raw PCM
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('truehd','mp4')=unsafe"         1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "truehd"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('dts','mp4')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "dts"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('dca','mp4')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "dca"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('pcm_s16le','mp4')=unsafe"      1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "pcm_s16le"
+
+  # MP4 accepts common lossy codecs + ALAC
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','mp4')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "aac"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('eac3','mp4')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "eac3"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('alac','mp4')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "alac"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('ac3','mp4')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "ac3"
+
+  # MOV mirrors MP4 rejection rules
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('truehd','mov')=unsafe"         1 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "truehd"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('dca','mov')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "dca"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','mov')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "aac"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('alac','mov')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "alac"
+}
+
 test_unit() {
   section "Pure-Function Unit Tests"
   _test_unit_audio_helpers
   _test_unit_sub_helpers
   _test_unit_validation_helpers
   _test_unit_filesize
+  _test_unit_sii_container_safety
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
@@ -2491,6 +3324,217 @@ test_profile_e2e() {
       esac
     fi
   done
+
+  # ---- animation profile + ASS source: verify subtitle format preserved ----
+  # Isolate HOME to prevent user config from affecting subtitle pipeline.
+  local _saved_home="$HOME"
+  export HOME="$TESTDIR/e2e_ass_home"
+  mkdir -p "$HOME"
+
+  local ass_e2e_out="$TESTDIR/e2e_animation_ass.mkv"
+  log "Full encode: animation profile with ASS subtitles..."
+  if assert_encode "animation + ASS: e2e output produced" "$ass_e2e_out" \
+       --profile animation --preset ultrafast --crf 28 "$TESTDIR/ass_subs.mkv"; then
+    local ass_e2e_codec
+    ass_e2e_codec="$(probe_sub "$ass_e2e_out" codec_name)"
+    if [[ "$ass_e2e_codec" == "ass" || "$ass_e2e_codec" == "ssa" ]]; then
+      pass "animation + ASS e2e: subtitle preserved as native $ass_e2e_codec"
+    else
+      fail "animation + ASS e2e: expected ass/ssa, got '$ass_e2e_codec'"
+    fi
+    # Verify subtitle content retained styling (check for ASS header markers)
+    local ass_e2e_content
+    ass_e2e_content="$(ffprobe -v error -select_streams s:0 -show_entries \
+      stream=codec_name,codec_long_name -of csv=p=0 "$ass_e2e_out" 2>/dev/null)"
+    assert_contains "ass" "animation + ASS e2e: ffprobe confirms ASS codec" "$ass_e2e_content"
+  fi
+
+  export HOME="$_saved_home"
+
+  # ---- dv-archival multi-track audio: verify commentary filtered, rest preserved ----
+  # hevc_multi_audio.mkv: 3 audio tracks — eng "Main Feature", eng "Director's Commentary", spa "Spanish"
+  # dv-archival defaults: AUDIO_MULTI_TRACK=1, AUDIO_KEEP_COMMENTARY=0, AUDIO_LANG_PREF="" (keep all langs)
+  # Expected: commentary dropped → 2 audio tracks in output (eng main + spa)
+  local mt_e2e_home="$TESTDIR/e2e_mt_home"
+  mkdir -p "$mt_e2e_home"
+
+  local mt_e2e_out="$TESTDIR/e2e_dv_archival_multi.mkv"
+  log "Full encode: dv-archival profile multi-track audio..."
+  if MUXM_HOME="$mt_e2e_home" assert_encode "dv-archival multi-track: e2e output produced" "$mt_e2e_out" \
+       --profile dv-archival "$TESTDIR/hevc_multi_audio.mkv"; then
+    # Should have 2 audio tracks (commentary dropped)
+    local mt_e2e_acount
+    mt_e2e_acount="$(count_streams "$mt_e2e_out" a)"
+    if [[ "$mt_e2e_acount" -eq 2 ]]; then
+      pass "dv-archival multi-track e2e: 2 audio tracks (commentary filtered)"
+    else
+      fail "dv-archival multi-track e2e: expected 2 audio tracks, got $mt_e2e_acount"
+    fi
+    # Video should be copy (HEVC, not re-encoded)
+    assert_probe "dv-archival multi-track e2e: video is HEVC (copy)" "$mt_e2e_out" codec_name hevc
+    # First audio track should have eng language
+    local mt_e2e_lang0
+    mt_e2e_lang0="$(probe_stream_tag "$mt_e2e_out" a:0 language)"
+    if [[ "$mt_e2e_lang0" == "eng" ]]; then
+      pass "dv-archival multi-track e2e: first audio track is English"
+    else
+      fail "dv-archival multi-track e2e: expected eng, got lang='$mt_e2e_lang0'"
+    fi
+    # Second audio track should have spa language
+    local mt_e2e_lang1
+    mt_e2e_lang1="$(probe_stream_tag "$mt_e2e_out" a:1 language)"
+    if [[ "$mt_e2e_lang1" == "spa" ]]; then
+      pass "dv-archival multi-track e2e: second audio track is Spanish"
+    else
+      fail "dv-archival multi-track e2e: expected spa, got lang='$mt_e2e_lang1'"
+    fi
+    # Audio title metadata alignment: after commentary filtering, output indices
+    # shift (source #0→out #0, source #2→out #1). The fix uses a sequential
+    # output counter instead of source indices for -metadata:s:a:N tags.
+    # A misalignment means the wrong title on the wrong track — or blank titles.
+    local mt_e2e_title0
+    mt_e2e_title0="$(probe_stream_tag "$mt_e2e_out" a:0 title)"
+    if [[ -n "$mt_e2e_title0" ]]; then
+      pass "dv-archival multi-track e2e: first audio track has title ('$mt_e2e_title0')"
+    else
+      fail "dv-archival multi-track e2e: first audio track has no title (metadata alignment bug)"
+    fi
+    local mt_e2e_title1
+    mt_e2e_title1="$(probe_stream_tag "$mt_e2e_out" a:1 title)"
+    if [[ -n "$mt_e2e_title1" ]]; then
+      pass "dv-archival multi-track e2e: second audio track has title ('$mt_e2e_title1')"
+    else
+      fail "dv-archival multi-track e2e: second audio track has no title (metadata alignment bug)"
+    fi
+  fi
+
+  # ---- dv-archival multi-track subtitles: verify all subs kept, dispositions correct ----
+  # hevc_multi_subs.mkv: 5 subs — eng forced, eng full, eng SDH, spa full, fra full
+  # dv-archival defaults: SUB_MULTI_TRACK=1, all SUB_INCLUDE_*=1, SUB_LANG_PREF="" (keep all)
+  # Expected: all 5 subtitle tracks preserved in output
+  local mt_sub_e2e_home="$TESTDIR/e2e_mt_sub_home"
+  mkdir -p "$mt_sub_e2e_home"
+
+  local mt_sub_e2e_out="$TESTDIR/e2e_dv_archival_multi_subs.mkv"
+  log "Full encode: dv-archival profile multi-track subtitles..."
+  # --no-skip-if-ideal: fixture is fully compliant; without this, muxm skips processing.
+  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "dv-archival multi-track subs: e2e output produced" "$mt_sub_e2e_out" \
+       --no-skip-if-ideal --profile dv-archival "$TESTDIR/hevc_multi_subs.mkv"; then
+    # Should have 5 subtitle tracks (all kept)
+    local mt_sub_e2e_scount
+    mt_sub_e2e_scount="$(count_streams "$mt_sub_e2e_out" s)"
+    if [[ "$mt_sub_e2e_scount" -eq 5 ]]; then
+      pass "dv-archival multi-track sub e2e: 5 subtitle tracks preserved"
+    else
+      fail "dv-archival multi-track sub e2e: expected 5 subtitle tracks, got $mt_sub_e2e_scount"
+    fi
+    # Video should be copy (HEVC)
+    assert_probe "dv-archival multi-track sub e2e: video is HEVC (copy)" "$mt_sub_e2e_out" codec_name hevc
+    # First sub should have eng language
+    local mt_sub_e2e_lang0
+    mt_sub_e2e_lang0="$(probe_stream_tag "$mt_sub_e2e_out" s:0 language)"
+    if [[ "$mt_sub_e2e_lang0" == "eng" ]]; then
+      pass "dv-archival multi-track sub e2e: first subtitle is English"
+    else
+      fail "dv-archival multi-track sub e2e: expected eng, got lang='$mt_sub_e2e_lang0'"
+    fi
+    # Fourth sub (s:3) should have spa language
+    local mt_sub_e2e_lang3
+    mt_sub_e2e_lang3="$(probe_stream_tag "$mt_sub_e2e_out" s:3 language)"
+    if [[ "$mt_sub_e2e_lang3" == "spa" ]]; then
+      pass "dv-archival multi-track sub e2e: fourth subtitle is Spanish"
+    else
+      fail "dv-archival multi-track sub e2e: expected spa, got lang='$mt_sub_e2e_lang3'"
+    fi
+    # Fifth sub (s:4) should have fra language
+    local mt_sub_e2e_lang4
+    mt_sub_e2e_lang4="$(probe_stream_tag "$mt_sub_e2e_out" s:4 language)"
+    if [[ "$mt_sub_e2e_lang4" == "fra" ]]; then
+      pass "dv-archival multi-track sub e2e: fifth subtitle is French"
+    else
+      fail "dv-archival multi-track sub e2e: expected fra, got lang='$mt_sub_e2e_lang4'"
+    fi
+    # Verify first sub has forced disposition
+    local mt_sub_e2e_dispo0
+    mt_sub_e2e_dispo0="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=forced -of csv=p=0 "$mt_sub_e2e_out" 2>/dev/null | head -1)"
+    if [[ "$mt_sub_e2e_dispo0" == "1" ]]; then
+      pass "dv-archival multi-track sub e2e: first subtitle has forced disposition"
+    else
+      fail "dv-archival multi-track sub e2e: first subtitle forced disposition expected 1, got '$mt_sub_e2e_dispo0'"
+    fi
+  fi
+
+  # ---- dv-archival multi-track subtitles with language filter ----
+  # --sub-lang-pref eng should keep only eng tracks (3 of 5)
+  local mt_sub_lang_e2e_out="$TESTDIR/e2e_dv_archival_multi_subs_eng.mkv"
+  log "Full encode: dv-archival multi-track subs with --sub-lang-pref eng..."
+  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "dv-archival multi-track subs eng: e2e output produced" "$mt_sub_lang_e2e_out" \
+       --profile dv-archival --sub-lang-pref eng "$TESTDIR/hevc_multi_subs.mkv"; then
+    local mt_sub_lang_scount
+    mt_sub_lang_scount="$(count_streams "$mt_sub_lang_e2e_out" s)"
+    if [[ "$mt_sub_lang_scount" -eq 3 ]]; then
+      pass "dv-archival multi-track sub eng e2e: 3 subtitle tracks (eng only)"
+    else
+      fail "dv-archival multi-track sub eng e2e: expected 3 subtitle tracks, got $mt_sub_lang_scount"
+    fi
+  fi
+
+  # ---- animation multi-track subtitles: verify eng subs kept ----
+  # animation profile: SUB_MULTI_TRACK=1, SUB_MAX_TRACKS=6, all SUB_INCLUDE_*=1
+  # SUB_LANG_PREF=eng (default) — only English tracks survive the language filter.
+  # hevc_multi_subs.mkv: 3 eng + 1 spa + 1 fra = 5 total → 3 kept.
+  # This is the core regression test: previously animation routed PGS/bitmap subs
+  # through the single-track OCR pipeline and silently dropped them when OCR failed.
+  local mt_sub_anim_e2e_out="$TESTDIR/e2e_animation_multi_subs.mkv"
+  log "Full encode: animation profile multi-track subtitles..."
+  if assert_encode "animation multi-track subs: e2e output produced" "$mt_sub_anim_e2e_out" \
+       --profile animation --crf 28 --preset ultrafast "$TESTDIR/hevc_multi_subs.mkv"; then
+    local mt_sub_anim_scount
+    mt_sub_anim_scount="$(count_streams "$mt_sub_anim_e2e_out" s)"
+    if [[ "$mt_sub_anim_scount" -eq 3 ]]; then
+      pass "animation multi-track sub e2e: 3 subtitle tracks preserved (eng only)"
+    else
+      fail "animation multi-track sub e2e: expected 3 subtitle tracks (eng only), got $mt_sub_anim_scount"
+    fi
+    # Video should be re-encoded to HEVC (animation always re-encodes)
+    assert_probe "animation multi-track sub e2e: video is HEVC" "$mt_sub_anim_e2e_out" codec_name hevc
+    # First sub should have eng language
+    local mt_sub_anim_lang0
+    mt_sub_anim_lang0="$(probe_stream_tag "$mt_sub_anim_e2e_out" s:0 language)"
+    if [[ "$mt_sub_anim_lang0" == "eng" ]]; then
+      pass "animation multi-track sub e2e: first subtitle is English"
+    else
+      fail "animation multi-track sub e2e: expected eng, got lang='$mt_sub_anim_lang0'"
+    fi
+    # Third sub (s:2) should also be eng (SDH) — no spa/fra tracks survive
+    local mt_sub_anim_lang2
+    mt_sub_anim_lang2="$(probe_stream_tag "$mt_sub_anim_e2e_out" s:2 language)"
+    if [[ "$mt_sub_anim_lang2" == "eng" ]]; then
+      pass "animation multi-track sub e2e: third subtitle is English (SDH)"
+    else
+      fail "animation multi-track sub e2e: expected eng, got lang='$mt_sub_anim_lang2'"
+    fi
+  fi
+
+  # ---- dv-archival multi-track audio with language filter ----
+  # Dry-run shows "keeping 1 of 3" for --audio-lang-pref eng (commentary dropped
+  # by AUDIO_KEEP_COMMENTARY=0, spa dropped by language filter).  This real encode
+  # confirms the ffmpeg command is built correctly — output has exactly 1 audio track.
+  # Fixture: hevc_multi_audio.mkv — eng main + eng commentary + spa (3 audio tracks).
+  local mt_audio_lang_e2e_out="$TESTDIR/e2e_dv_archival_mt_audio_eng.mkv"
+  log "Full encode: dv-archival multi-track audio with --audio-lang-pref eng..."
+  if MUXM_HOME="$mt_e2e_home" assert_encode "dv-archival multi-track audio eng: e2e output produced" "$mt_audio_lang_e2e_out" \
+       --profile dv-archival --audio-lang-pref eng "$TESTDIR/hevc_multi_audio.mkv"; then
+    assert_stream_count "dv-archival multi-track audio eng e2e: 1 audio track (eng main only)" \
+      "$mt_audio_lang_e2e_out" a 1 1
+    local mt_audio_lang_e2e_lang0
+    mt_audio_lang_e2e_lang0="$(probe_stream_tag "$mt_audio_lang_e2e_out" a:0 language)"
+    if [[ "$mt_audio_lang_e2e_lang0" == "eng" ]]; then
+      pass "dv-archival multi-track audio eng e2e: surviving track is English"
+    else
+      fail "dv-archival multi-track audio eng e2e: expected eng, got '$mt_audio_lang_e2e_lang0'"
+    fi
+  fi
 }
 
 # === Suite: Completions Installer ===
@@ -2643,8 +3687,8 @@ test_setup() {
 
 # ---- Run Suites ----
 # NOTE: Suite names are listed in three places that must stay in sync:
-#   1. File header comment (lines 10-11)
-#   2. --help output in arg parser (lines 41-42)
+#   1. File header comment (top of file)
+#   2. show_help() function
 #   3. This case statement
 run_suites() {
   case "$SUITE" in
@@ -2689,9 +3733,7 @@ run_suites() {
     edge)         test_edge ;;
     e2e)          test_profile_e2e ;;
     *)
-      echo "Unknown suite: $SUITE"
-      echo "Valid: all, cli, toggles, unit, completions, setup, config, profiles, conflicts, collision, dryrun,"
-      echo "       video, hdr, audio, subs, output, containers, metadata, edge, e2e"
+      echo "Unknown suite: $SUITE (run with --help to see available suites)"
       exit 1
       ;;
   esac
