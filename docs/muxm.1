@@ -263,6 +263,10 @@ Preferred subtitle languages (comma\-separated).
 .BR \-\-sub\-burn\-forced " , " \-\-no\-sub\-burn\-forced
 Burn/don't burn forced subtitles into the video stream.
 .TP
+.BR \-\-clear\-default\-subs " , " \-\-no\-clear\-default\-subs
+Clear default subtitle flags in MP4/MOV output using MP4Box to prevent
+players from auto-enabling full/SDH subtitles.
+.TP
 .BR \-\-sub\-export\-external " , " \-\-no\-sub\-export\-external
 Export/embed subtitles as external .srt files.
 .IP
@@ -406,6 +410,18 @@ is rejected with an error directing you to use
 Replace the original source file with the encoded output without prompting
 for confirmation. This is the scripting\-friendly variant of
 .BR \-\-replace\-source .
+.TP
+.BR \-\-remove\-source
+Remove the original source file after a successful encode. Prompts for
+confirmation before proceeding. Requires an interactive terminal (stdin
+must be a TTY); in non\-interactive shells (scripts, pipelines), this flag
+is rejected with an error directing you to use
+.BR \-\-force\-remove\-source .
+.TP
+.BR \-\-force\-remove\-source
+Remove the original source file after a successful encode without prompting
+for confirmation. This is the scripting\-friendly variant of
+.BR \-\-remove\-source .
 .PP
 .B Source collision auto\-versioning:
 When the derived output path matches the source file and neither
@@ -566,10 +582,10 @@ Major variable groups:
 .TP
 .B Subtitles
 .BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED ", " SUB_INCLUDE_FULL ", "
-.BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_BURN_FORCED ", "
-.BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
-.BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
-.BR SUB_OCR_LANG .
+.BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_CLEAR_DEFAULT ", "
+.BR SUB_BURN_FORCED ", " SUB_EXPORT_EXTERNAL ", "
+.BR SUB_PRESERVE_TEXT_FORMAT ", " SUB_ENABLE_OCR ", "
+.BR SUB_OCR_TOOL ", " SUB_OCR_LANG .
 .TP
 .B Multi\-track subtitles (archival)
 .BR SUB_MULTI_TRACK .

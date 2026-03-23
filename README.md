@@ -87,7 +87,7 @@ muxm --profile hdr10-hq movie.mkv
 
 ### `atv-directplay-hq` — Apple TV Direct Play
 
-Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present) with AAC stereo fallback, and forced subtitle burn-in. Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
+Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present) with AAC stereo fallback, and forced subtitle burn-in. Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant. **Automatically uses hardware acceleration (NVIDIA/Intel/Apple) when available** for 3-5x faster encoding.
 
 ```
 muxm --profile atv-directplay-hq movie.mkv
@@ -243,6 +243,18 @@ muxm --uninstall-man
 muxm --uninstall-completions
 ```
 
+**🚀 Hardware Acceleration Setup**
+
+After installation, configure hardware acceleration for 3-5x faster encoding:
+
+```bash
+# Auto-detect and configure your GPU (NVIDIA/Intel/Apple)
+muxm --setup
+```
+
+**📖 Full Hardware Acceleration Guide:**  
+[See comprehensive setup documentation](docs/hardware_acceleration.md) for platform-specific requirements, FFmpeg setup, troubleshooting, and performance optimization.
+
 ### Upgrading
 
 <a id="upgrading"></a>
@@ -297,6 +309,7 @@ muxm [options] <source> [target.mp4]
 | `--sub-lang-pref LANGS` | Subtitle language preference (comma-separated) |
 | `--sub-burn-forced` | Burn forced subtitles into video |
 | `--sub-preserve-format` | Keep ASS/SSA subtitles in native format (MKV only; use `--no-sub-preserve-format` to force SRT conversion) |
+| `--clear-default-subs` | Clear default subtitle flag in MP4/MOV using MP4Box |
 | `--output-ext mp4\|mkv\|m4v\|mov` | Output container |
 | `--report-json` | Generate a JSON report alongside the output file |
 | `--checksum` | Write a SHA-256 checksum file for the output |
@@ -304,6 +317,8 @@ muxm [options] <source> [target.mp4]
 | `--skip-if-ideal` | Skip processing if source matches target |
 | `--replace-source` | Replace the original source file (interactive confirmation) |
 | `--force-replace-source` | Replace the original source file (no prompt; scripting-friendly) |
+| `--remove-source` | Remove the original source file after encoding (interactive confirmation) |
+| `--force-remove-source` | Remove the original source file after encoding (no prompt; scripting-friendly) |
 | `--print-effective-config` | Show resolved config after config file imports |
 
 ### Setup & Management
@@ -392,6 +407,7 @@ Beyond profiles and the core encoding pipeline, `muxm` ships with a set of opera
 
 - **Skip-if-Ideal** – Before encoding, `muxm` inspects the source to determine if it already matches the target profile. If it does, the file is linked or copied without re-encoding, saving time and avoiding generation loss. When multi-track audio or subtitle modes are active, the ideal check verifies that every source track would survive the filter — if any would be dropped, the source is not ideal and remuxing proceeds with explicit per-stream maps. Enabled per-profile or via `--skip-if-ideal`.
 - **Collision Handling** – When the derived output filename matches the source (e.g., encoding `movie.mp4` with the default `.mp4` extension), `muxm` auto-versions the output to `movie(1).mp4`, `movie(2).mp4`, etc. instead of failing. Use `--replace-source` for interactive in-place replacement or `--force-replace-source` for scripted workflows.
+- **Source Management** – In addition to replacing the source file, you can choose to remove the original file entirely after a successful encode using `--remove-source` (interactive) or `--force-remove-source` (scripted).
 - **Conflict Warnings** – Running `--profile dv-archival --no-dv` doesn't error out — it warns you that the combination is contradictory and proceeds with your explicit flags taking precedence. Flags that are incompatible with multi-track modes (e.g., `--audio-track`, `--audio-force-codec`, `--sub-burn-forced`) trigger a graceful demotion: multi-track mode drops to single-track with an informational note, and the explicit CLI flag wins. The tool trusts you but lets you know when something looks wrong.
 - **Dry-Run Mode** – `--dry-run` executes the entire decision pipeline (profile resolution, codec detection, DV identification, audio selection) and prints what it would do, without writing any output files.
 - **JSON Reporting** – `--report-json` generates a machine-readable JSON report alongside the output file, documenting every decision, warning, codec mapping, and stream disposition from the run.
