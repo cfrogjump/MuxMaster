@@ -68,6 +68,7 @@ _is_valid_profile(){ [[ " $VALID_PROFILES " == *" $1 "* ]]; }
 declare -a COMPLETED_STEPS=()
 declare -a MUXM_CONFIG_LOADED=()
 WORKDIR=""
+_LOCAL_PIPE_DIR=""
 LOGFILE=""
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (outside WORKDIR; cleaned in on_exit)
 FAILED=0
@@ -160,6 +161,7 @@ declare -i SUB_INCLUDE_FORCED=1
 declare -i SUB_INCLUDE_FULL=1
 declare -i SUB_INCLUDE_SDH=1
 declare -i SUB_MAX_TRACKS=3
+declare -i SUB_CLEAR_DEFAULT=0
 
 declare -i SUB_ENABLE_OCR=1
 SUB_OCR_TOOL="sub2srt"
@@ -307,14 +309,22 @@ run_with_spinner() {
 
 # _make_progress_pipe — Create a named pipe (FIFO) for ffmpeg -progress output.
 # Args: $1 — path for the FIFO
-# Returns: 0 if FIFO created successfully, 1 on failure (with warning logged).
+# Returns: 0 if FIFO created successfully, 1 on failure.
+# Outputs: the pipe path if created (may be a local fallback path).
 # On failure, callers should fall back to spinner-only mode (no -progress flag).
 _make_progress_pipe() {
   local pipe_path="$1"
   if mkfifo "$pipe_path" 2>/dev/null; then
+    echo "$pipe_path"
     return 0
   fi
-  warn "Could not create progress pipe ($pipe_path) — progress display unavailable."
+
+  # SMB/NFS shares often don't support FIFOs; fall back to local temp.
+  local fallback_pipe="${TMPDIR:-/tmp}/muxm_pipe_$$.$(basename "$pipe_path")"
+  if mkfifo "$fallback_pipe" 2>/dev/null; then
+    echo "$fallback_pipe"
+    return 0
+  fi
   return 1
 }
 
@@ -2574,8 +2584,10 @@ _create_config_emit() {
   local _base="DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL "
   _base+="OUTPUT_EXT VIDEO_CODEC VIDEO_COPY_IF_COMPLIANT "
   _base+="AUDIO_LOSSLESS_PASSTHROUGH ADD_STEREO_IF_MULTICH STEREO_BITRATE "
-  _base+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED "
+  _base+="SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_BURN_FORCED SUB_CLEAR_DEFAULT "
+  _base+="SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT SUB_ENABLE_OCR SUB_OCR_TOOL SUB_OCR_LANG "
   _base+="KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT "
+  _base+="PROFILE_ALLOW_HW "
   _active+="$_base"
 
   case "$profile" in
@@ -2679,6 +2691,9 @@ HEADER
   echo ""
   echo "# Enable hardware encode when available (1=enabled, 0=disabled)"
   printf 'HWACCEL_ENCODE=1\n'
+  echo ""
+  echo "# Allow hardware encoding for the active profile (1=allow, 0=disable)"
+  printf 'PROFILE_ALLOW_HW=%s\n' "$PROFILE_ALLOW_HW"
   echo ""
 
   echo "# ========================="
@@ -2887,6 +2902,9 @@ HEADER
   echo ""
   echo "# Maximum subtitle tracks to include in output"
   _V SUB_MAX_TRACKS
+  echo ""
+  echo "# Clear default subtitle flags in MP4/MOV (prevents auto-enabled subs)"
+  _V SUB_CLEAR_DEFAULT
   echo ""
   echo "# Burn forced subtitles into the video stream (hardcoded, cannot be turned off)"
   _V SUB_BURN_FORCED
@@ -3224,6 +3242,7 @@ apply_profile_hdr10_hq() {
   STRIP_METADATA=0
   # Hardware acceleration: enabled for HEVC encode
   HWACCEL_ENABLED=1
+  PROFILE_ALLOW_HW=1
 }
 
 apply_profile_atv_directplay_hq() {
@@ -3263,6 +3282,7 @@ apply_profile_atv_directplay_hq() {
   SKIP_IF_IDEAL=1
   # Hardware acceleration: enabled for HEVC encode
   HWACCEL_ENABLED=1
+  PROFILE_ALLOW_HW=1
 }
 
 apply_profile_universal() {
@@ -3296,6 +3316,7 @@ apply_profile_universal() {
   STRIP_METADATA=1
   # Hardware acceleration: enabled for H.264 encode
   HWACCEL_ENABLED=1
+  PROFILE_ALLOW_HW=1
 }
 
 apply_profile_streaming() {
@@ -3321,6 +3342,7 @@ apply_profile_streaming() {
   EAC3_BITRATE_7_1="640k"
   # Hardware acceleration: enabled for HEVC encode
   HWACCEL_ENABLED=1
+  PROFILE_ALLOW_HW=1
   # Subs: soft forced, full embedded, no SDH
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
@@ -3368,6 +3390,7 @@ apply_profile_animation() {
   STRIP_METADATA=0
   # Hardware acceleration: enabled for HEVC encode
   HWACCEL_ENABLED=1
+  PROFILE_ALLOW_HW=0
 }
 
 # _profile_comment — return the profile tagline for container comment metadata.
@@ -3585,6 +3608,8 @@ while [[ $# -gt 0 ]]; do
     --no-subtitles) SUB_INCLUDE_FORCED=0; SUB_INCLUDE_FULL=0; SUB_INCLUDE_SDH=0; shift ;;
     --sub-lang-pref) SUB_LANG_PREF="${2:-}"; shift 2 ;;
     --no-sub-sdh) SUB_INCLUDE_SDH=0; shift ;;
+    --clear-default-subs) SUB_CLEAR_DEFAULT=1; shift ;;
+    --no-clear-default-subs) SUB_CLEAR_DEFAULT=0; shift ;;
     --ocr-lang) SUB_OCR_LANG="${2:-}"; shift 2 ;;
     --no-ocr) SUB_ENABLE_OCR=0; shift ;;
     --ocr-tool) SUB_OCR_TOOL="${2:-}"; shift 2 ;;
@@ -3875,6 +3900,7 @@ Effective config (post config-files + profile + CLI):
   HWACCEL_ENABLED           = $HWACCEL_ENABLED
   HWACCEL_DECODE            = $HWACCEL_DECODE
   HWACCEL_ENCODE            = $HWACCEL_ENCODE
+  PROFILE_ALLOW_HW          = $PROFILE_ALLOW_HW
 
   [Profile]
   PROFILE_NAME              = ${PROFILE_NAME:-<none>}
@@ -3932,6 +3958,7 @@ Effective config (post config-files + profile + CLI):
   SUB_INCLUDE_FULL          = $SUB_INCLUDE_FULL
   SUB_INCLUDE_SDH           = $SUB_INCLUDE_SDH
   SUB_MAX_TRACKS            = $SUB_MAX_TRACKS
+  SUB_CLEAR_DEFAULT         = $SUB_CLEAR_DEFAULT
   SUB_BURN_FORCED           = $SUB_BURN_FORCED
   SUB_EXPORT_EXTERNAL       = $SUB_EXPORT_EXTERNAL
   SUB_ENABLE_OCR            = $SUB_ENABLE_OCR
@@ -3986,6 +4013,13 @@ fi
 if (( ! DISABLE_DV )); then
   if ! _detect_mp4box; then
     warn "mp4box (GPAC) not found — DV container signaling (dvcC box) may fail."
+    warn "  Install: brew install gpac (macOS) or apt install gpac (Linux)"
+  fi
+fi
+
+if (( SUB_CLEAR_DEFAULT )) && [[ "$OUTPUT_EXT" != "mkv" ]]; then
+  if [[ -z "${MP4BOX_CMD:-}" ]] && ! _detect_mp4box; then
+    warn "mp4box (GPAC) not found — cannot clear default subtitle flags."
     warn "  Install: brew install gpac (macOS) or apt install gpac (Linux)"
   fi
 fi
@@ -4204,6 +4238,7 @@ _print_completed_steps(){
 on_exit() {
   # Clean up subtitle burn-in temp file (lives outside WORKDIR in /tmp)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
+  rm -f "${TMPDIR:-/tmp}/muxm_pipe_$$."* 2>/dev/null || true
 
   local have_result=0
   
@@ -4893,9 +4928,55 @@ verify_dv_container_record() {
       warn "DV container fallback remux failed. See: $WORKDIR/dv_remux.err"
     fi
   fi
+}
 
-  report_add "dv_container_record" "missing — players may fall back to HDR10/HLG"
-  return 0  # Non-fatal; output is still usable, just without DV activation on some players
+# Clear default subtitle flags in MP4/MOV using MP4Box by removing the 'enable'
+# flag from non-forced subtitle tracks. This prevents players from auto-enabling
+# full/SDH subtitle streams while keeping forced subs available.
+clear_default_subtitle_flags() {
+  (( SUB_CLEAR_DEFAULT )) || return 0
+  (( DRY_RUN )) && return 0
+  [[ "$MUX_FORMAT" != "matroska" ]] || return 0
+
+  if [[ -z "${MP4BOX_CMD:-}" ]] && ! _detect_mp4box; then
+    warn "mp4box (GPAC) not found — skipping default subtitle flag clear."
+    return 0
+  fi
+
+  local subs_json
+  subs_json="$(ffprobe -v error -select_streams s -show_streams -of json "$TMP_OUT" 2>/dev/null)" || return 0
+
+  local -a clear_tracks=()
+  local idx=0 forced
+  while IFS= read -r forced; do
+    [[ -n "$forced" ]] || continue
+    idx=$(( idx + 1 ))
+    [[ "$forced" == "1" ]] && continue
+    clear_tracks+=("$idx")
+  done <<< "$(printf '%s\n' "$subs_json" | jq -r '.streams[] | (.disposition.forced // 0)')"
+
+  (( ${#clear_tracks[@]} > 0 )) || return 0
+
+  local cleared_out="$WORKDIR/subs_nodefault.${OUTPUT_EXT}"
+  local -a mp4box_cmd=("$MP4BOX_CMD")
+  local t
+  for t in "${clear_tracks[@]}"; do
+    mp4box_cmd+=( -add "self#text${t}:tkhd-=enable" )
+  done
+  mp4box_cmd+=( "$TMP_OUT" -out "$cleared_out" )
+
+  "${mp4box_cmd[@]}" >"$WORKDIR/mp4box_subtitle_flags.log" 2>&1 &
+  local mp4box_pid=$!
+  spinner "$mp4box_pid" "Clearing default subtitle flags (mp4box)"
+  if wait "$mp4box_pid" 2>/dev/null && [[ -s "$cleared_out" ]]; then
+    mv -f "$cleared_out" "$TMP_OUT"
+    note "Cleared default subtitle flags on non-forced subtitle tracks."
+    report_add "subs_default_cleared" "yes"
+  else
+    warn "mp4box failed to clear default subtitle flags. See: $WORKDIR/mp4box_subtitle_flags.log"
+    rm -f "$cleared_out" 2>/dev/null || true
+    report_add "subs_default_cleared" "failed"
+  fi
 }
 
 # Check if source has valid HDR10 static metadata (MaxCLL, mastering display).
@@ -5281,7 +5362,18 @@ run_video_pipeline() {
   local selected_encoder="$VIDEO_CODEC"
   local encoder_type="cpu"
   
-  if (( HWACCEL_ENABLED )) && (( HWACCEL_ENCODE )); then
+  local -i hw_encode_allowed=1
+  if (( IS_DV )) && (( ! DISABLE_DV )); then
+    hw_encode_allowed=0
+    report_add "hw_encode_blocked" "dv_injection"
+    note "→ Hardware encode disabled: DV injection requires software encode"
+  elif (( ! PROFILE_ALLOW_HW )); then
+    hw_encode_allowed=0
+    report_add "hw_encode_blocked" "profile_opt_out"
+    note "→ Hardware encode disabled by profile policy"
+  fi
+
+  if (( HWACCEL_ENABLED )) && (( HWACCEL_ENCODE )) && (( hw_encode_allowed )); then
     # Try to get hardware encoder for target codec
     selected_encoder="$(_get_hwaccel_encoder "$target_codec" "$HWACCEL_TYPE")"
     if [[ -n "$selected_encoder" ]]; then
@@ -5416,7 +5508,10 @@ run_video_pipeline() {
     local progress_pipe="$WORKDIR/encode_progress.pipe"
 
     log "ffmpeg encode command: ffmpeg ${ff_cmd[*]}"
-    if _make_progress_pipe "$progress_pipe"; then
+    local actual_pipe
+    actual_pipe="$(_make_progress_pipe "$progress_pipe")"
+    if [[ -n "$actual_pipe" ]]; then
+      progress_pipe="$actual_pipe"
       ffmpeg "${ff_cmd[@]}" -progress "$progress_pipe" 2>"$WORKDIR/encode.err" &
       local enc_pid=$!
       # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
@@ -5426,6 +5521,7 @@ run_video_pipeline() {
       fi
       rm -f "$progress_pipe" 2>/dev/null || true
     else
+      warn "Could not create progress pipe — progress display unavailable (falling back to spinner)."
       ffmpeg "${ff_cmd[@]}" 2>"$WORKDIR/encode.err" &
       local enc_pid=$!
       spinner "$enc_pid" "Encoding video"
@@ -6573,7 +6669,10 @@ run_audio_pipeline(){
     total_secs="$(_get_source_duration_secs)"
     local a_progress_pipe="$WORKDIR/audio_progress.pipe"
 
-    if _make_progress_pipe "$a_progress_pipe"; then
+    local actual_pipe
+    actual_pipe="$(_make_progress_pipe "$a_progress_pipe")"
+    if [[ -n "$actual_pipe" ]]; then
+      a_progress_pipe="$actual_pipe"
       ffmpeg "${transcode_args[@]}" -progress "$a_progress_pipe" 2>"$WORKDIR/audio_primary.err" &
       local atx_pid=$!
       # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
@@ -6583,6 +6682,7 @@ run_audio_pipeline(){
       fi
       rm -f "$a_progress_pipe" 2>/dev/null || true
     else
+      warn "Could not create progress pipe — progress display unavailable (falling back to spinner)."
       ffmpeg "${transcode_args[@]}" 2>"$WORKDIR/audio_primary.err" &
       local atx_pid=$!
       spinner "$atx_pid" "Transcoding audio"
@@ -6606,7 +6706,10 @@ run_audio_pipeline(){
     stereo_total_secs="$(_get_source_duration_secs)"
     local stereo_progress_pipe="$WORKDIR/stereo_progress.pipe"
 
-    if _make_progress_pipe "$stereo_progress_pipe"; then
+    local actual_pipe
+    actual_pipe="$(_make_progress_pipe "$stereo_progress_pipe")"
+    if [[ -n "$actual_pipe" ]]; then
+      stereo_progress_pipe="$actual_pipe"
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" \
         -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" \
         -progress "$stereo_progress_pipe" 2>"$WORKDIR/audio_stereo.err" &
@@ -6620,6 +6723,7 @@ run_audio_pipeline(){
       fi
       rm -f "$stereo_progress_pipe" 2>/dev/null || true
     else
+      warn "Could not create progress pipe — progress display unavailable (falling back to spinner)."
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" \
         -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" \
         2>"$WORKDIR/audio_stereo.err" &
@@ -7972,6 +8076,8 @@ main() {
   fi
 
   mux_final
+
+  clear_default_subtitle_flags
 
   # Verify DV container signaling is present in output (dvcC/dvvC box for MP4/MOV)
   verify_dv_container_record

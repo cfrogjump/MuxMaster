@@ -309,6 +309,7 @@ muxm [options] <source> [target.mp4]
 | `--sub-lang-pref LANGS` | Subtitle language preference (comma-separated) |
 | `--sub-burn-forced` | Burn forced subtitles into video |
 | `--sub-preserve-format` | Keep ASS/SSA subtitles in native format (MKV only; use `--no-sub-preserve-format` to force SRT conversion) |
+| `--clear-default-subs` | Clear default subtitle flag in MP4/MOV using MP4Box |
 | `--output-ext mp4\|mkv\|m4v\|mov` | Output container |
 | `--report-json` | Generate a JSON report alongside the output file |
 | `--checksum` | Write a SHA-256 checksum file for the output |
