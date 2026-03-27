@@ -102,11 +102,23 @@ readonly DV_CONTAINER_PATTERN='DOVI configuration record|dv_profile|dv_version'
 declare -a REPORT_ENTRIES=()
 
 # Hardware acceleration detection and configuration
-HWACCEL_TYPE=""                # nvidia|intel|apple|cpu (detected at runtime)
+HW_ACCEL="auto"                # auto|off|nvenc|qsv|videotoolbox|vaapi
+HWACCEL_TYPE=""                # nvidia|intel|apple|vaapi|cpu (resolved at runtime)
 declare -i HWACCEL_ENABLED=0   # 1 if hardware acceleration is available and enabled
 HWACCEL_DECODE=1               # Enable hardware decode when available
 HWACCEL_ENCODE=1               # Enable hardware encode when available
 declare -i PROFILE_ALLOW_HW=1  # Per-profile hardware encode allowlist (1=allow, 0=disable)
+declare -i HW_DV_ALLOW=0       # Allow HW encode when DV injection is active (unsafe)
+declare -i HW_QUALITY_GATE=1   # Verify HW encode quality and fall back to CPU if needed
+HW_QUALITY_METRIC="ssim"       # ssim (default)
+HW_QUALITY_THRESHOLD="0.97"    # SSIM threshold (0-1)
+HW_BITRATE_UPLIFT_NVENC="0.10" # Fractional uplift for HW quality (CQ/global_quality)
+HW_BITRATE_UPLIFT_QSV="0.12"
+HW_BITRATE_UPLIFT_VT="0.15"
+HW_BITRATE_UPLIFT_VAAPI="0.12"
+HW_QUALITY_MAP_NVENC=""        # Optional mapping_summary.csv for NVENC
+HW_QUALITY_MAP_QSV=""          # Optional mapping_summary.csv for QSV
+HW_QUALITY_MAP_VT=""           # Optional mapping_summary.csv for VideoToolbox (kbps)
 
 # Skip-if-ideal stream keep-lists (populated by check_skip_if_ideal).
 # Used by the metadata remux in main() to build explicit -map flags instead
@@ -501,6 +513,162 @@ _detect_mp4box(){
   return 0
 }
 
+# _source_avg_bitrate_kbps — get average source bitrate in kbps.
+# Uses ffprobe bit_rate when available, else file size / duration.
+_source_avg_bitrate_kbps(){
+  local src_br_bps
+  src_br_bps="$(_probe_field bit_rate)"
+
+  if [[ -z "$src_br_bps" || "$src_br_bps" == "N/A" || "$src_br_bps" == "0" ]]; then
+    local _dur _fsz
+    _dur="$(_get_source_duration_secs)"
+    _dur="${_dur%.*}"
+    if [[ -n "$_dur" ]] && (( _dur > 0 )); then
+      _fsz="$(stat -f%z "$SRC_ABS" 2>/dev/null || stat -c%s "$SRC_ABS" 2>/dev/null || echo 0)"
+      if (( _fsz > 0 )); then
+        src_br_bps=$(( _fsz * 8 / _dur ))
+      fi
+    fi
+  fi
+
+  if [[ -n "$src_br_bps" && "$src_br_bps" =~ ^[0-9]+$ ]] && (( src_br_bps > 0 )); then
+    echo $(( src_br_bps / 1000 ))
+  else
+    echo ""
+  fi
+}
+
+# _vt_target_bitrate_kbps — content-adaptive target bitrate for VideoToolbox.
+# Uses source bitrate if available, else resolution-based baseline.
+_vt_target_bitrate_kbps(){
+  local codec="$1" width height fps fps_dec base_kbps
+  width="$(_probe_field width)"
+  height="$(_probe_field height)"
+  fps="$(_probe_field r_frame_rate)"
+
+  # Compute fps as decimal if fractional (e.g., 24000/1001)
+  if [[ -n "$fps" && "$fps" == */* ]]; then
+    fps_dec="$(echo "scale=3; $fps" | bc 2>/dev/null | sed 's/0*$//' | sed 's/\.$//')"
+  else
+    fps_dec="${fps:-}"
+  fi
+
+  base_kbps="$(_source_avg_bitrate_kbps)"
+
+  # Optional CRF→bitrate mapping (calibration summary) for VideoToolbox
+  local map_path map_val map_used=0
+  map_path="${HW_QUALITY_MAP_VT:-}"
+  if [[ -n "$map_path" && -f "$map_path" ]]; then
+    map_val="$(_hw_quality_from_map "$CRF_VALUE" "$map_path")"
+    if [[ -n "$map_val" ]]; then
+      base_kbps="$map_val"
+      map_used=1
+    fi
+  fi
+
+  if [[ -z "$base_kbps" ]]; then
+    # Resolution-based fallback baselines (kbps)
+    case "$codec" in
+      hevc)
+        if [[ -n "$height" ]] && (( height >= 2160 )); then base_kbps=12000;
+        elif [[ -n "$height" ]] && (( height >= 1440 )); then base_kbps=8000;
+        elif [[ -n "$height" ]] && (( height >= 1080 )); then base_kbps=5000;
+        elif [[ -n "$height" ]] && (( height >= 720 )); then base_kbps=3000;
+        else base_kbps=2000; fi
+        ;;
+      h264|*)
+        if [[ -n "$height" ]] && (( height >= 2160 )); then base_kbps=16000;
+        elif [[ -n "$height" ]] && (( height >= 1440 )); then base_kbps=10000;
+        elif [[ -n "$height" ]] && (( height >= 1080 )); then base_kbps=6500;
+        elif [[ -n "$height" ]] && (( height >= 720 )); then base_kbps=4000;
+        else base_kbps=2500; fi
+        ;;
+    esac
+  fi
+
+  # CRF → quality factor (lower CRF = higher target bitrate)
+  local qfactor="1.0"
+  if (( ! map_used )); then
+    if (( CRF_VALUE <= 17 )); then qfactor="1.15";
+    elif (( CRF_VALUE <= 20 )); then qfactor="1.0";
+    elif (( CRF_VALUE <= 23 )); then qfactor="0.85";
+    elif (( CRF_VALUE <= 26 )); then qfactor="0.7";
+    else qfactor="0.6"; fi
+  fi
+
+  # FPS scaling (only above 30 fps, capped)
+  local fps_factor="1.0"
+  if [[ -n "$fps_dec" ]] && (( $(echo "$fps_dec > 30" | bc -l 2>/dev/null) )); then
+    fps_factor="$(echo "scale=3; $fps_dec / 30" | bc 2>/dev/null)"
+    # Cap to avoid runaway bitrates
+    if (( $(echo "$fps_factor > 1.5" | bc -l 2>/dev/null) )); then
+      fps_factor="1.5"
+    fi
+  fi
+
+  local target_kbps
+  target_kbps="$(echo "scale=0; $base_kbps * $qfactor * $fps_factor" | bc -l 2>/dev/null)"
+  target_kbps="${target_kbps%.*}"
+  [[ -z "$target_kbps" || ! "$target_kbps" =~ ^[0-9]+$ ]] && target_kbps="$base_kbps"
+
+  # Clamp to sane bounds
+  local min_kbps max_kbps
+  if [[ "$codec" == "hevc" ]]; then
+    min_kbps=1500; max_kbps=20000
+  else
+    min_kbps=2000; max_kbps=25000
+  fi
+  if (( target_kbps < min_kbps )); then target_kbps=$min_kbps; fi
+  if (( target_kbps > max_kbps )); then target_kbps=$max_kbps; fi
+
+  if [[ -n "$HW_BITRATE_UPLIFT_VT" ]]; then
+    local uplifted
+    uplifted="$(echo "scale=0; $target_kbps * (1 + $HW_BITRATE_UPLIFT_VT)" | bc -l 2>/dev/null)"
+    if [[ -n "$uplifted" && "$uplifted" =~ ^[0-9]+$ ]]; then
+      target_kbps="$uplifted"
+    fi
+  fi
+
+  echo "$target_kbps"
+}
+
+_hw_quality_from_map(){
+  local crf="$1" map_file="$2"
+  [[ -z "$map_file" || ! -f "$map_file" ]] && return 1
+  awk -F',' -v crf="$crf" 'NR>1 && $1==crf {print $2; exit}' "$map_file" 2>/dev/null
+}
+
+_apply_hw_quality_uplift(){
+  local base="$1" uplift="$2" map_file="${3:-}" adj
+  if [[ -n "$map_file" && -f "$map_file" ]]; then
+    local mapped
+    mapped="$(_hw_quality_from_map "$base" "$map_file")"
+    if [[ -n "$mapped" ]]; then
+      base="$mapped"
+    fi
+  fi
+  if [[ -z "$uplift" ]]; then
+    echo "$base"
+    return
+  fi
+  adj="$(echo "scale=2; $base * (1 - $uplift)" | bc -l 2>/dev/null)"
+  adj="${adj%.*}"
+  if [[ -z "$adj" || ! "$adj" =~ ^[0-9]+$ ]]; then
+    echo "$base"
+    return
+  fi
+  (( adj < 1 )) && adj=1
+  echo "$adj"
+}
+
+_calc_ssim(){
+  local src="$1" enc="$2" stats_file="$3"
+  ffmpeg -v error -i "$src" -i "$enc" \
+    -filter_complex "[0:v][1:v]ssim=stats_file=$stats_file" \
+    -f null - >/dev/null 2>&1
+  grep -Eo 'All:[0-9.]+' "$stats_file" | tail -n1 | cut -d: -f2
+}
+
 # Improved realpath that handles non-existent files on all platforms
 realpath_fallback(){
   local p="$1"
@@ -602,6 +770,12 @@ is_valid_loglevel(){
   case "$1" in
     quiet|panic|fatal|error|warning|info|verbose|debug|trace) return 0;;
     *) return 1;;
+    vaapi)
+      case "$src_codec" in
+        h264) echo "h264_vaapi" ;;
+        hevc) echo "hevc_vaapi" ;;
+      esac
+      ;;
   esac
 }
 
@@ -714,6 +888,26 @@ _detect_apple_silicon(){
   return 1
 }
 
+_detect_vaapi(){
+  # Check for VA-API support (Linux)
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 1
+  fi
+
+  local ffmpeg_path
+  ffmpeg_path="$(command -v ffmpeg 2>/dev/null)" || return 1
+
+  # Require a VA-API device node
+  [[ -e /dev/dri/renderD128 ]] || return 1
+
+  # Check if ffmpeg has VA-API encoders
+  if ! "$ffmpeg_path" -hide_banner -encoders 2>/dev/null | grep -E "_vaapi" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 0
+}
+
 _detect_hardware(){
   # Detect available hardware acceleration in priority order
   if _detect_nvidia_gpu; then
@@ -728,11 +922,75 @@ _detect_hardware(){
     HWACCEL_TYPE="apple"
     HWACCEL_ENABLED=1
     return 0
+  elif _detect_vaapi; then
+    HWACCEL_TYPE="vaapi"
+    HWACCEL_ENABLED=1
+    return 0
   else
     HWACCEL_TYPE="cpu"
     HWACCEL_ENABLED=0
     return 1
   fi
+}
+
+_resolve_hwaccel(){
+  local choice
+  choice="$(_lower "${HW_ACCEL:-auto}")"
+  case "$choice" in
+    auto|"")
+      _detect_hardware
+      ;;
+    off|none|cpu)
+      HWACCEL_TYPE="cpu"
+      HWACCEL_ENABLED=0
+      ;;
+    nvenc|nvidia)
+      if _detect_nvidia_gpu; then
+        HWACCEL_TYPE="nvidia"
+        HWACCEL_ENABLED=1
+      else
+        HWACCEL_TYPE="cpu"
+        HWACCEL_ENABLED=0
+        return 1
+      fi
+      ;;
+    qsv|intel)
+      if _detect_intel_gpu; then
+        HWACCEL_TYPE="intel"
+        HWACCEL_ENABLED=1
+      else
+        HWACCEL_TYPE="cpu"
+        HWACCEL_ENABLED=0
+        return 1
+      fi
+      ;;
+    videotoolbox|vt|apple)
+      if _detect_apple_silicon; then
+        HWACCEL_TYPE="apple"
+        HWACCEL_ENABLED=1
+      else
+        HWACCEL_TYPE="cpu"
+        HWACCEL_ENABLED=0
+        return 1
+      fi
+      ;;
+    vaapi)
+      if _detect_vaapi; then
+        HWACCEL_TYPE="vaapi"
+        HWACCEL_ENABLED=1
+      else
+        HWACCEL_TYPE="cpu"
+        HWACCEL_ENABLED=0
+        return 1
+      fi
+      ;;
+    *)
+      warn "Unknown HW_ACCEL setting: $HW_ACCEL (expected auto/off/nvenc/qsv/videotoolbox/vaapi)"
+      HWACCEL_TYPE="cpu"
+      HWACCEL_ENABLED=0
+      return 1
+      ;;
+  esac
 }
 
 # ===== Section 7: Dependency installer ========================================================
@@ -2033,11 +2291,14 @@ _muxm_completions() {
         --create-config|--force-create-config)
             COMPREPLY=( $(compgen -W "system user project" -- "$cur") )
             return ;;
+        --hw-accel|--hwaccel)
+            COMPREPLY=( $(compgen -W "auto off nvenc qsv videotoolbox vaapi" -- "$cur") )
+            return ;;
 
         # Flags that take a free-form value — offer no completion, fall through to files
         --crf|--stereo-bitrate|--threads|-l|--level|--x265-params|\
         --audio-track|--audio-lang-pref|--audio-force-codec|\
-        --max-copy-bitrate|--sub-lang-pref|--ocr-lang)
+        --max-copy-bitrate|--sub-lang-pref|--ocr-lang|--hw-accel|--hwaccel)
             COMPREPLY=()
             return ;;
     esac
@@ -2083,6 +2344,10 @@ _muxm_completions() {
             --ocr-lang --no-ocr --ocr-tool
 
             --skip-video --skip-audio --skip-subs
+
+            --hw-accel --hwaccel --hwaccel-decode --no-hwaccel-decode
+            --hwaccel-encode --no-hwaccel-encode
+            --hw-dv-allow --no-hw-dv-allow --show-hardware-info
 
             --output-ext
             --keep-chapters --no-keep-chapters
@@ -2299,6 +2564,12 @@ _get_hwaccel_decoder(){
         hevc) echo "hevc_videotoolbox" ;;
       esac
       ;;
+    vaapi)
+      case "$src_codec" in
+        h264) echo "h264_vaapi" ;;
+        hevc) echo "hevc_vaapi" ;;
+      esac
+      ;;
   esac
 }
 
@@ -2325,6 +2596,12 @@ _get_hwaccel_encoder(){
       case "$tgt_codec" in
         h264) echo "h264_videotoolbox" ;;
         hevc) echo "hevc_videotoolbox" ;;
+      esac
+      ;;
+    vaapi)
+      case "$tgt_codec" in
+        h264) echo "h264_vaapi" ;;
+        hevc) echo "hevc_vaapi" ;;
       esac
       ;;
   esac
@@ -2370,9 +2647,16 @@ _show_hardware_info(){
   else
     say "  ❌ Apple Silicon (VideoToolbox) — not available"
   fi
+
+  if _detect_vaapi; then
+    say "  ✅ VA-API — hevc_vaapi, h264_vaapi"
+  else
+    say "  ❌ VA-API — not available"
+  fi
   
   echo ""
   say "Current Configuration:"
+  say "  HW_ACCEL=$HW_ACCEL"
   say "  HWACCEL_TYPE=$HWACCEL_TYPE"
   say "  HWACCEL_ENABLED=$HWACCEL_ENABLED"
   say "  HWACCEL_DECODE=$HWACCEL_DECODE"
@@ -2494,6 +2778,17 @@ _setup_detect_and_display_hardware(){
     printf "\t❌ not found\n"
     unavailable=$(( unavailable + 1 ))
   fi
+
+  # VA-API (Linux)
+  total=$(( total + 1 ))
+  printf "  %-20s" "VA-API"
+  if _detect_vaapi; then
+    printf "\t✅ detected\n"
+    available=$(( available + 1 ))
+  else
+    printf "\t❌ not found\n"
+    unavailable=$(( unavailable + 1 ))
+  fi
   
   echo ""
   
@@ -2527,6 +2822,7 @@ _create_config_user_with_hardware(){
     echo "# ================================================================"
     echo ""
     echo "# Hardware acceleration settings (auto-detected during setup)"
+    echo "HW_ACCEL='auto'"
     echo "HWACCEL_TYPE='$HWACCEL_TYPE'"
     echo "HWACCEL_ENABLED=$HWACCEL_ENABLED"
     echo "HWACCEL_DECODE=1"
@@ -2568,7 +2864,7 @@ _create_config_emit() {
 
   # Detect hardware acceleration if not already set
   if [[ -z "$HWACCEL_TYPE" ]]; then
-    _detect_hardware
+    _resolve_hwaccel || warn "Hardware accel unavailable for HW_ACCEL=$HW_ACCEL — using CPU"
   fi
 
   # Build the set of variables that this profile explicitly sets.
@@ -2674,7 +2970,10 @@ HEADER
   echo "# Hardware Acceleration"
   echo "# ========================="
   echo ""
-  echo "# Hardware acceleration type: nvidia|intel|apple|cpu"
+  echo "# Hardware acceleration selection: auto|off|nvenc|qsv|videotoolbox|vaapi"
+  printf 'HW_ACCEL=%s\n' "$HW_ACCEL"
+  echo ""
+  echo "# Hardware acceleration type: nvidia|intel|apple|vaapi|cpu"
   echo "# Auto-detected and cached here for future runs"
   if [[ "$HWACCEL_TYPE" != "cpu" ]]; then
     printf 'HWACCEL_TYPE=%s\n' "$HWACCEL_TYPE"
@@ -2694,6 +2993,27 @@ HEADER
   echo ""
   echo "# Allow hardware encoding for the active profile (1=allow, 0=disable)"
   printf 'PROFILE_ALLOW_HW=%s\n' "$PROFILE_ALLOW_HW"
+  echo ""
+  echo "# Allow HW encode when DV injection is active (unsafe)"
+  printf 'HW_DV_ALLOW=%s\n' "$HW_DV_ALLOW"
+  echo ""
+  echo "# Hardware quality gate: verify HW encode and fall back to CPU if needed"
+  printf 'HW_QUALITY_GATE=%s\n' "$HW_QUALITY_GATE"
+  echo ""
+  echo "# Quality metric + threshold (ssim, 0-1)"
+  printf 'HW_QUALITY_METRIC=%s\n' "$HW_QUALITY_METRIC"
+  printf 'HW_QUALITY_THRESHOLD=%s\n' "$HW_QUALITY_THRESHOLD"
+  echo ""
+  echo "# HW quality uplifts (fractional). Lower CQ/global_quality, raise VT bitrate."
+  printf 'HW_BITRATE_UPLIFT_NVENC=%s\n' "$HW_BITRATE_UPLIFT_NVENC"
+  printf 'HW_BITRATE_UPLIFT_QSV=%s\n' "$HW_BITRATE_UPLIFT_QSV"
+  printf 'HW_BITRATE_UPLIFT_VT=%s\n' "$HW_BITRATE_UPLIFT_VT"
+  printf 'HW_BITRATE_UPLIFT_VAAPI=%s\n' "$HW_BITRATE_UPLIFT_VAAPI"
+  echo ""
+  echo "# Optional CRF→HW quality mapping summary CSVs (from tools/quality_calibrate.sh)"
+  printf '#HW_QUALITY_MAP_NVENC=artifacts/quality/.../mapping_summary.csv\n'
+  printf '#HW_QUALITY_MAP_QSV=artifacts/quality/.../mapping_summary.csv\n'
+  printf '#HW_QUALITY_MAP_VT=artifacts/quality/.../mapping_summary.csv\n'
   echo ""
 
   echo "# ========================="
@@ -3520,6 +3840,11 @@ Common options:
   --create-config SCOPE [PROFILE]
                               Generate .muxmrc (system|user|project)
 
+Hardware accel:
+  --hw-accel MODE           auto|off|nvenc|qsv|videotoolbox|vaapi
+  --hw-dv-allow             Allow HW encode during DV injection (unsafe)
+  --show-hardware-info      Print detected HW backends
+
 See muxm(1) for the full option reference, profiles, and examples.
   First run: muxm --setup
   Then:      man muxm
@@ -3624,11 +3949,14 @@ while [[ $# -gt 0 ]]; do
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
-    --hwaccel) HWACCEL_TYPE="${2:-}"; shift 2 ;;
+    --hw-accel) HW_ACCEL="${2:-}"; shift 2 ;;
+    --hwaccel) HW_ACCEL="${2:-}"; shift 2 ;;
     --hwaccel-decode) HWACCEL_DECODE=1; shift ;;
     --no-hwaccel-decode) HWACCEL_DECODE=0; shift ;;
     --hwaccel-encode) HWACCEL_ENCODE=1; shift ;;
     --no-hwaccel-encode) HWACCEL_ENCODE=0; shift ;;
+    --hw-dv-allow) HW_DV_ALLOW=1; shift ;;
+    --no-hw-dv-allow) HW_DV_ALLOW=0; shift ;;
     --show-hardware-info) _show_hardware_info; exit 0 ;;
 
     --output-ext) OUTPUT_EXT="${2:-}"; shift 2 ;;
@@ -3896,11 +4224,23 @@ print_effective_config(){
 Effective config (post config-files + profile + CLI):
 
   [Hardware Acceleration]
+  HW_ACCEL                  = $HW_ACCEL
   HWACCEL_TYPE              = $HWACCEL_TYPE
   HWACCEL_ENABLED           = $HWACCEL_ENABLED
   HWACCEL_DECODE            = $HWACCEL_DECODE
   HWACCEL_ENCODE            = $HWACCEL_ENCODE
   PROFILE_ALLOW_HW          = $PROFILE_ALLOW_HW
+  HW_DV_ALLOW               = $HW_DV_ALLOW
+  HW_QUALITY_GATE           = $HW_QUALITY_GATE
+  HW_QUALITY_METRIC         = $HW_QUALITY_METRIC
+  HW_QUALITY_THRESHOLD      = $HW_QUALITY_THRESHOLD
+  HW_BITRATE_UPLIFT_NVENC   = $HW_BITRATE_UPLIFT_NVENC
+  HW_BITRATE_UPLIFT_QSV     = $HW_BITRATE_UPLIFT_QSV
+  HW_BITRATE_UPLIFT_VT      = $HW_BITRATE_UPLIFT_VT
+  HW_BITRATE_UPLIFT_VAAPI   = $HW_BITRATE_UPLIFT_VAAPI
+  HW_QUALITY_MAP_NVENC      = ${HW_QUALITY_MAP_NVENC:-<none>}
+  HW_QUALITY_MAP_QSV        = ${HW_QUALITY_MAP_QSV:-<none>}
+  HW_QUALITY_MAP_VT         = ${HW_QUALITY_MAP_VT:-<none>}
 
   [Profile]
   PROFILE_NAME              = ${PROFILE_NAME:-<none>}
@@ -5315,6 +5655,11 @@ run_video_pipeline() {
         note "→ GPU decode enabled (Apple VideoToolbox) for encode"
         report_add "gpu_decode" "enabled (apple_videotoolbox)"
         ;;
+      vaapi)
+        decode_args=(-hwaccel vaapi -hwaccel_device /dev/dri/renderD128)
+        note "→ GPU decode enabled (VA-API) for encode"
+        report_add "gpu_decode" "enabled (vaapi)"
+        ;;
     esac
   fi
 
@@ -5347,13 +5692,6 @@ run_video_pipeline() {
     report_add "sub_burn_forced" "skipped (no forced subtitle available)"
   fi
 
-  # Build -vf string
-  local vf_str=""
-  if [[ ${#vf_filters[@]} -gt 0 ]]; then
-    # shellcheck disable=SC2030  # Subshell-scoped IFS change is intentional
-    vf_str="$(IFS=','; echo "${vf_filters[*]}")"
-  fi
-
   # Determine target codec (h264 or hevc) and select appropriate encoder
   local target_codec="hevc"
   [[ "$VIDEO_CODEC" == "libx264" ]] && target_codec="h264"
@@ -5363,10 +5701,13 @@ run_video_pipeline() {
   local encoder_type="cpu"
   
   local -i hw_encode_allowed=1
-  if (( IS_DV )) && (( ! DISABLE_DV )); then
+  if (( IS_DV )) && (( ! DISABLE_DV )) && (( ! HW_DV_ALLOW )); then
     hw_encode_allowed=0
     report_add "hw_encode_blocked" "dv_injection"
     note "→ Hardware encode disabled: DV injection requires software encode"
+  elif (( IS_DV )) && (( ! DISABLE_DV )) && (( HW_DV_ALLOW )); then
+    warn "HW_DV_ALLOW=1 — proceeding with hardware encode during DV injection (unsupported)"
+    report_add "hw_encode_blocked" "dv_injection_override"
   elif (( ! PROFILE_ALLOW_HW )); then
     hw_encode_allowed=0
     report_add "hw_encode_blocked" "profile_opt_out"
@@ -5386,6 +5727,18 @@ run_video_pipeline() {
       warn "Hardware encoder not available for $target_codec on $HWACCEL_TYPE, falling back to CPU ($VIDEO_CODEC)"
     fi
   fi
+
+  # VA-API requires hwupload; add to filter chain after encoder selection
+  if [[ "$selected_encoder" == *_vaapi ]]; then
+    vf_filters+=("format=nv12,hwupload")
+  fi
+
+  # Build -vf string
+  local vf_str=""
+  if [[ ${#vf_filters[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2030  # Subshell-scoped IFS change is intentional
+    vf_str="$(IFS=','; echo "${vf_filters[*]}")"
+  fi
   
   # Build encoder-specific arguments
   if [[ "$target_codec" == "h264" ]]; then
@@ -5396,29 +5749,36 @@ run_video_pipeline() {
       h264_nvenc)
         # NVIDIA NVENC H.264: use -cq instead of -crf, map presets
         local nvenc_preset="medium"
+        local hw_quality
         case "$PRESET_VALUE" in
           ultrafast|superfast|veryfast|faster|fast) nvenc_preset="fast" ;;
           medium) nvenc_preset="medium" ;;
           slow|slower|veryslow) nvenc_preset="slow" ;;
         esac
-        encode_args=(-c:v h264_nvenc -preset "$nvenc_preset" -cq "$CRF_VALUE" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_NVENC" "$HW_QUALITY_MAP_NVENC")"
+        encode_args=(-c:v h264_nvenc -preset "$nvenc_preset" -cq "$hw_quality" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "nvenc:crf=${CRF_VALUE}->cq=${hw_quality}"
         ;;
       h264_qsv)
         # Intel QuickSync H.264: use -global_quality instead of -crf
-        encode_args=(-c:v h264_qsv -preset "$PRESET_VALUE" -global_quality "$CRF_VALUE" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
+        local hw_quality
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_QSV" "$HW_QUALITY_MAP_QSV")"
+        encode_args=(-c:v h264_qsv -preset "$PRESET_VALUE" -global_quality "$hw_quality" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "qsv:crf=${CRF_VALUE}->gq=${hw_quality}"
+        ;;
+      h264_vaapi)
+        # VA-API H.264: use -qp, requires hwupload filter
+        local hw_quality
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_VAAPI")"
+        encode_args=(-vaapi_device /dev/dri/renderD128 -c:v h264_vaapi -qp "$hw_quality" -pix_fmt nv12 "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "vaapi:crf=${CRF_VALUE}->qp=${hw_quality}"
         ;;
       h264_videotoolbox)
-        # Apple VideoToolbox H.264: use -b:v for bitrate instead of -q:v or -crf
-        # VideoToolbox doesn't support -preset or -q:v parameters
-        local vt_bitrate="4000k"
-        case "$CRF_VALUE" in
-          14|15|16|17) vt_bitrate="5000k" ;;
-          18|19|20) vt_bitrate="3500k" ;;
-          21|22|23) vt_bitrate="2500k" ;;
-          24|25|26) vt_bitrate="2000k" ;;
-          *) vt_bitrate="3000k" ;;
-        esac
-        encode_args=(-c:v h264_videotoolbox -b:v "$vt_bitrate" -pix_fmt yuv420p -allow_sw 1 "${COLOR_ARGS[@]}")
+        # Apple VideoToolbox H.264: content-adaptive bitrate
+        local vt_kbps
+        vt_kbps="$(_vt_target_bitrate_kbps h264)"
+        encode_args=(-c:v h264_videotoolbox -b:v "${vt_kbps}k" -pix_fmt yuv420p -allow_sw 1 "${COLOR_ARGS[@]}")
+        report_add "vt_bitrate_kbps" "$vt_kbps"
         ;;
       *)
         # libx264 (CPU encode)
@@ -5439,44 +5799,36 @@ run_video_pipeline() {
         # libx265: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
         # NVENC: default, fast, medium, slow
         local nvenc_preset="medium"
+        local hw_quality
         case "$PRESET_VALUE" in
           ultrafast|superfast|veryfast|faster|fast) nvenc_preset="fast" ;;
           medium) nvenc_preset="medium" ;;
           slow|slower|veryslow) nvenc_preset="slow" ;;
         esac
-        encode_args=(-c:v hevc_nvenc -preset "$nvenc_preset" -cq "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_NVENC" "$HW_QUALITY_MAP_NVENC")"
+        encode_args=(-c:v hevc_nvenc -preset "$nvenc_preset" -cq "$hw_quality" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "nvenc:crf=${CRF_VALUE}->cq=${hw_quality}"
         ;;
       hevc_qsv)
         # Intel QuickSync: use -global_quality instead of -crf
-        encode_args=(-c:v hevc_qsv -preset "$PRESET_VALUE" -global_quality "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        local hw_quality
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_QSV" "$HW_QUALITY_MAP_QSV")"
+        encode_args=(-c:v hevc_qsv -preset "$PRESET_VALUE" -global_quality "$hw_quality" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "qsv:crf=${CRF_VALUE}->gq=${hw_quality}"
+        ;;
+      hevc_vaapi)
+        # VA-API HEVC: use -qp, requires hwupload filter
+        local hw_quality
+        hw_quality="$(_apply_hw_quality_uplift "$CRF_VALUE" "$HW_BITRATE_UPLIFT_VAAPI")"
+        encode_args=(-vaapi_device /dev/dri/renderD128 -c:v hevc_vaapi -qp "$hw_quality" -pix_fmt nv12 "${COLOR_ARGS[@]}")
+        report_add "hw_quality_uplift" "vaapi:crf=${CRF_VALUE}->qp=${hw_quality}"
         ;;
       hevc_videotoolbox)
-        # Apple VideoToolbox: use -b:v for bitrate instead of -q:v or -crf
-        # VideoToolbox doesn't support -preset or -q:v parameters
-        # Convert CRF to approximate bitrate (rough estimate: higher CRF = lower bitrate)
-        # CRF 17 ≈ 4000k, CRF 20 ≈ 3000k, CRF 23 ≈ 2000k
-        local vt_bitrate="4000k"
-        case "$CRF_VALUE" in
-          14|15|16|17) vt_bitrate="5000k" ;;
-          18|19|20) vt_bitrate="3500k" ;;
-          21|22|23) vt_bitrate="2500k" ;;
-          24|25|26) vt_bitrate="2000k" ;;
-          *) vt_bitrate="3000k" ;;
-        esac
-        encode_args=(-c:v hevc_videotoolbox -b:v "$vt_bitrate" -pix_fmt "$TARGET_PIXFMT" -allow_sw 1 "${COLOR_ARGS[@]}")
-        ;;
-      h264_videotoolbox)
-        # Apple VideoToolbox H.264: use -b:v for bitrate instead of -q:v or -crf
-        # VideoToolbox doesn't support -preset or -q:v parameters
-        local vt_bitrate="4000k"
-        case "$CRF_VALUE" in
-          14|15|16|17) vt_bitrate="5000k" ;;
-          18|19|20) vt_bitrate="3500k" ;;
-          21|22|23) vt_bitrate="2500k" ;;
-          24|25|26) vt_bitrate="2000k" ;;
-          *) vt_bitrate="3000k" ;;
-        esac
-        encode_args=(-c:v h264_videotoolbox -b:v "$vt_bitrate" -pix_fmt yuv420p -allow_sw 1 "${COLOR_ARGS[@]}")
+        # Apple VideoToolbox HEVC: content-adaptive bitrate
+        local vt_kbps
+        vt_kbps="$(_vt_target_bitrate_kbps hevc)"
+        encode_args=(-c:v hevc_videotoolbox -b:v "${vt_kbps}k" -pix_fmt "$TARGET_PIXFMT" -allow_sw 1 "${COLOR_ARGS[@]}")
+        report_add "vt_bitrate_kbps" "$vt_kbps"
         ;;
       *)
         # libx265 (CPU encode)
@@ -5489,10 +5841,14 @@ run_video_pipeline() {
     report_add "encoder_type" "$encoder_type"
   fi
 
-  if (( DRY_RUN )); then
-    : > "$V_BASE" 2>/dev/null || true
-    mark_done "Encode base video (dry-run)"
-  else
+  local -i hw_gate_retry=0
+  while :; do
+    if (( DRY_RUN )); then
+      : > "$V_BASE" 2>/dev/null || true
+      mark_done "Encode base video (dry-run)"
+      break
+    fi
+
     local -a ff_cmd=("${FFMPEG_FLAGS[@]}")
     [[ ${#decode_args[@]} -gt 0 ]] && ff_cmd+=("${decode_args[@]}")
     ff_cmd+=(-i "$SRC_ABS" -map 0:v:0)
@@ -5533,8 +5889,33 @@ run_video_pipeline() {
     # Validate encoded output
     _validate_media_file "$V_BASE" "Base video encode"
 
+    if [[ "$encoder_type" != "cpu" ]] && (( HW_QUALITY_GATE )); then
+      local ssim_log="$WORKDIR/hw_ssim.log" ssim_val
+      ssim_val="$(_calc_ssim "$SRC_ABS" "$V_BASE" "$ssim_log")"
+      if [[ -n "$ssim_val" ]] && (( $(echo "$ssim_val < $HW_QUALITY_THRESHOLD" | bc -l 2>/dev/null) )); then
+        report_add "hw_quality_gate" "failed ($HW_QUALITY_METRIC=$ssim_val < $HW_QUALITY_THRESHOLD)"
+        warn "HW quality gate failed (${HW_QUALITY_METRIC}=$ssim_val < $HW_QUALITY_THRESHOLD)."
+        if (( hw_gate_retry == 0 )); then
+          note "→ Re-encoding with CPU for quality fallback"
+          report_add "hw_quality_fallback" "cpu_reencode"
+          selected_encoder="$VIDEO_CODEC"
+          encoder_type="cpu"
+          if [[ "$target_codec" == "h264" ]]; then
+            encode_args=(-c:v libx264 -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt yuv420p "${COLOR_ARGS[@]}")
+          else
+            encode_args=(-c:v libx265 -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" "${COLOR_ARGS[@]}" -x265-params "$X265_PARAMS")
+          fi
+          hw_gate_retry=1
+          continue
+        fi
+      else
+        report_add "hw_quality_gate" "passed ($HW_QUALITY_METRIC=$ssim_val)"
+      fi
+    fi
+
     mark_done "Encode base video"
-  fi
+    break
+  done
 
   log "→ Finalizing video stream (DV inject if available) → $V_MIXED"
 
@@ -7902,7 +8283,7 @@ main() {
   # Detect hardware acceleration if not already set by config
   # This ensures hardware is detected even if --setup hasn't been run
   if [[ -z "$HWACCEL_TYPE" ]]; then
-    _detect_hardware
+    _resolve_hwaccel || warn "Hardware accel unavailable for HW_ACCEL=$HW_ACCEL — using CPU"
   fi
 
   # Cache metadata once for all operations

@@ -77,7 +77,7 @@ sudo dpkg -i jellyfin-ffmpeg_7.0.1-1_amd64.deb
 
 ### Apple Silicon
 - ✅ Full GPU decode + encode
-- Uses bitrate instead of CRF
+- Uses content-adaptive bitrate (CRF-informed)
 - Requires ffmpeg with VideoToolbox
 
 ## Subtitle Compatibility

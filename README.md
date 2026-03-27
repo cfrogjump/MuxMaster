@@ -255,6 +255,9 @@ muxm --setup
 **📖 Full Hardware Acceleration Guide:**  
 [See comprehensive setup documentation](docs/hardware_acceleration.md) for platform-specific requirements, FFmpeg setup, troubleshooting, and performance optimization.
 
+**🧪 Quality Calibration Harness:**  
+[CRF → hardware quality calibration](docs/quality_calibration.md) for building CRF→CQ/bitrate mappings with VMAF/SSIM.
+
 ### Upgrading
 
 <a id="upgrading"></a>

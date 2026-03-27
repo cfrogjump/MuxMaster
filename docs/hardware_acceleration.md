@@ -169,26 +169,105 @@ HWACCEL_ENCODE=1
 - Intel CPU with QuickSync support (Sandy Bridge or newer)
 - ffmpeg compiled with libmfx support
 
+### VA-API (Linux)
+
+**Features:**
+- GPU encoding/decoding via VA-API (Linux)
+- Supports H.264 and HEVC encoding
+- Uses `-qp` for quality control
+
+**Encoder Mapping:**
+- `libx265` → `hevc_vaapi`
+- `libx264` → `h264_vaapi`
+
+**Requirements:**
+- Linux with `/dev/dri/renderD128`
+- ffmpeg compiled with VA-API support
+
 ### Apple Silicon (VideoToolbox)
 
 **Features:**
 - Full hardware decode and encode pipeline
 - Supports H.264 and HEVC encoding
-- Uses bitrate-based encoding instead of CRF
+- Uses content-adaptive bitrate selection (CRF-informed)
 
 **Encoder Mapping:**
 - `libx265` → `hevc_videotoolbox`
 - `libx264` → `h264_videotoolbox`
 
-**Bitrate Mapping (CRF → approximate):**
-- CRF 14-16 → 8000k
-- CRF 17-19 → 5000k  
-- CRF 20-22 → 3000k
-- CRF 23-25 → 2000k
+**Content-Adaptive Bitrate Selection:**
+- Starts from the source average bitrate when available (ffprobe or size/duration)
+- Falls back to resolution-based baselines when source bitrate is unknown
+- Applies a CRF-based quality factor and fps scaling (above 30 fps)
+- Clamped to sane bounds to avoid runaway bitrate spikes
+
+**What this means in practice:**
+- Higher-detail sources keep more bitrate headroom
+- Higher CRF values still trend toward smaller outputs
+- 60 fps inputs won’t starve the encoder
 
 **Special Parameters:**
 - `-allow_sw 1` for software fallback
 - No preset support (uses system defaults)
+
+---
+
+## Hardware Quality Gate (All HW Encoders)
+
+MuxMaster can verify hardware encode quality using a fast SSIM check and
+automatically fall back to CPU encoding if the hardware result is below a
+threshold. This helps avoid obvious quality regressions on tricky sources.
+
+**Config variables:**
+
+```bash
+# Enable/disable HW quality gate (1=on, 0=off)
+HW_QUALITY_GATE=1
+
+# Metric + threshold (SSIM recommended)
+HW_QUALITY_METRIC=ssim
+HW_QUALITY_THRESHOLD=0.97
+
+# Uplift factors (fractional). Lower CQ/global_quality, raise VT bitrate.
+HW_BITRATE_UPLIFT_NVENC=0.10
+HW_BITRATE_UPLIFT_QSV=0.12
+HW_BITRATE_UPLIFT_VT=0.15
+```
+
+**Notes:**
+- Gate runs only for hardware encodes; CPU encodes skip it.
+- When a gate fails, muxm re-encodes with the software encoder at the original CRF.
+
+---
+
+## Hardware Accel Selection & DV Guardrails
+
+```bash
+# Force a backend or disable HW accel entirely
+HW_ACCEL=auto   # auto|off|nvenc|qsv|videotoolbox|vaapi
+
+# Allow HW encode during DV injection (unsafe; default off)
+HW_DV_ALLOW=0
+```
+
+**Notes:**
+- `auto` selects the first available backend in priority order.
+- DV injection defaults to CPU encodes unless `HW_DV_ALLOW=1`.
+
+---
+
+## CRF → Hardware Quality Mapping (Optional)
+
+You can feed the calibration summary CSV into muxm so HW encoders start from
+an empirically matched quality value:
+
+```bash
+HW_QUALITY_MAP_NVENC=artifacts/quality/20240301-120000/mapping_summary.csv
+HW_QUALITY_MAP_QSV=artifacts/quality/20240301-120000/mapping_summary.csv
+HW_QUALITY_MAP_VT=artifacts/quality/20240301-120000/mapping_summary.csv
+```
+
+If no mapping is provided, muxm falls back to the uplift-based defaults.
 
 **Requirements:**
 - Apple Silicon Mac (M1/M2/M3) or Intel Mac with T2

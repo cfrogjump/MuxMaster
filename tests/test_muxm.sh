@@ -102,6 +102,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve muxm path to absolute to support run_muxm_in from other directories.
+if [[ "$MUXM" != /* ]]; then
+  if [[ -e "$MUXM" ]]; then
+    MUXM="$(cd "$(dirname "$MUXM")" && pwd -P)/$(basename "$MUXM")"
+  fi
+fi
+
 # ---- Helpers ----
 log()  { printf "%b  → %s%b\n" "$BLUE" "$*" "$NC"; }
 pass() { PASS=$((PASS + 1)); printf "%b  ✅ PASS: %s%b\n" "$GREEN" "$*" "$NC"; }
@@ -920,6 +927,20 @@ _test_config_effective() {
   assert_contains "streaming" "Effective config shows streaming profile" "$out"
   assert_contains "CRF_VALUE" "Effective config shows CRF" "$out"
   assert_contains "VIDEO_CODEC" "Effective config shows video codec" "$out"
+
+  # HW quality gate variables appear in effective config
+  assert_contains "HW_ACCEL" "Effective config shows HW_ACCEL" "$out"
+  assert_contains "HW_QUALITY_GATE" "Effective config shows HW_QUALITY_GATE" "$out"
+  assert_contains "HW_QUALITY_METRIC" "Effective config shows HW_QUALITY_METRIC" "$out"
+  assert_contains "HW_QUALITY_THRESHOLD" "Effective config shows HW_QUALITY_THRESHOLD" "$out"
+  assert_contains "HW_BITRATE_UPLIFT_NVENC" "Effective config shows HW_BITRATE_UPLIFT_NVENC" "$out"
+  assert_contains "HW_BITRATE_UPLIFT_QSV" "Effective config shows HW_BITRATE_UPLIFT_QSV" "$out"
+  assert_contains "HW_BITRATE_UPLIFT_VT" "Effective config shows HW_BITRATE_UPLIFT_VT" "$out"
+  assert_contains "HW_BITRATE_UPLIFT_VAAPI" "Effective config shows HW_BITRATE_UPLIFT_VAAPI" "$out"
+  assert_contains "HW_DV_ALLOW" "Effective config shows HW_DV_ALLOW" "$out"
+  assert_contains "HW_QUALITY_MAP_NVENC" "Effective config shows HW_QUALITY_MAP_NVENC" "$out"
+  assert_contains "HW_QUALITY_MAP_QSV" "Effective config shows HW_QUALITY_MAP_QSV" "$out"
+  assert_contains "HW_QUALITY_MAP_VT" "Effective config shows HW_QUALITY_MAP_VT" "$out"
 
   # CLI flags override profile
   out="$(run_muxm --profile streaming --crf 25 --print-effective-config)"
